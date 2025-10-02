@@ -1,0 +1,675 @@
+# Build updated WordPress plugin v1.0.1 with:
+# - Clean "Save Changes" via custom admin-post handler (no raw data dump)
+# - "Test Connection" buttons for TiDB and Algolia with admin notices
+# - Persistent settings
+# - Existing VPP rendering, Push to VPP, Push to Algolia
+# - Same Vercel-like CSS
+import os, textwrap, zipfile
+
+root = "/mnt/data/virtual-product-pages-v1.0.1"
+assets = os.path.join(root, "assets")
+os.makedirs(assets, exist_ok=True)
+
+main_php = textwrap.dedent("""\
+<?php
+/**
+ * Plugin Name: Virtual Product Pages (TiDB + Algolia)
+ * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP and Push to Algolia tools. No WooCommerce rows required.
+ * Version: 1.0.1
+ * Author: ChatGPT (for Martin)
+ * Requires PHP: 7.4
+ */
+
+if (!defined('ABSPATH')) { exit; }
+
+class VPP_Plugin {
+    const OPT_KEY = 'vpp_settings';
+    const NONCE_KEY = 'vpp_nonce';
+    const QUERY_VAR = 'vpp_slug';
+
+    private static $instance = null;
+    public static function instance() {
+        if (self::$instance === null) { self::$instance = new self(); }
+        return self::$instance;
+    }
+
+    private function __construct() {
+        add_action('init', [$this, 'register_rewrite']);
+        add_action('template_redirect', [$this, 'maybe_render_vpp']);
+        add_filter('query_vars', [$this, 'add_query_var']);
+        register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
+        register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
+
+        if (is_admin()) {
+            add_action('admin_menu', [$this, 'admin_menu']);
+            add_action('admin_init', [$this, 'register_settings']);
+            add_action('admin_post_vpp_save_settings', [$this, 'handle_save_settings']);
+            add_action('admin_post_vpp_test_tidb', [$this, 'handle_test_tidb']);
+            add_action('admin_post_vpp_test_algolia', [$this, 'handle_test_algolia']);
+            add_action('admin_post_vpp_push_publish', [$this, 'handle_push_publish']);
+            add_action('admin_post_vpp_push_algolia', [$this, 'handle_push_algolia']);
+            add_action('admin_notices', [$this, 'maybe_admin_notice']);
+        }
+
+        add_action('wp_enqueue_scripts', [$this, 'enqueue_assets']);
+    }
+
+    public static function on_activate() { self::instance()->register_rewrite(); flush_rewrite_rules(); }
+    public static function on_deactivate() { flush_rewrite_rules(); }
+
+    public function add_query_var($vars) { $vars[] = self::QUERY_VAR; return $vars; }
+
+    public function register_rewrite() {
+        add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+    }
+
+    public function enqueue_assets() {
+        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], '1.0.1');
+        if (get_query_var(self::QUERY_VAR)) wp_enqueue_style('vpp-styles');
+    }
+
+    /* ========= SETTINGS ========= */
+
+    public function admin_menu() {
+        add_menu_page('Virtual Products', 'Virtual Products', 'manage_options', 'vpp_settings', [$this, 'render_settings_page'], 'dashicons-archive', 58);
+    }
+
+    public function register_settings() {
+        // Only for sanitization; we save via custom admin-post to keep the page clean.
+        register_setting(self::OPT_KEY, self::OPT_KEY, [$this, 'sanitize_settings']);
+    }
+
+    public function get_settings() {
+        $defaults = [
+            'tidb' => ['host'=>'','port'=>'4000','database'=>'','user'=>'','pass'=>'','table'=>'products'],
+            'algolia' => ['app_id'=>'','admin_key'=>'','index'=>''],
+            'cloudflare' => ['api_token'=>'','zone_id'=>'','site_base'=>''],
+        ];
+        $opt = get_option(self::OPT_KEY);
+        if (!is_array($opt)) $opt = [];
+        $out = wp_parse_args($opt, $defaults);
+        $out['tidb'] = wp_parse_args(is_array($out['tidb']) ? $out['tidb'] : [], $defaults['tidb']);
+        $out['algolia'] = wp_parse_args(is_array($out['algolia']) ? $out['algolia'] : [], $defaults['algolia']);
+        $out['cloudflare'] = wp_parse_args(is_array($out['cloudflare']) ? $out['cloudflare'] : [], $defaults['cloudflare']);
+        return $out;
+    }
+
+    public function sanitize_settings($input) {
+        $out = $this->get_settings();
+        if (isset($input['tidb'])) {
+            $out['tidb']['host'] = sanitize_text_field($input['tidb']['host'] ?? '');
+            $out['tidb']['port'] = sanitize_text_field($input['tidb']['port'] ?? '4000');
+            $out['tidb']['database'] = sanitize_text_field($input['tidb']['database'] ?? '');
+            $out['tidb']['user'] = sanitize_text_field($input['tidb']['user'] ?? '');
+            $out['tidb']['pass'] = $input['tidb']['pass'] ?? '';
+            $out['tidb']['table'] = sanitize_text_field($input['tidb']['table'] ?? 'products');
+        }
+        if (isset($input['algolia'])) {
+            $out['algolia']['app_id'] = sanitize_text_field($input['algolia']['app_id'] ?? '');
+            $out['algolia']['admin_key'] = sanitize_text_field($input['algolia']['admin_key'] ?? '');
+            $out['algolia']['index'] = sanitize_text_field($input['algolia']['index'] ?? '');
+        }
+        if (isset($input['cloudflare'])) {
+            $out['cloudflare']['api_token'] = sanitize_text_field($input['cloudflare']['api_token'] ?? '');
+            $out['cloudflare']['zone_id'] = sanitize_text_field($input['cloudflare']['zone_id'] ?? '');
+            $out['cloudflare']['site_base'] = esc_url_raw($input['cloudflare']['site_base'] ?? '');
+        }
+        return $out;
+    }
+
+    public function render_settings_page() {
+        if (!current_user_can('manage_options')) return;
+        $s = $this->get_settings();
+        ?>
+        <div class="wrap">
+            <h1>Virtual Product Pages</h1>
+            <?php $this->maybe_admin_notice(); ?>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <input type="hidden" name="action" value="vpp_save_settings"/>
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <h2 class="title">Connections</h2>
+                <table class="form-table"><tbody>
+                    <tr><th scope="row">TiDB Host</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][host]" value="<?php echo esc_attr($s['tidb']['host']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">TiDB Port</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][port]" value="<?php echo esc_attr($s['tidb']['port']); ?>" class="small-text"></td></tr>
+                    <tr><th scope="row">TiDB Database</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][database]" value="<?php echo esc_attr($s['tidb']['database']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">TiDB User</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][user]" value="<?php echo esc_attr($s['tidb']['user']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">TiDB Password</th><td><input type="password" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][pass]" value="<?php echo esc_attr($s['tidb']['pass']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">TiDB Table</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][table]" value="<?php echo esc_attr($s['tidb']['table']); ?>" class="regular-text"><p class="description">Expected columns: id, slug, title_h1, brand, model, sku, images_json, desc_html, cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url, is_published, last_tidb_update_at</p></td></tr>
+                </tbody></table>
+
+                <table class="form-table"><tbody>
+                    <tr><th scope="row">Algolia App ID</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][app_id]" value="<?php echo esc_attr($s['algolia']['app_id']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">Algolia Admin API Key</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][admin_key]" value="<?php echo esc_attr($s['algolia']['admin_key']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">Algolia Index Name</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][index]" value="<?php echo esc_attr($s['algolia']['index']); ?>" class="regular-text"></td></tr>
+                </tbody></table>
+
+                <h2 class="title">Cloudflare (optional)</h2>
+                <table class="form-table"><tbody>
+                    <tr><th scope="row">API Token</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[cloudflare][api_token]" value="<?php echo esc_attr($s['cloudflare']['api_token']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">Zone ID</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[cloudflare][zone_id]" value="<?php echo esc_attr($s['cloudflare']['zone_id']); ?>" class="regular-text"></td></tr>
+                    <tr><th scope="row">Site Base URL</th><td><input type="url" placeholder="https://yourdomain.com" name="<?php echo esc_attr(self::OPT_KEY); ?>[cloudflare][site_base]" value="<?php echo esc_attr($s['cloudflare']['site_base']); ?>" class="regular-text"></td></tr>
+                </tbody></table>
+
+                <?php submit_button('Save Changes'); ?>
+            </form>
+
+            <h2 class="title">Test Connections</h2>
+            <p>Verify credentials without publishing anything.</p>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                    <input type="hidden" name="action" value="vpp_test_tidb"/>
+                    <?php wp_nonce_field(self::NONCE_KEY); ?>
+                    <?php submit_button('Test TiDB Connection', 'secondary', 'submit', false); ?>
+                </form>
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                    <input type="hidden" name="action" value="vpp_test_algolia"/>
+                    <?php wp_nonce_field(self::NONCE_KEY); ?>
+                    <?php submit_button('Test Algolia Connection', 'secondary', 'submit', false); ?>
+                </form>
+            </div>
+
+            <h2 class="title" style="margin-top:24px;">Push Actions</h2>
+            <p>Enter IDs or slugs (comma-separated).</p>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:1rem;">
+                <input type="hidden" name="action" value="vpp_push_publish"/>
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
+                <?php submit_button('Push to VPP (Publish)'); ?>
+            </form>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <input type="hidden" name="action" value="vpp_push_algolia"/>
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
+                <?php submit_button('Push to Algolia'); ?>
+            </form>
+        </div>
+        <?php
+    }
+
+    public function maybe_admin_notice() {
+        if (!empty($_GET['vpp_msg'])) {
+            $msg = sanitize_text_field(wp_unslash($_GET['vpp_msg']));
+            echo '<div class="notice notice-success is-dismissible"><p>'.esc_html($msg).'</p></div>';
+        }
+        if (!empty($_GET['vpp_err'])) {
+            $msg = sanitize_text_field(wp_unslash($_GET['vpp_err']));
+            echo '<div class="notice notice-error is-dismissible"><p>'.esc_html($msg).'</p></div>';
+        }
+    }
+
+    /* ========= ADMIN HANDLERS ========= */
+
+    public function handle_save_settings() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $input = isset($_POST[self::OPT_KEY]) ? (array) $_POST[self::OPT_KEY] : [];
+        $clean = $this->sanitize_settings($input);
+        update_option(self::OPT_KEY, $clean, false); // persistent
+        $redirect = add_query_arg(['vpp_msg'=> rawurlencode('Settings saved.')], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_test_tidb() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $err = null;
+        $conn = $this->db_connect($err);
+        if ($conn) { @$conn->close(); $ok = true; } else { $ok = false; }
+        $redirect = add_query_arg([$ok ? 'vpp_msg' : 'vpp_err' => rawurlencode($ok ? 'TiDB connection OK.' : ('TiDB connection failed: ' . $err))], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_test_algolia() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $s = $this->get_settings();
+        $app = trim($s['algolia']['app_id'] ?? '');
+        $key = trim($s['algolia']['admin_key'] ?? '');
+        $index = trim($s['algolia']['index'] ?? '');
+        if (!$app || !$key || !$index) {
+            $redirect = add_query_arg(['vpp_err'=> rawurlencode('Algolia not configured (app_id, admin_key, index required).')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        $endpoint = "https://{$app}-dsn.algolia.net/1/indexes/" . rawurlencode($index);
+        $resp = wp_remote_request($endpoint, [
+            'method' => 'GET',
+            'headers' => [
+                'X-Algolia-API-Key' => $key,
+                'X-Algolia-Application-Id' => $app
+            ],
+            'timeout' => 10,
+        ]);
+        if (is_wp_error($resp)) {
+            $redirect = add_query_arg(['vpp_err'=> rawurlencode('Algolia request failed: ' . $resp->get_error_message())], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $code = wp_remote_retrieve_response_code($resp);
+            if ($code >= 200 && $code < 300) {
+                $redirect = add_query_arg(['vpp_msg'=> rawurlencode('Algolia connection OK.')], admin_url('admin.php?page=vpp_settings'));
+            } else {
+                $redirect = add_query_arg(['vpp_err'=> rawurlencode('Algolia HTTP ' . $code)], admin_url('admin.php?page=vpp_settings'));
+            }
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
+    /* ========= DATA ACCESS ========= */
+
+    private function db_connect(&$err = null) {
+        $s = $this->get_settings();
+        $host = $s['tidb']['host']; $port = $s['tidb']['port']; $db = $s['tidb']['database']; $user = $s['tidb']['user']; $pass = $s['tidb']['pass'];
+        if (!$host || !$db || !$user) { $err = 'TiDB connection is not configured.'; return null; }
+        $mysqli = @mysqli_init();
+        if (!$mysqli) { $err = 'mysqli_init() failed'; return null; }
+        $mysqli->options(MYSQLI_OPT_CONNECT_TIMEOUT, 5);
+        @$mysqli->real_connect($host, $user, $pass, $db, (int)$port);
+        if ($mysqli->connect_errno) { $err = 'DB connect error: ' . $mysqli->connect_error; return null; }
+        @$mysqli->set_charset('utf8mb4');
+        return $mysqli;
+    }
+
+    private function fetch_product_by_slug($slug, &$err = null) {
+        $s = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) return null;
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html,
+                       cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url,
+                       is_published, last_tidb_update_at
+                FROM `{$table}` WHERE slug = ? LIMIT 2";
+        $stmt = $mysqli->prepare($sql);
+        if (!$stmt) { $err = 'DB prepare failed.'; return null; }
+        $stmt->bind_param('s', $slug);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $row = $res ? $res->fetch_assoc() : null;
+        $stmt->close();
+        @$mysqli->close();
+        if (!$row) { $err = 'Product not found.'; return null; }
+        return $row;
+    }
+
+    private function fetch_product_by_id($id, &$err = null) {
+        $s = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) return null;
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html,
+                       cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url,
+                       is_published, last_tidb_update_at
+                FROM `{$table}` WHERE id = ? LIMIT 1";
+        $stmt = $mysqli->prepare($sql);
+        if (!$stmt) { $err = 'DB prepare failed.'; return null; }
+        $stmt->bind_param('i', $id);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $row = $res ? $res->fetch_assoc() : null;
+        $stmt->close();
+        @$mysqli->close();
+        if (!$row) { $err = 'Product not found.'; return null; }
+        return $row;
+    }
+
+    private function publish_product($id_or_slug, &$err = null) {
+        $s = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) return false;
+        $is_num = ctype_digit((string)$id_or_slug);
+        if ($is_num) {
+            $sql = "UPDATE `{$table}` SET is_published = 1, last_tidb_update_at = NOW() WHERE id = ?";
+            $stmt = $mysqli->prepare($sql);
+            if (!$stmt) { $err = 'DB prepare failed.'; return false; }
+            $id = (int)$id_or_slug;
+            $stmt->bind_param('i', $id);
+        } else {
+            $sql = "UPDATE `{$table}` SET is_published = 1, last_tidb_update_at = NOW() WHERE slug = ?";
+            $stmt = $mysqli->prepare($sql);
+            if (!$stmt) { $err = 'DB prepare failed.'; return false; }
+            $slug = $id_or_slug;
+            $stmt->bind_param('s', $slug);
+        }
+        $ok = $stmt->execute();
+        $stmt->close();
+        @$mysqli->close();
+        if (!$ok) { $err = 'Publish failed.'; return false; }
+        return true;
+    }
+
+    private function purge_cloudflare_url($url) {
+        $s = $this->get_settings();
+        $token = $s['cloudflare']['api_token'];
+        $zone  = $s['cloudflare']['zone_id'];
+        if (!$token || !$zone || !$url) return;
+        $endpoint = "https://api.cloudflare.com/client/v4/zones/{$zone}/purge_cache";
+        $body = json_encode(['files'=>[$url]]);
+        $args = [
+            'method' => 'POST',
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'Authorization' => 'Bearer ' . $token,
+            ],
+            'body' => $body,
+            'timeout' => 10,
+        ];
+        $resp = wp_remote_post($endpoint, $args);
+    }
+
+    private function push_algolia($product, &$err = null) {
+        $s = $this->get_settings();
+        $app = $s['algolia']['app_id'];
+        $key = $s['algolia']['admin_key'];
+        $index = $s['algolia']['index'];
+        if (!$app || !$key || !$index) { $err = 'Algolia not configured.'; return false; }
+
+        $record = [
+            'objectID' => (string)$product['id'],
+            'title' => (string)$product['title_h1'],
+            'slug'  => (string)$product['slug'],
+            'url'   => home_url('/p/' . $product['slug']),
+            'brand' => $product['brand'] ?? '',
+            'model' => $product['model'] ?? '',
+            'sku'   => $product['sku'] ?? '',
+            'cta_available_types' => [],
+            'last_updated' => $product['last_tidb_update_at'] ?? '',
+        ];
+
+        $img = '';
+        if (!empty($product['images_json'])) {
+            $arr = json_decode($product['images_json'], true);
+            if (is_array($arr) && !empty($arr)) { $img = $arr[0]; }
+        }
+        if ($img) { $record['image_thumb'] = $img; }
+
+        $snippet = '';
+        if (!empty($product['desc_html'])) {
+            $snippet = wp_strip_all_tags($product['desc_html']);
+            if (function_exists('mb_substr')) { $snippet = mb_substr($snippet, 0, 180); } else { $snippet = substr($snippet, 0, 180); }
+        } else {
+            $parts = array_filter([$product['brand'] ?? '', $product['model'] ?? '', $product['sku'] ?? '']);
+            $snippet = trim(implode(' • ', $parts));
+        }
+        if ($snippet) $record['snippet'] = $snippet;
+
+        $primary = '';
+        if (!empty($product['cta_lead_url'])) { $primary = 'lead'; $record['cta_available_types'][] = 'lead'; }
+        if (!empty($product['cta_stripe_url'])) { if (!$primary) $primary='stripe'; $record['cta_available_types'][] = 'stripe'; }
+        if (!empty($product['cta_affiliate_url'])) { if (!$primary) $primary='affiliate'; $record['cta_available_types'][] = 'affiliate'; }
+        if (!empty($product['cta_paypal_url'])) { if (!$primary) $primary='paypal'; $record['cta_available_types'][] = 'paypal'; }
+        if ($primary) $record['cta_primary_type'] = $primary;
+
+        $endpoint = "https://{$app}-dsn.algolia.net/1/indexes/" . rawurlencode($index) . "/" . rawurlencode($record['objectID']);
+        $args = [
+            'method' => 'PUT',
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'X-Algolia-API-Key' => $key,
+                'X-Algolia-Application-Id' => $app
+            ],
+            'body' => wp_json_encode($record),
+            'timeout' => 15,
+        ];
+        $resp = wp_remote_request($endpoint, $args);
+        if (is_wp_error($resp)) { $err = $resp->get_error_message(); return false; }
+        $code = wp_remote_retrieve_response_code($resp);
+        if ($code < 200 || $code >= 300) { $err = 'Algolia HTTP ' . $code; return false; }
+        return true;
+    }
+
+    /* ========= ADMIN ACTIONS ========= */
+
+    public function handle_push_publish() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $ids = isset($_POST['vpp_ids']) ? wp_unslash($_POST['vpp_ids']) : '';
+        $list = array_filter(array_map('trim', explode(',', $ids)));
+        $ok = 0; $fail = 0; $msg = '';
+        foreach ($list as $id_or_slug) {
+            $err = null;
+            if ($this->publish_product($id_or_slug, $err)) {
+                $slug = ctype_digit((string)$id_or_slug) ? null : $id_or_slug;
+                if (!$slug) {
+                    $p = $this->fetch_product_by_id((int)$id_or_slug, $tmp);
+                    if ($p && !empty($p['slug'])) $slug = $p['slug'];
+                }
+                if ($slug) {
+                    $site = $this->get_settings()['cloudflare']['site_base'];
+                    $url = $site ? rtrim($site,'/') . '/p/' . $slug : home_url('/p/' . $slug);
+                    $this->purge_cloudflare_url($url);
+                }
+                $ok++;
+            } else { $fail++; $msg = $err ?: 'Unknown error'; }
+        }
+        $redirect = add_query_arg($fail ? ['vpp_err'=> rawurlencode("Published {$ok}, failed {$fail}. {$msg}")] : ['vpp_msg'=> rawurlencode("Published {$ok}, failed {$fail}.")], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_push_algolia() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $ids = isset($_POST['vpp_ids']) ? wp_unslash($_POST['vpp_ids']) : '';
+        $list = array_filter(array_map('trim', explode(',', $ids)));
+        $ok = 0; $fail = 0; $msg = '';
+        foreach ($list as $id_or_slug) {
+            $err = null;
+            $product = ctype_digit((string)$id_or_slug) ? $this->fetch_product_by_id((int)$id_or_slug, $err) : $this->fetch_product_by_slug($id_or_slug, $err);
+            if ($product && $this->push_algolia($product, $err)) { $ok++; }
+            else { $fail++; $msg = $err ?: 'Unknown error'; }
+        }
+        $redirect = add_query_arg($fail ? ['vpp_err'=> rawurlencode("Algolia push: {$ok} ok, {$fail} failed. {$msg}")] : ['vpp_msg'=> rawurlencode("Algolia push: {$ok} ok, {$fail} failed.")], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    /* ========= FRONT RENDER ========= */
+
+    public function maybe_render_vpp() {
+        $slug = get_query_var(self::QUERY_VAR);
+        if (!$slug) return;
+        $err = null;
+        $product = $this->fetch_product_by_slug($slug, $err);
+        if (!$product || empty($product['is_published'])) {
+            status_header(404);
+            nocache_headers();
+            echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
+            exit;
+        }
+        $this->render_product($product);
+        exit;
+    }
+
+    private function allowed_html() {
+        return [
+            'h2'=>['id'=>[]], 'h3'=>['id'=>[]], 'h4'=>['id'=>[]],
+            'p'=>['class'=>[]], 'br'=>[], 'hr'=>[],
+            'ul'=>['class'=>[]], 'ol'=>['class'=>[]], 'li'=>['class'=>[]],
+            'strong'=>[], 'em'=>[], 'u'=>[], 'span'=>['class'=>[]],
+            'a'=>['href'=>[], 'title'=>[], 'rel'=>[], 'target'=>[]],
+            'table'=>['class'=>[]], 'thead'=>[], 'tbody'=>[], 'tr'=>[], 'th'=>[], 'td'=>['colspan'=>[], 'rowspan'=>[]],
+            'code'=>[], 'pre'=>[],
+        ];
+    }
+
+    private function pick_primary_cta($p) {
+        if (!empty($p['cta_lead_url'])) return ['type'=>'lead','url'=>$p['cta_lead_url'],'rel'=>'nofollow'];
+        if (!empty($p['cta_stripe_url'])) return ['type'=>'stripe','url'=>$p['cta_stripe_url'],'rel'=>'nofollow'];
+        if (!empty($p['cta_affiliate_url'])) return ['type'=>'affiliate','url'=>$p['cta_affiliate_url'],'rel'=>'sponsored nofollow'];
+        if (!empty($p['cta_paypal_url'])) return ['type'=>'paypal','url'=>$p['cta_paypal_url'],'rel'=>'nofollow'];
+        return null;
+    }
+
+    private function secondary_ctas($p) {
+        $out = [];
+        if (!empty($p['cta_lead_url'])) $out[] = ['type'=>'lead','url'=>$p['cta_lead_url'],'rel'=>'nofollow'];
+        if (!empty($p['cta_stripe_url'])) $out[] = ['type'=>'stripe','url'=>$p['cta_stripe_url'],'rel'=>'nofollow'];
+        if (!empty($p['cta_affiliate_url'])) $out[] = ['type'=>'affiliate','url'=>$p['cta_affiliate_url'],'rel'=>'sponsored nofollow'];
+        if (!empty($p['cta_paypal_url'])) $out[] = ['type'=>'paypal','url'=>$p['cta_paypal_url'],'rel'=>'nofollow'];
+        return $out;
+    }
+
+    private function render_product($p) {
+        $title = $p['title_h1'] ?: $p['slug'];
+        $brand = $p['brand'] ?? '';
+        $model = $p['model'] ?? '';
+        $sku   = $p['sku'] ?? '';
+        $images = [];
+        if (!empty($p['images_json'])) {
+            $arr = json_decode($p['images_json'], true);
+            if (is_array($arr)) $images = $arr;
+        }
+        $primary = $this->pick_primary_cta($p);
+        $secondary = $this->secondary_ctas($p);
+        $allowed = $this->allowed_html();
+        $meta_line = trim(implode(' • ', array_filter([$brand, $model, $sku])));
+
+        @header('Content-Type: text/html; charset=utf-8');
+        @header('Cache-Control: public, max-age=300');
+        ?>
+<!doctype html>
+<html <?php language_attributes(); ?>>
+<head>
+<meta charset="<?php bloginfo('charset'); ?>">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title><?php echo esc_html($title); ?></title>
+<link rel="canonical" href="<?php echo esc_url(home_url('/p/' . $p['slug'])); ?>">
+<?php wp_head(); ?>
+</head>
+<body class="vpp-body">
+<main class="vpp-container">
+  <article class="vpp">
+    <section class="vpp-hero card-elevated">
+      <div class="vpp-grid">
+        <div class="vpp-media">
+          <?php if (!empty($images)): ?>
+              <img src="<?php echo esc_url($images[0]); ?>" alt="<?php echo esc_attr($title); ?>" loading="eager" decoding="async" class="vpp-main-image"/>
+              <?php if (count($images) > 1): ?>
+                <div class="vpp-thumbs">
+                  <?php foreach (array_slice($images, 1, 6) as $thumb): ?>
+                    <img src="<?php echo esc_url($thumb); ?>" alt="<?php echo esc_attr($title); ?>" loading="lazy" decoding="async" class="vpp-thumb"/>
+                  <?php endforeach; ?>
+                </div>
+              <?php endif; ?>
+          <?php else: ?>
+              <div class="vpp-placeholder">
+                <div class="vpp-ph-img"></div>
+              </div>
+          <?php endif; ?>
+        </div>
+        <div class="vpp-summary">
+          <h1 class="vpp-title"><?php echo esc_html($title); ?></h1>
+          <?php if ($meta_line): ?><p class="vpp-meta"><?php echo esc_html($meta_line); ?></p><?php endif; ?>
+
+          <?php if ($primary): ?>
+            <div class="vpp-cta-block">
+              <a class="vpp-cta-primary glow" href="<?php echo esc_url($primary['url']); ?>" rel="<?php echo esc_attr($primary['rel']); ?>">
+                <?php
+                  $labels = ['lead'=>'Request a Quote','stripe'=>'Buy via Stripe','affiliate'=>'Buy Now','paypal'=>'Pay with PayPal'];
+                  echo esc_html($labels[$primary['type']]);
+                ?>
+              </a>
+              <div class="vpp-cta-secondary">
+                <?php
+                foreach ($secondary as $btn) {
+                    if ($primary && $btn['type'] === $primary['type'] && $btn['url'] === $primary['url']) continue;
+                    $labels = ['lead'=>'Request a Quote','stripe'=>'Buy via Stripe','affiliate'=>'Buy Now','paypal'=>'Pay with PayPal'];
+                    echo '<a class="vpp-cta-secondary-btn" href="'.esc_url($btn['url']).'" rel="'.esc_attr($btn['rel']).'">'.esc_html($labels[$btn['type']]).'</a>';
+                }
+                ?>
+              </div>
+            </div>
+          <?php endif; ?>
+        </div>
+      </div>
+    </section>
+
+    <section class="vpp-content card">
+      <?php
+        $html = $p['desc_html'] ?? '';
+        if ($html) {
+            echo wp_kses($html, $allowed);
+        } else {
+            echo '<p>No description available yet.</p>';
+        }
+      ?>
+    </section>
+  </article>
+</main>
+<?php wp_footer(); ?>
+</body>
+</html>
+        <?php
+    }
+}
+
+VPP_Plugin::instance();
+""")
+
+css = textwrap.dedent("""\
+/* Minimal Vercel-like look */
+.vpp-body { background: #0b0e13; color: #0e1116; }
+.vpp-container { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }
+.vpp .card, .vpp .card-elevated {
+  background: #fff;
+  border-radius: 16px;
+  padding: 1.25rem;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.05);
+}
+.vpp .card-elevated {
+  box-shadow: 0 20px 40px rgba(0,0,0,0.25), 0 1px 0 rgba(0,0,0,0.05);
+}
+.vpp-hero { margin-bottom: 1rem; }
+.vpp-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 2rem; }
+@media (max-width: 900px) { .vpp-grid { grid-template-columns: 1fr; } }
+
+.vpp-media { display:flex; flex-direction:column; gap: .75rem; }
+.vpp-main-image { width: 100%; height: auto; border-radius: 12px; background: #f3f4f6; }
+.vpp-thumbs { display:flex; gap: .5rem; flex-wrap: wrap; }
+.vpp-thumb { width: 88px; height: 64px; object-fit: cover; border-radius: 8px; background: #f3f4f6; }
+
+.vpp-placeholder { display:flex; align-items:center; justify-content:center; height: 360px; background: linear-gradient(180deg,#f3f4f6,#e5e7eb); border-radius: 12px; }
+.vpp-ph-img { width: 60%; height: 70%; border-radius: 12px; background: repeating-linear-gradient(45deg,#e5e7eb,#e5e7eb 12px,#f3f4f6 12px,#f3f4f6 24px); }
+
+.vpp-summary { display:flex; flex-direction:column; gap: .75rem; }
+.vpp-title { font-size: clamp(1.6rem, 2vw, 2.2rem); font-weight: 800; margin: 0; color: #111827; }
+.vpp-meta { color: #6b7280; margin: 0; }
+
+.vpp-cta-block { margin-top: .75rem; display:flex; flex-direction:column; gap: .5rem; }
+.vpp-cta-primary {
+  display:inline-block; text-decoration:none; padding: .85rem 1.2rem; font-weight: 700;
+  border-radius: 999px; background: #2563eb; color: #fff; position: relative;
+  box-shadow: 0 8px 24px rgba(37,99,235,0.45);
+}
+/* luminous glow */
+.vpp-cta-primary.glow::before {
+  content:""; position:absolute; inset:-3px; border-radius: 999px;
+  background: radial-gradient( 120% 120% at 50% 0%, rgba(59,130,246,0.65), rgba(59,130,246,0.15) 60%, transparent 70% );
+  filter: blur(8px); z-index:-1;
+}
+.vpp-cta-primary:hover { transform: translateY(-1px); box-shadow: 0 12px 28px rgba(37,99,235,0.55); }
+.vpp-cta-secondary { display:flex; gap: .5rem; flex-wrap:wrap; }
+.vpp-cta-secondary-btn {
+  display:inline-block; text-decoration:none; padding: .6rem .9rem; font-weight: 600;
+  border-radius: 999px; background: #eef2ff; color: #1f2937;
+}
+
+.vpp-content { margin-top: 1rem; }
+.vpp-content h2 { font-size: 1.25rem; margin: 1rem 0 .5rem; }
+.vpp-content h3 { font-size: 1.05rem; margin: .75rem 0 .25rem; }
+.vpp-content table { width:100%; border-collapse: collapse; margin: .75rem 0; }
+.vpp-content th, .vpp-content td { border: 1px solid #e5e7eb; padding: .5rem .6rem; text-align:left; }
+.vpp-content a { color: #2563eb; }
+""")
+
+with open(os.path.join(root, "virtual-product-pages.php"), "w", encoding="utf-8") as f:
+    f.write(main_php)
+with open(os.path.join(assets, "vpp.css"), "w", encoding="utf-8") as f:
+    f.write(css)
+
+zip_path = "/mnt/data/virtual-product-pages-v1.0.1.zip"
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    for foldername, subfolders, filenames in os.walk(root):
+        for filename in filenames:
+            full_path = os.path.join(foldername, filename)
+            arcname = os.path.relpath(full_path, os.path.dirname(root))
+            z.write(full_path, arcname)
+
+zip_path
