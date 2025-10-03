@@ -28,8 +28,6 @@ class VPP_Plugin {
         add_action('init', [$this, 'register_rewrite']);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
         add_filter('query_vars', [$this, 'add_query_var']);
-        register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
-        register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
 
         if (is_admin()) {
             add_action('admin_menu', [$this, 'admin_menu']);
@@ -43,6 +41,8 @@ class VPP_Plugin {
             add_action('admin_post_vpp_rebuild_sitemaps', [$this, 'handle_rebuild_sitemaps']);
             add_action('admin_post_vpp_edit_load', [$this, 'handle_edit_load']);
             add_action('admin_post_vpp_edit_save', [$this, 'handle_edit_save']);
+            add_action('admin_post_vpp_download_log', [$this, 'handle_download_log']);
+            add_action('admin_post_vpp_clear_log', [$this, 'handle_clear_log']);
             add_action('admin_notices', [$this, 'maybe_admin_notice']);
         }
 
@@ -1337,5 +1337,8 @@ class VPP_Plugin {
         <?php
     }
 }
+
+register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
+register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
 
 VPP_Plugin::instance();
