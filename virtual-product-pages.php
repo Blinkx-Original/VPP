@@ -123,7 +123,6 @@ class VPP_Plugin {
         ?>
         <div class="wrap">
             <h1>Virtual Product Pages</h1>
-            <?php $this->maybe_admin_notice(); ?>
             <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                 <input type="hidden" name="action" value="vpp_save_settings"/>
                 <?php wp_nonce_field(self::NONCE_KEY); ?>
@@ -230,7 +229,6 @@ class VPP_Plugin {
         ?>
         <div class="wrap">
             <h1>VPP Status</h1>
-            <?php $this->maybe_admin_notice(); ?>
 
             <table class="widefat striped" style="max-width:720px; margin-top:1rem;">
                 <tbody>
@@ -455,7 +453,6 @@ class VPP_Plugin {
         ?>
         <div class="wrap">
             <h1>Edit Product</h1>
-            <?php $this->maybe_admin_notice(); ?>
 
             <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:1rem;">
                 <input type="hidden" name="action" value="vpp_edit_load"/>
