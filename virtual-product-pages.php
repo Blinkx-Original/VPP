@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.1.1
+ * Version: 1.2.0
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -35,6 +35,8 @@ class VPP_Plugin {
             add_action('admin_post_vpp_test_algolia', [$this, 'handle_test_algolia']);
             add_action('admin_post_vpp_push_publish', [$this, 'handle_push_publish']);
             add_action('admin_post_vpp_push_algolia', [$this, 'handle_push_algolia']);
+            add_action('admin_post_vpp_purge_cache', [$this, 'handle_purge_cache']);
+            add_action('admin_post_vpp_rebuild_sitemaps', [$this, 'handle_rebuild_sitemaps']);
             add_action('admin_post_vpp_edit_load', [$this, 'handle_edit_load']);
             add_action('admin_post_vpp_edit_save', [$this, 'handle_edit_save']);
             add_action('admin_notices', [$this, 'maybe_admin_notice']);
@@ -54,7 +56,7 @@ class VPP_Plugin {
     }
 
     public function enqueue_assets() {
-        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], '1.1.1');
+        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], '1.2.0');
         if (get_query_var(self::QUERY_VAR)) wp_enqueue_style('vpp-styles');
     }
 
@@ -166,6 +168,20 @@ class VPP_Plugin {
                 <?php wp_nonce_field(self::NONCE_KEY); ?>
                 <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
                 <?php submit_button('Push to Algolia'); ?>
+            </form>
+
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top:1rem;">
+                <input type="hidden" name="action" value="vpp_purge_cache"/>
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <?php submit_button('Purge Cache'); ?>
+            </form>
+
+            <h2 class="title" style="margin-top:24px;">SEO Tools</h2>
+            <p>Rebuild sitemap files for published products.</p>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <input type="hidden" name="action" value="vpp_rebuild_sitemaps"/>
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <?php submit_button('Rebuild Sitemap'); ?>
             </form>
         </div>
         <?php
@@ -606,23 +622,178 @@ class VPP_Plugin {
         return true;
     }
 
-    private function purge_cloudflare_url($url) {
+    private function purge_cloudflare(array $urls = [], &$err = null) {
         $s = $this->get_settings();
-        $token = $s['cloudflare']['api_token'];
-        $zone  = $s['cloudflare']['zone_id'];
-        if (!$token || !$zone || !$url) return;
+        $token = trim($s['cloudflare']['api_token'] ?? '');
+        $zone  = trim($s['cloudflare']['zone_id'] ?? '');
+        if (!$token || !$zone) { $err = 'Cloudflare credentials not configured.'; return false; }
+
         $endpoint = "https://api.cloudflare.com/client/v4/zones/{$zone}/purge_cache";
-        $body = json_encode(['files'=>[$url]]);
+        $payload = empty($urls)
+            ? ['purge_everything' => true]
+            : ['files' => array_values(array_filter($urls))];
+        if (empty($payload['purge_everything']) && empty($payload['files'])) {
+            $err = 'No URLs provided for purge.';
+            return false;
+        }
+
         $args = [
             'method' => 'POST',
             'headers' => [
                 'Content-Type' => 'application/json',
                 'Authorization' => 'Bearer ' . $token,
             ],
-            'body' => $body,
-            'timeout' => 10,
+            'body' => wp_json_encode($payload),
+            'timeout' => 15,
         ];
         $resp = wp_remote_post($endpoint, $args);
+        if (is_wp_error($resp)) { $err = 'Cloudflare request failed: ' . $resp->get_error_message(); return false; }
+        $code = wp_remote_retrieve_response_code($resp);
+        $body = json_decode(wp_remote_retrieve_body($resp), true);
+        if ($code < 200 || $code >= 300 || (is_array($body) && isset($body['success']) && !$body['success'])) {
+            $msg = is_array($body) && !empty($body['errors'][0]['message']) ? $body['errors'][0]['message'] : ('HTTP ' . $code);
+            $err = 'Cloudflare purge failed: ' . $msg;
+            return false;
+        }
+        return true;
+    }
+
+    private function purge_cloudflare_url($url) {
+        if (!$url) { return false; }
+        return $this->purge_cloudflare([$url]);
+    }
+
+    private function rebuild_sitemaps(&$summary = '', &$err = null) {
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) { return false; }
+
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $this->get_settings()['tidb']['table']);
+        $batch_size = 2000;
+        $chunk_size = 50000;
+        $offset = 0;
+        $total = 0;
+        $chunk_index = 0;
+        $chunk_entries = [];
+        $chunk_lastmod = 0;
+        $files = [];
+
+        $uploads = wp_upload_dir();
+        if (empty($uploads['basedir']) || empty($uploads['baseurl'])) {
+            @$mysqli->close();
+            $err = 'Uploads directory is not writable.';
+            return false;
+        }
+        $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps';
+        if (!wp_mkdir_p($dir)) {
+            @$mysqli->close();
+            $err = 'Failed to create sitemap directory.';
+            return false;
+        }
+        $dir = trailingslashit($dir);
+        $base_url = trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/';
+
+        // Clean previous sitemap files.
+        foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+        @unlink($dir . 'sitemap-index.xml');
+
+        $write_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err) {
+            if (empty($entries)) { return true; }
+            $filename = sprintf('sitemap-products-%d.xml', $index);
+            $path = $dir . $filename;
+            $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+            $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+            foreach ($entries as $entry) {
+                $loc = home_url('/p/' . $entry['slug']);
+                $xml .= "  <url>\n";
+                $xml .= '    <loc>' . $this->xml_escape($loc) . '</loc>' . "\n";
+                $xml .= '    <lastmod>' . gmdate('c', $entry['lastmod']) . '</lastmod>' . "\n";
+                $xml .= "  </url>\n";
+            }
+            $xml .= '</urlset>';
+            if (@file_put_contents($path, $xml) === false) {
+                $err = 'Failed to write ' . $filename;
+                return false;
+            }
+            $files[] = [
+                'loc' => $base_url . $filename,
+                'lastmod' => gmdate('c', $lastmod_ts ?: time()),
+            ];
+            return true;
+        };
+
+        while (true) {
+            $sql = sprintf(
+                "SELECT slug, last_tidb_update_at FROM `%s` WHERE is_published = 1 ORDER BY id LIMIT %d OFFSET %d",
+                $table,
+                $batch_size,
+                $offset
+            );
+            $res = $mysqli->query($sql);
+            if (!$res) {
+                @$mysqli->close();
+                $err = 'DB query failed: ' . $mysqli->error;
+                return false;
+            }
+
+            $row_count = 0;
+            while ($row = $res->fetch_assoc()) {
+                $row_count++;
+                $slug = trim($row['slug'] ?? '');
+                if ($slug === '') { continue; }
+                $lastmod = !empty($row['last_tidb_update_at']) ? strtotime($row['last_tidb_update_at']) : time();
+                if (!$lastmod) { $lastmod = time(); }
+                $chunk_entries[] = ['slug' => $slug, 'lastmod' => $lastmod];
+                $chunk_lastmod = max($chunk_lastmod, $lastmod);
+                $total++;
+                if (count($chunk_entries) >= $chunk_size) {
+                    $chunk_index++;
+                    if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) {
+                        $res->free();
+                        @$mysqli->close();
+                        return false;
+                    }
+                    $chunk_entries = [];
+                    $chunk_lastmod = 0;
+                }
+            }
+            $res->free();
+
+            if ($row_count < $batch_size) { break; }
+            $offset += $batch_size;
+        }
+
+        if (!empty($chunk_entries)) {
+            $chunk_index++;
+            if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) {
+                @$mysqli->close();
+                return false;
+            }
+        }
+
+        @$mysqli->close();
+
+        $index_path = $dir . 'sitemap-index.xml';
+        $index_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        $index_xml .= '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        foreach ($files as $file) {
+            $index_xml .= "  <sitemap>\n";
+            $index_xml .= '    <loc>' . $this->xml_escape($file['loc']) . '</loc>' . "\n";
+            $index_xml .= '    <lastmod>' . $file['lastmod'] . '</lastmod>' . "\n";
+            $index_xml .= "  </sitemap>\n";
+        }
+        $index_xml .= '</sitemapindex>';
+        if (@file_put_contents($index_path, $index_xml) === false) {
+            $err = 'Failed to write sitemap-index.xml';
+            return false;
+        }
+
+        $summary = sprintf(
+            'Generated %d sitemap file(s) covering %d product(s).',
+            count($files),
+            $total
+        );
+
+        return true;
     }
 
     private function push_algolia($product, &$err = null) {
@@ -733,6 +904,33 @@ class VPP_Plugin {
         wp_safe_redirect($redirect); exit;
     }
 
+    public function handle_purge_cache() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $err = null;
+        $ok = $this->purge_cloudflare([], $err);
+        if ($ok) {
+            $redirect = add_query_arg(['vpp_msg' => rawurlencode('Cloudflare cache purged.')], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Cloudflare purge failed.')], admin_url('admin.php?page=vpp_settings'));
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_rebuild_sitemaps() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $summary = '';
+        $err = null;
+        $ok = $this->rebuild_sitemaps($summary, $err);
+        if ($ok) {
+            $redirect = add_query_arg(['vpp_msg' => rawurlencode($summary ?: 'Sitemap rebuilt.')], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Sitemap rebuild failed.')], admin_url('admin.php?page=vpp_settings'));
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
     /* ========= FRONT RENDER ========= */
 
     public function maybe_render_vpp() {
@@ -760,6 +958,10 @@ class VPP_Plugin {
             'table'=>['class'=>[]], 'thead'=>[], 'tbody'=>[], 'tr'=>[], 'th'=>[], 'td'=>['colspan'=>[], 'rowspan'=>[]],
             'code'=>[], 'pre'=>[],
         ];
+    }
+
+    private function xml_escape($value) {
+        return htmlspecialchars((string)$value, ENT_XML1 | ENT_COMPAT, 'UTF-8');
     }
 
     private function pick_primary_cta($p) {
