@@ -1260,17 +1260,31 @@ class VPP_Plugin {
 
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
+        $body_class_filter = function ($classes) {
+            $classes[] = 'vpp-body';
+            return $classes;
+        };
+
+        $title_filter = function () use ($title) {
+            return $title;
+        };
+
+        $title_parts_filter = function ($parts) use ($title) {
+            $parts['title'] = $title;
+            return $parts;
+        };
+
+        $head_tag = function () use ($p) {
+            echo '<link rel="canonical" href="' . esc_url(home_url('/p/' . $p['slug'])) . '">';
+        };
+
+        add_filter('body_class', $body_class_filter);
+        add_filter('pre_get_document_title', $title_filter, 99);
+        add_filter('document_title_parts', $title_parts_filter, 99);
+        add_action('wp_head', $head_tag, 1);
+
+        get_header();
         ?>
-<!doctype html>
-<html <?php language_attributes(); ?>>
-<head>
-<meta charset="<?php bloginfo('charset'); ?>">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?php echo esc_html($title); ?></title>
-<link rel="canonical" href="<?php echo esc_url(home_url('/p/' . $p['slug'])); ?>">
-<?php wp_head(); ?>
-</head>
-<body class="vpp-body">
 <main class="vpp-container">
   <article class="vpp">
     <section class="vpp-hero card-elevated">
@@ -1331,10 +1345,13 @@ class VPP_Plugin {
     </section>
   </article>
 </main>
-<?php wp_footer(); ?>
-</body>
-</html>
-        <?php
+<?php
+        get_footer();
+
+        remove_filter('body_class', $body_class_filter);
+        remove_filter('pre_get_document_title', $title_filter, 99);
+        remove_filter('document_title_parts', $title_parts_filter, 99);
+        remove_action('wp_head', $head_tag, 1);
     }
 }
 
