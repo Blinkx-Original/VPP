@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.1.1
+ * Version: 1.3.0
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,6 +13,10 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
+    const VERSION = '1.3.0';
+    const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
+    const LOG_SUBDIR = 'vpp-logs';
+    const LOG_FILENAME = 'vpp.log';
 
     private static $instance = null;
     public static function instance() {
@@ -35,6 +39,10 @@ class VPP_Plugin {
             add_action('admin_post_vpp_test_algolia', [$this, 'handle_test_algolia']);
             add_action('admin_post_vpp_push_publish', [$this, 'handle_push_publish']);
             add_action('admin_post_vpp_push_algolia', [$this, 'handle_push_algolia']);
+            add_action('admin_post_vpp_purge_cache', [$this, 'handle_purge_cache']);
+            add_action('admin_post_vpp_rebuild_sitemaps', [$this, 'handle_rebuild_sitemaps']);
+            add_action('admin_post_vpp_download_log', [$this, 'handle_download_log']);
+            add_action('admin_post_vpp_clear_log', [$this, 'handle_clear_log']);
             add_action('admin_post_vpp_edit_load', [$this, 'handle_edit_load']);
             add_action('admin_post_vpp_edit_save', [$this, 'handle_edit_save']);
             add_action('admin_notices', [$this, 'maybe_admin_notice']);
@@ -54,7 +62,7 @@ class VPP_Plugin {
     }
 
     public function enqueue_assets() {
-        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], '1.1.1');
+        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
         if (get_query_var(self::QUERY_VAR)) wp_enqueue_style('vpp-styles');
     }
 
@@ -63,6 +71,7 @@ class VPP_Plugin {
     public function admin_menu() {
         add_menu_page('Virtual Products', 'Virtual Products', 'manage_options', 'vpp_settings', [$this, 'render_settings_page'], 'dashicons-archive', 58);
         add_submenu_page('vpp_settings', 'Edit Product', 'Edit Product', 'manage_options', 'vpp_edit', [$this, 'render_edit_page']);
+        add_submenu_page('vpp_settings', 'VPP Status', 'VPP Status', 'manage_options', 'vpp_status', [$this, 'render_status_page']);
     }
 
     public function register_settings() {
@@ -167,6 +176,20 @@ class VPP_Plugin {
                 <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
                 <?php submit_button('Push to Algolia'); ?>
             </form>
+
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top:1rem;">
+                <input type="hidden" name="action" value="vpp_purge_cache"/>
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <?php submit_button('Purge Cache'); ?>
+            </form>
+
+            <h2 class="title" style="margin-top:24px;">SEO Tools</h2>
+            <p>Rebuild sitemap files for published products.</p>
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <input type="hidden" name="action" value="vpp_rebuild_sitemaps"/>
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <?php submit_button('Rebuild Sitemap'); ?>
+            </form>
         </div>
         <?php
     }
@@ -180,6 +203,220 @@ class VPP_Plugin {
             $msg = sanitize_text_field(wp_unslash($_GET['vpp_err']));
             echo '<div class="notice notice-error is-dismissible"><p>'.esc_html($msg).'</p></div>';
         }
+    }
+
+    /* ========= STATUS & LOGS ========= */
+
+    public function render_status_page() {
+        if (!current_user_can('manage_options')) { return; }
+
+        $published_err = null;
+        $published_count = $this->count_published_products($published_err);
+
+        $tidb_status = $published_count === null ? 'Error' : 'OK';
+        $tidb_message = $published_err ?: ($tidb_status === 'OK' ? 'Connection OK.' : '');
+
+        $sitemap_meta = $this->get_sitemap_meta();
+        $last_total = isset($sitemap_meta['total']) ? (int)$sitemap_meta['total'] : null;
+        $last_files = isset($sitemap_meta['file_count']) ? (int)$sitemap_meta['file_count'] : null;
+        $last_generated = isset($sitemap_meta['generated_at']) ? (int)$sitemap_meta['generated_at'] : 0;
+        $index_url = !empty($sitemap_meta['index_url']) ? $sitemap_meta['index_url'] : '';
+
+        $algolia_message = '';
+        $algolia_status = $this->check_algolia_status($algolia_message);
+
+        $log_excerpt = $this->get_log_excerpt();
+
+        ?>
+        <div class="wrap">
+            <h1>VPP Status</h1>
+            <?php $this->maybe_admin_notice(); ?>
+
+            <table class="widefat striped" style="max-width:720px; margin-top:1rem;">
+                <tbody>
+                    <tr>
+                        <th scope="row">Published products</th>
+                        <td>
+                            <?php
+                            if ($published_count !== null) {
+                                echo esc_html(number_format_i18n($published_count));
+                            } else {
+                                echo '—';
+                                if ($published_err) {
+                                    echo ' <span style="color:#b32d2e;">' . esc_html($published_err) . '</span>';
+                                }
+                            }
+                            ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">URLs in last sitemap</th>
+                        <td><?php echo $last_total !== null ? esc_html(number_format_i18n($last_total)) : '—'; ?></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Sitemap files</th>
+                        <td><?php echo $last_files !== null ? esc_html(number_format_i18n($last_files)) : '—'; ?></td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Last sitemap rebuild</th>
+                        <td>
+                            <?php
+                            if ($last_generated) {
+                                $format = get_option('date_format') . ' ' . get_option('time_format');
+                                echo esc_html(date_i18n($format, $last_generated));
+                            } else {
+                                echo 'Never';
+                            }
+                            ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Sitemap index URL</th>
+                        <td>
+                            <?php if ($index_url) : ?>
+                                <a href="<?php echo esc_url($index_url); ?>" target="_blank" rel="noopener"><?php echo esc_html($index_url); ?></a>
+                            <?php else : ?>
+                                —
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">TiDB connection</th>
+                        <td>
+                            <strong><?php echo esc_html($tidb_status); ?></strong>
+                            <?php if ($tidb_message) : ?>
+                                <span style="margin-left:0.5rem;"><?php echo esc_html($tidb_message); ?></span>
+                            <?php endif; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Algolia connection</th>
+                        <td>
+                            <?php
+                            if ($algolia_status === null) {
+                                echo esc_html('Not configured.');
+                            } else {
+                                echo '<strong>' . esc_html($algolia_status ? 'OK' : 'Error') . '</strong>';
+                                if ($algolia_message) {
+                                    echo ' <span style="margin-left:0.5rem;">' . esc_html($algolia_message) . '</span>';
+                                }
+                            }
+                            ?>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <h2 style="margin-top:2rem;">Logs</h2>
+            <p>The plugin records errors to <code>/wp-content/uploads/<?php echo esc_html(self::LOG_SUBDIR . '/' . self::LOG_FILENAME); ?></code>.</p>
+            <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                    <input type="hidden" name="action" value="vpp_download_log"/>
+                    <?php wp_nonce_field(self::NONCE_KEY); ?>
+                    <?php submit_button('Download Log', 'secondary', 'submit', false); ?>
+                </form>
+                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" onsubmit="return confirm('Clear the VPP log?');">
+                    <input type="hidden" name="action" value="vpp_clear_log"/>
+                    <?php wp_nonce_field(self::NONCE_KEY); ?>
+                    <?php submit_button('Clear Log', 'secondary', 'submit', false); ?>
+                </form>
+            </div>
+
+            <?php if ($log_excerpt !== '') : ?>
+                <textarea readonly rows="12" style="width:100%; margin-top:1rem; font-family:monospace;">
+<?php echo esc_textarea($log_excerpt); ?>
+                </textarea>
+            <?php else : ?>
+                <p style="margin-top:1rem;">No log entries recorded yet.</p>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
+    private function get_log_file_path($ensure_dir = false) {
+        $uploads = wp_upload_dir();
+        if (empty($uploads['basedir'])) { return ''; }
+        $dir = trailingslashit($uploads['basedir']) . self::LOG_SUBDIR;
+        if ($ensure_dir && !wp_mkdir_p($dir)) { return ''; }
+        return trailingslashit($dir) . self::LOG_FILENAME;
+    }
+
+    private function get_log_excerpt($max_bytes = 65536) {
+        $path = $this->get_log_file_path();
+        if (!$path || !file_exists($path)) { return ''; }
+        $size = @filesize($path);
+        if (!$size) { return ''; }
+        $offset = max(0, $size - $max_bytes);
+        $content = @file_get_contents($path, false, null, $offset);
+        if ($content === false) { return ''; }
+        if ($offset > 0) {
+            $content = "(trimmed)\n" . ltrim($content);
+        }
+        return trim($content);
+    }
+
+    private function get_sitemap_meta() {
+        $meta = get_option(self::SITEMAP_META_OPTION);
+        if (!is_array($meta)) { $meta = []; }
+        return $meta;
+    }
+
+    private function count_published_products(&$err = null) {
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) { return null; }
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $this->get_settings()['tidb']['table']);
+        $sql = "SELECT COUNT(*) AS total FROM `{$table}` WHERE is_published = 1";
+        $res = $mysqli->query($sql);
+        if (!$res) {
+            $err = 'DB query failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            @$mysqli->close();
+            return null;
+        }
+        $row = $res->fetch_assoc();
+        $res->free();
+        @$mysqli->close();
+        return isset($row['total']) ? (int)$row['total'] : 0;
+    }
+
+    private function check_algolia_status(&$message = '') {
+        $s = $this->get_settings();
+        $app = trim($s['algolia']['app_id'] ?? '');
+        $key = trim($s['algolia']['admin_key'] ?? '');
+        $index = trim($s['algolia']['index'] ?? '');
+        if (!$app || !$key || !$index) { $message = 'Not configured.'; return null; }
+
+        $endpoint = "https://{$app}-dsn.algolia.net/1/indexes/" . rawurlencode($index);
+        $resp = wp_remote_request($endpoint, [
+            'method' => 'GET',
+            'headers' => [
+                'X-Algolia-API-Key' => $key,
+                'X-Algolia-Application-Id' => $app,
+            ],
+            'timeout' => 10,
+        ]);
+
+        if (is_wp_error($resp)) {
+            $message = $resp->get_error_message();
+            $this->log_error('algolia', 'Status check failed: ' . $message);
+            return false;
+        }
+        $code = wp_remote_retrieve_response_code($resp);
+        if ($code >= 200 && $code < 300) {
+            $message = 'Connection OK.';
+            return true;
+        }
+        $message = 'HTTP ' . $code;
+        $this->log_error('algolia', 'Status check HTTP ' . $code);
+        return false;
+    }
+
+    private function log_error($context, $message) {
+        $path = $this->get_log_file_path(true);
+        if (!$path) { return; }
+        $time = current_time('mysql');
+        $line = sprintf("[%s] [%s] %s\n", $time, strtoupper($context), trim((string)$message));
+        @file_put_contents($path, $line, FILE_APPEND | LOCK_EX);
     }
 
     /* ========= ADMIN: EDIT PRODUCT ========= */
@@ -399,6 +636,7 @@ class VPP_Plugin {
         $sql = "UPDATE `{$table}` SET " . implode(', ', $set_parts) . " WHERE id = ?";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) {
+            $this->log_error('db_query', 'DB prepare failed: ' . $mysqli->error);
             $mysqli->close();
             $redirect = add_query_arg(['vpp_err'=> rawurlencode('DB prepare failed: ' . $mysqli->error)], admin_url('admin.php?page=vpp_edit&lookup_type=id&lookup_val='.$id));
             wp_safe_redirect($redirect); exit;
@@ -413,12 +651,16 @@ class VPP_Plugin {
         call_user_func_array([$stmt, 'bind_param'], $refs);
 
         $ok = $stmt->execute();
+        $stmt_error = $stmt->error;
         $stmt->close();
         @$mysqli->close();
 
         $inline = 'ok'; $inline_msg = 'Saved';
         $top_msg = 'Saved.';
-        if (!$ok) { $inline = 'err'; $inline_msg = 'Error saving'; $top_msg = 'Save failed.'; }
+        if (!$ok) {
+            $this->log_error('db_query', 'Product update failed: ' . $stmt_error);
+            $inline = 'err'; $inline_msg = 'Error saving'; $top_msg = 'Save failed.';
+        }
 
         // Handle post-actions
         if ($ok && isset($_POST['do_save_purge'])) {
@@ -489,13 +731,17 @@ class VPP_Plugin {
             'timeout' => 10,
         ]);
         if (is_wp_error($resp)) {
-            $redirect = add_query_arg(['vpp_err'=> rawurlencode('Algolia request failed: ' . $resp->get_error_message())], admin_url('admin.php?page=vpp_settings'));
+            $msg = 'Algolia request failed: ' . $resp->get_error_message();
+            $this->log_error('algolia', $msg);
+            $redirect = add_query_arg(['vpp_err'=> rawurlencode($msg)], admin_url('admin.php?page=vpp_settings'));
         } else {
             $code = wp_remote_retrieve_response_code($resp);
             if ($code >= 200 && $code < 300) {
                 $redirect = add_query_arg(['vpp_msg'=> rawurlencode('Algolia connection OK.')], admin_url('admin.php?page=vpp_settings'));
             } else {
-                $redirect = add_query_arg(['vpp_err'=> rawurlencode('Algolia HTTP ' . $code)], admin_url('admin.php?page=vpp_settings'));
+                $msg = 'Algolia HTTP ' . $code;
+                $this->log_error('algolia', 'Test failed: ' . $msg);
+                $redirect = add_query_arg(['vpp_err'=> rawurlencode($msg)], admin_url('admin.php?page=vpp_settings'));
             }
         }
         wp_safe_redirect($redirect); exit;
@@ -507,9 +753,9 @@ class VPP_Plugin {
         $s = $this->get_settings();
         $host = $s['tidb']['host']; $port = $s['tidb']['port']; $db = $s['tidb']['database']; $user = $s['tidb']['user']; $pass = $s['tidb']['pass'];
         $ssl_ca = trim($s['tidb']['ssl_ca']);
-        if (!$host || !$db || !$user) { $err = 'TiDB connection is not configured.'; return null; }
+        if (!$host || !$db || !$user) { $err = 'TiDB connection is not configured.'; $this->log_error('db_connect', $err); return null; }
         $mysqli = @mysqli_init();
-        if (!$mysqli) { $err = 'mysqli_init() failed'; return null; }
+        if (!$mysqli) { $err = 'mysqli_init() failed'; $this->log_error('db_connect', $err); return null; }
 
         // Enforce TLS for TiDB Serverless
         if ($ssl_ca && @file_exists($ssl_ca)) {
@@ -530,6 +776,7 @@ class VPP_Plugin {
                 $msg .= ' (Tip: set a valid SSL CA path in the plugin settings.)';
             }
             $err = 'DB connect error: ' . $msg;
+            $this->log_error('db_connect', $err);
             return null;
         }
         @$mysqli->set_charset('utf8mb4');
@@ -547,7 +794,7 @@ class VPP_Plugin {
                        is_published, last_tidb_update_at
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
-        if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; return null; }
+        if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
         $stmt->bind_param('s', $slug);
         $stmt->execute();
         $res = $stmt->get_result();
@@ -569,7 +816,7 @@ class VPP_Plugin {
                        is_published, last_tidb_update_at
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
-        if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; return null; }
+        if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
         $stmt->bind_param('i', $id);
         $stmt->execute();
         $res = $stmt->get_result();
@@ -589,40 +836,248 @@ class VPP_Plugin {
         if ($is_num) {
             $sql = "UPDATE `{$table}` SET is_published = 1, last_tidb_update_at = NOW() WHERE id = ?";
             $stmt = $mysqli->prepare($sql);
-            if (!$stmt) { $err = 'DB prepare failed.'; return false; }
+            if (!$stmt) { $err = 'DB prepare failed.'; $this->log_error('db_query', $err); return false; }
             $id = (int)$id_or_slug;
             $stmt->bind_param('i', $id);
         } else {
             $sql = "UPDATE `{$table}` SET is_published = 1, last_tidb_update_at = NOW() WHERE slug = ?";
             $stmt = $mysqli->prepare($sql);
-            if (!$stmt) { $err = 'DB prepare failed.'; return false; }
+            if (!$stmt) { $err = 'DB prepare failed.'; $this->log_error('db_query', $err); return false; }
             $slug = $id_or_slug;
             $stmt->bind_param('s', $slug);
         }
         $ok = $stmt->execute();
         $stmt->close();
         @$mysqli->close();
-        if (!$ok) { $err = 'Publish failed.'; return false; }
+        if (!$ok) { $err = 'Publish failed.'; $this->log_error('db_query', $err); return false; }
         return true;
     }
 
-    private function purge_cloudflare_url($url) {
+    private function purge_cloudflare(array $urls = [], &$err = null) {
         $s = $this->get_settings();
-        $token = $s['cloudflare']['api_token'];
-        $zone  = $s['cloudflare']['zone_id'];
-        if (!$token || !$zone || !$url) return;
+        $token = trim($s['cloudflare']['api_token'] ?? '');
+        $zone  = trim($s['cloudflare']['zone_id'] ?? '');
+        if (!$token || !$zone) { $err = 'Cloudflare credentials not configured.'; $this->log_error('cloudflare', $err); return false; }
+
         $endpoint = "https://api.cloudflare.com/client/v4/zones/{$zone}/purge_cache";
-        $body = json_encode(['files'=>[$url]]);
+        $payload = empty($urls)
+            ? ['purge_everything' => true]
+            : ['files' => array_values(array_filter($urls))];
+        if (empty($payload['purge_everything']) && empty($payload['files'])) {
+            $err = 'No URLs provided for purge.';
+            $this->log_error('cloudflare', $err);
+            return false;
+        }
+
         $args = [
             'method' => 'POST',
             'headers' => [
                 'Content-Type' => 'application/json',
                 'Authorization' => 'Bearer ' . $token,
             ],
-            'body' => $body,
-            'timeout' => 10,
+            'body' => wp_json_encode($payload),
+            'timeout' => 15,
         ];
         $resp = wp_remote_post($endpoint, $args);
+        if (is_wp_error($resp)) { $err = 'Cloudflare request failed: ' . $resp->get_error_message(); $this->log_error('cloudflare', $err); return false; }
+        $code = wp_remote_retrieve_response_code($resp);
+        $body = json_decode(wp_remote_retrieve_body($resp), true);
+        if ($code < 200 || $code >= 300 || (is_array($body) && isset($body['success']) && !$body['success'])) {
+            $msg = is_array($body) && !empty($body['errors'][0]['message']) ? $body['errors'][0]['message'] : ('HTTP ' . $code);
+            $err = 'Cloudflare purge failed: ' . $msg;
+            $this->log_error('cloudflare', $err);
+            return false;
+        }
+        return true;
+    }
+
+    private function purge_cloudflare_url($url) {
+        if (!$url) { return false; }
+        return $this->purge_cloudflare([$url]);
+    }
+
+    private function rebuild_sitemaps(&$summary = '', &$err = null, &$meta = null) {
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) { return false; }
+
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $this->get_settings()['tidb']['table']);
+        $batch_size = 2000;
+        $chunk_size = 50000;
+        $offset = 0;
+        $total = 0;
+        $chunk_index = 0;
+        $chunk_entries = [];
+        $chunk_lastmod = 0;
+        $files = [];
+
+        $uploads = wp_upload_dir();
+        if (empty($uploads['basedir']) || empty($uploads['baseurl'])) {
+            @$mysqli->close();
+            $err = 'Uploads directory is not writable.';
+            $this->log_error('sitemap', $err);
+            return false;
+        }
+        $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps';
+        if (!wp_mkdir_p($dir)) {
+            @$mysqli->close();
+            $err = 'Failed to create sitemap directory.';
+            $this->log_error('sitemap', $err);
+            return false;
+        }
+        $dir = trailingslashit($dir);
+        $base_url = trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/';
+
+        // Clean previous sitemap files.
+        foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+        @unlink($dir . 'sitemap-index.xml');
+
+        $write_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err) {
+            if (empty($entries)) { return true; }
+            $filename = sprintf('sitemap-products-%d.xml', $index);
+            $path = $dir . $filename;
+            $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+            $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+            foreach ($entries as $entry) {
+                $loc = home_url('/p/' . $entry['slug']);
+                $xml .= "  <url>\n";
+                $xml .= '    <loc>' . $this->xml_escape($loc) . '</loc>' . "\n";
+                $xml .= '    <lastmod>' . gmdate('c', $entry['lastmod']) . '</lastmod>' . "\n";
+                $xml .= "  </url>\n";
+            }
+            $xml .= '</urlset>';
+            if (@file_put_contents($path, $xml) === false) {
+                $err = 'Failed to write ' . $filename;
+                $this->log_error('sitemap', $err);
+                return false;
+            }
+            $files[] = [
+                'loc' => $base_url . $filename,
+                'lastmod' => gmdate('c', $lastmod_ts ?: time()),
+            ];
+            return true;
+        };
+
+        while (true) {
+            $sql = sprintf(
+                "SELECT slug, last_tidb_update_at FROM `%s` WHERE is_published = 1 ORDER BY id LIMIT %d OFFSET %d",
+                $table,
+                $batch_size,
+                $offset
+            );
+            $res = $mysqli->query($sql);
+            if (!$res) {
+                @$mysqli->close();
+                $err = 'DB query failed: ' . $mysqli->error;
+                $this->log_error('sitemap', $err);
+                return false;
+            }
+
+            $row_count = 0;
+            while ($row = $res->fetch_assoc()) {
+                $row_count++;
+                $slug = trim($row['slug'] ?? '');
+                if ($slug === '') { continue; }
+                $lastmod = !empty($row['last_tidb_update_at']) ? strtotime($row['last_tidb_update_at']) : time();
+                if (!$lastmod) { $lastmod = time(); }
+                $chunk_entries[] = ['slug' => $slug, 'lastmod' => $lastmod];
+                $chunk_lastmod = max($chunk_lastmod, $lastmod);
+                $total++;
+                if (count($chunk_entries) >= $chunk_size) {
+                    $chunk_index++;
+                    if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) {
+                        $res->free();
+                        @$mysqli->close();
+                        return false;
+                    }
+                    $chunk_entries = [];
+                    $chunk_lastmod = 0;
+                }
+            }
+            $res->free();
+
+            if ($row_count < $batch_size) { break; }
+            $offset += $batch_size;
+        }
+
+        if (!empty($chunk_entries)) {
+            $chunk_index++;
+            if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) {
+                @$mysqli->close();
+                return false;
+            }
+        }
+
+        @$mysqli->close();
+
+        $index_path = $dir . 'sitemap-index.xml';
+        $index_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        $index_xml .= '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        foreach ($files as $file) {
+            $index_xml .= "  <sitemap>\n";
+            $index_xml .= '    <loc>' . $this->xml_escape($file['loc']) . '</loc>' . "\n";
+            $index_xml .= '    <lastmod>' . $file['lastmod'] . '</lastmod>' . "\n";
+            $index_xml .= "  </sitemap>\n";
+        }
+        $index_xml .= '</sitemapindex>';
+        if (@file_put_contents($index_path, $index_xml) === false) {
+            $err = 'Failed to write sitemap-index.xml';
+            $this->log_error('sitemap', $err);
+            return false;
+        }
+
+        $summary = sprintf(
+            'Generated %d sitemap file(s) covering %d product(s).',
+            count($files),
+            $total
+        );
+
+        $meta = [
+            'file_count' => count($files),
+            'total' => $total,
+            'generated_at' => current_time('timestamp'),
+            'index_url' => $base_url . 'sitemap-index.xml',
+        ];
+        update_option(self::SITEMAP_META_OPTION, $meta, false);
+
+        return true;
+    }
+
+    private function ping_search_engines($index_url, &$message = '') {
+        if (!$index_url) {
+            $message = 'No sitemap URL available for ping.';
+            $this->log_error('sitemap_ping', $message);
+            return false;
+        }
+
+        $endpoints = [
+            'Google' => 'https://www.google.com/ping?sitemap=%s',
+            'Bing'   => 'https://www.bing.com/ping?sitemap=%s',
+        ];
+
+        $messages = [];
+        $all_ok = true;
+        foreach ($endpoints as $label => $pattern) {
+            $url = sprintf($pattern, rawurlencode($index_url));
+            $resp = wp_remote_get($url, ['timeout' => 10]);
+            if (is_wp_error($resp)) {
+                $err = $resp->get_error_message();
+                $messages[] = sprintf('%s ping failed: %s.', $label, $err);
+                $this->log_error('sitemap_ping', $label . ': ' . $err);
+                $all_ok = false;
+                continue;
+            }
+            $code = wp_remote_retrieve_response_code($resp);
+            if ($code >= 200 && $code < 300) {
+                $messages[] = sprintf('%s ping OK.', $label);
+            } else {
+                $messages[] = sprintf('%s ping failed: HTTP %d.', $label, $code);
+                $this->log_error('sitemap_ping', $label . ' HTTP ' . $code);
+                $all_ok = false;
+            }
+        }
+
+        $message = implode(' ', $messages);
+        return $all_ok;
     }
 
     private function push_algolia($product, &$err = null) {
@@ -683,9 +1138,9 @@ class VPP_Plugin {
             'timeout' => 15,
         ];
         $resp = wp_remote_request($endpoint, $args);
-        if (is_wp_error($resp)) { $err = $resp->get_error_message(); return false; }
+        if (is_wp_error($resp)) { $err = $resp->get_error_message(); $this->log_error('algolia', 'Push failed: ' . $err); return false; }
         $code = wp_remote_retrieve_response_code($resp);
-        if ($code < 200 || $code >= 300) { $err = 'Algolia HTTP ' . $code; return false; }
+        if ($code < 200 || $code >= 300) { $err = 'Algolia HTTP ' . $code; $this->log_error('algolia', 'Push failed: ' . $err); return false; }
         return true;
     }
 
@@ -733,6 +1188,70 @@ class VPP_Plugin {
         wp_safe_redirect($redirect); exit;
     }
 
+    public function handle_purge_cache() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $err = null;
+        $ok = $this->purge_cloudflare([], $err);
+        if ($ok) {
+            $redirect = add_query_arg(['vpp_msg' => rawurlencode('Cloudflare cache purged.')], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Cloudflare purge failed.')], admin_url('admin.php?page=vpp_settings'));
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_rebuild_sitemaps() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $summary = '';
+        $err = null;
+        $meta = null;
+        $ok = $this->rebuild_sitemaps($summary, $err, $meta);
+        if ($ok) {
+            $ping_msg = '';
+            $ping_ok = $this->ping_search_engines($meta['index_url'] ?? '', $ping_msg);
+            $message = trim(implode(' ', array_filter([$summary, $ping_msg])));
+            if (!$message) { $message = $summary ?: 'Sitemap rebuilt.'; }
+            $key = $ping_ok ? 'vpp_msg' : 'vpp_err';
+            $redirect = add_query_arg([$key => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Sitemap rebuild failed.')], admin_url('admin.php?page=vpp_settings'));
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_download_log() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $path = $this->get_log_file_path();
+        if (!$path || !file_exists($path)) {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Log file not found.')], admin_url('admin.php?page=vpp_status'));
+            wp_safe_redirect($redirect); exit;
+        }
+        @nocache_headers();
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . self::LOG_FILENAME . '"');
+        header('Content-Length: ' . filesize($path));
+        readfile($path);
+        exit;
+    }
+
+    public function handle_clear_log() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $path = $this->get_log_file_path();
+        if ($path && file_exists($path)) {
+            if (@file_put_contents($path, '') === false) {
+                $this->log_error('logs', 'Failed to clear log file.');
+                $redirect = add_query_arg(['vpp_err' => rawurlencode('Failed to clear log file.')], admin_url('admin.php?page=vpp_status'));
+                wp_safe_redirect($redirect); exit;
+            }
+        }
+        $redirect = add_query_arg(['vpp_msg' => rawurlencode('Log cleared.')], admin_url('admin.php?page=vpp_status'));
+        wp_safe_redirect($redirect); exit;
+    }
+
     /* ========= FRONT RENDER ========= */
 
     public function maybe_render_vpp() {
@@ -760,6 +1279,10 @@ class VPP_Plugin {
             'table'=>['class'=>[]], 'thead'=>[], 'tbody'=>[], 'tr'=>[], 'th'=>[], 'td'=>['colspan'=>[], 'rowspan'=>[]],
             'code'=>[], 'pre'=>[],
         ];
+    }
+
+    private function xml_escape($value) {
+        return htmlspecialchars((string)$value, ENT_XML1 | ENT_COMPAT, 'UTF-8');
     }
 
     private function pick_primary_cta($p) {
