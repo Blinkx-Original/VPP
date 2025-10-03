@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.2.0
+ * Version: 1.3.1
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.0';
+    const VERSION = '1.3.1';
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
@@ -60,7 +60,7 @@ class VPP_Plugin {
     }
 
     public function enqueue_assets() {
-        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], '1.2.0');
+        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
         if (get_query_var(self::QUERY_VAR)) wp_enqueue_style('vpp-styles');
     }
 
@@ -1155,39 +1155,6 @@ class VPP_Plugin {
             $redirect = add_query_arg(['vpp_msg' => $summary ?: 'Sitemap rebuilt.'], admin_url('admin.php?page=vpp_settings'));
         } else {
             $redirect = add_query_arg(['vpp_err' => $err ?: 'Sitemap rebuild failed.'], admin_url('admin.php?page=vpp_settings'));
-        }
-        wp_safe_redirect($redirect); exit;
-    }
-
-    public function handle_purge_cache() {
-        if (!current_user_can('manage_options')) wp_die('Forbidden');
-        check_admin_referer(self::NONCE_KEY);
-        $err = null;
-        $ok = $this->purge_cloudflare([], $err);
-        if ($ok) {
-            $redirect = add_query_arg(['vpp_msg' => rawurlencode('Cloudflare cache purged.')], admin_url('admin.php?page=vpp_settings'));
-        } else {
-            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Cloudflare purge failed.')], admin_url('admin.php?page=vpp_settings'));
-        }
-        wp_safe_redirect($redirect); exit;
-    }
-
-    public function handle_rebuild_sitemaps() {
-        if (!current_user_can('manage_options')) wp_die('Forbidden');
-        check_admin_referer(self::NONCE_KEY);
-        $summary = '';
-        $err = null;
-        $meta = null;
-        $ok = $this->rebuild_sitemaps($summary, $err, $meta);
-        if ($ok) {
-            $ping_msg = '';
-            $ping_ok = $this->ping_search_engines($meta['index_url'] ?? '', $ping_msg);
-            $message = trim(implode(' ', array_filter([$summary, $ping_msg])));
-            if (!$message) { $message = $summary ?: 'Sitemap rebuilt.'; }
-            $key = $ping_ok ? 'vpp_msg' : 'vpp_err';
-            $redirect = add_query_arg([$key => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
-        } else {
-            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Sitemap rebuild failed.')], admin_url('admin.php?page=vpp_settings'));
         }
         wp_safe_redirect($redirect); exit;
     }
