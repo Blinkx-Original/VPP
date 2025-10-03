@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.3.0
+ * Version: 1.2.0
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -41,8 +41,6 @@ class VPP_Plugin {
             add_action('admin_post_vpp_push_algolia', [$this, 'handle_push_algolia']);
             add_action('admin_post_vpp_purge_cache', [$this, 'handle_purge_cache']);
             add_action('admin_post_vpp_rebuild_sitemaps', [$this, 'handle_rebuild_sitemaps']);
-            add_action('admin_post_vpp_download_log', [$this, 'handle_download_log']);
-            add_action('admin_post_vpp_clear_log', [$this, 'handle_clear_log']);
             add_action('admin_post_vpp_edit_load', [$this, 'handle_edit_load']);
             add_action('admin_post_vpp_edit_save', [$this, 'handle_edit_save']);
             add_action('admin_notices', [$this, 'maybe_admin_notice']);
@@ -62,7 +60,7 @@ class VPP_Plugin {
     }
 
     public function enqueue_assets() {
-        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
+        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], '1.2.0');
         if (get_query_var(self::QUERY_VAR)) wp_enqueue_style('vpp-styles');
     }
 
@@ -531,7 +529,7 @@ class VPP_Plugin {
         $key = isset($_POST['vpp_key']) ? sanitize_text_field(wp_unslash($_POST['vpp_key'])) : '';
         list($type, $val) = $this->parse_lookup_key($key);
         if (!$type) {
-            $redirect = add_query_arg(['vpp_err'=> rawurlencode('Enter a valid URL, slug or ID.')], admin_url('admin.php?page=vpp_edit'));
+            $redirect = add_query_arg(['vpp_err'=> 'Enter a valid URL, slug or ID.'], admin_url('admin.php?page=vpp_edit'));
         } else {
             $redirect = add_query_arg(['lookup_type'=> $type, 'lookup_val'=> $val], admin_url('admin.php?page=vpp_edit'));
         }
@@ -590,7 +588,7 @@ class VPP_Plugin {
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
         $mysqli = $this->db_connect($err);
         if (!$mysqli) {
-            $redirect = add_query_arg(['vpp_err'=> rawurlencode('DB error: ' . $err)], admin_url('admin.php?page=vpp_edit&lookup_type=id&lookup_val='.$id));
+            $redirect = add_query_arg(['vpp_err'=> 'DB error: ' . $err], admin_url('admin.php?page=vpp_edit&lookup_type=id&lookup_val='.$id));
             wp_safe_redirect($redirect); exit;
         }
 
@@ -626,7 +624,7 @@ class VPP_Plugin {
 
         if (empty($set_parts)) {
             $mysqli->close();
-            $redirect = add_query_arg(['vpp_err'=> rawurlencode('No editable columns found in table.')], admin_url('admin.php?page=vpp_edit&lookup_type=id&lookup_val='.$id));
+            $redirect = add_query_arg(['vpp_err'=> 'No editable columns found in table.'], admin_url('admin.php?page=vpp_edit&lookup_type=id&lookup_val='.$id));
             wp_safe_redirect($redirect); exit;
         }
 
@@ -635,7 +633,7 @@ class VPP_Plugin {
         if (!$stmt) {
             $this->log_error('db_query', 'DB prepare failed: ' . $mysqli->error);
             $mysqli->close();
-            $redirect = add_query_arg(['vpp_err'=> rawurlencode('DB prepare failed: ' . $mysqli->error)], admin_url('admin.php?page=vpp_edit&lookup_type=id&lookup_val='.$id));
+            $redirect = add_query_arg(['vpp_err'=> 'DB prepare failed: ' . $mysqli->error], admin_url('admin.php?page=vpp_edit&lookup_type=id&lookup_val='.$id));
             wp_safe_redirect($redirect); exit;
         }
 
@@ -675,11 +673,11 @@ class VPP_Plugin {
             }
         }
 
-        $args = ['lookup_type'=>'id','lookup_val'=>$id,'vpp_msg'=>rawurlencode($top_msg),'inline'=>$inline,'inline_msg'=>rawurlencode($inline_msg)];
+        $args = ['lookup_type'=>'id','lookup_val'=>$id,'vpp_msg'=>$top_msg,'inline'=>$inline,'inline_msg'=>$inline_msg];
         $redirect = add_query_arg($args, admin_url('admin.php?page=vpp_edit'));
 
         if (isset($_POST['do_save_view']) && $ok) {
-            $redirect = add_query_arg(['vpp_msg'=> rawurlencode($top_msg . ' Open: ' . home_url('/p/' . $slug))] + $args, admin_url('admin.php?page=vpp_edit'));
+            $redirect = add_query_arg(['vpp_msg'=> $top_msg . ' Open: ' . home_url('/p/' . $slug)] + $args, admin_url('admin.php?page=vpp_edit'));
         }
 
         wp_safe_redirect($redirect); exit;
@@ -693,7 +691,7 @@ class VPP_Plugin {
         $input = isset($_POST[self::OPT_KEY]) ? (array) $_POST[self::OPT_KEY] : [];
         $clean = $this->sanitize_settings($input);
         update_option(self::OPT_KEY, $clean, false); // persistent
-        $redirect = add_query_arg(['vpp_msg'=> rawurlencode('Settings saved.')], admin_url('admin.php?page=vpp_settings'));
+        $redirect = add_query_arg(['vpp_msg'=> 'Settings saved.'], admin_url('admin.php?page=vpp_settings'));
         wp_safe_redirect($redirect); exit;
     }
 
@@ -703,7 +701,7 @@ class VPP_Plugin {
         $err = null;
         $conn = $this->db_connect($err);
         if ($conn) { @$conn->close(); $ok = true; } else { $ok = false; }
-        $redirect = add_query_arg([$ok ? 'vpp_msg' : 'vpp_err' => rawurlencode($ok ? 'TiDB connection OK.' : ('TiDB connection failed: ' . $err))], admin_url('admin.php?page=vpp_settings'));
+        $redirect = add_query_arg([$ok ? 'vpp_msg' : 'vpp_err' => $ok ? 'TiDB connection OK.' : ('TiDB connection failed: ' . $err)], admin_url('admin.php?page=vpp_settings'));
         wp_safe_redirect($redirect); exit;
     }
 
@@ -715,7 +713,7 @@ class VPP_Plugin {
         $key = trim($s['algolia']['admin_key'] ?? '');
         $index = trim($s['algolia']['index'] ?? '');
         if (!$app || !$key || !$index) {
-            $redirect = add_query_arg(['vpp_err'=> rawurlencode('Algolia not configured (app_id, admin_key, index required).')], admin_url('admin.php?page=vpp_settings'));
+            $redirect = add_query_arg(['vpp_err'=> 'Algolia not configured (app_id, admin_key, index required).'], admin_url('admin.php?page=vpp_settings'));
             wp_safe_redirect($redirect); exit;
         }
         $endpoint = "https://{$app}-dsn.algolia.net/1/indexes/" . rawurlencode($index);
@@ -728,17 +726,13 @@ class VPP_Plugin {
             'timeout' => 10,
         ]);
         if (is_wp_error($resp)) {
-            $msg = 'Algolia request failed: ' . $resp->get_error_message();
-            $this->log_error('algolia', $msg);
-            $redirect = add_query_arg(['vpp_err'=> rawurlencode($msg)], admin_url('admin.php?page=vpp_settings'));
+            $redirect = add_query_arg(['vpp_err'=> 'Algolia request failed: ' . $resp->get_error_message()], admin_url('admin.php?page=vpp_settings'));
         } else {
             $code = wp_remote_retrieve_response_code($resp);
             if ($code >= 200 && $code < 300) {
-                $redirect = add_query_arg(['vpp_msg'=> rawurlencode('Algolia connection OK.')], admin_url('admin.php?page=vpp_settings'));
+                $redirect = add_query_arg(['vpp_msg'=> 'Algolia connection OK.'], admin_url('admin.php?page=vpp_settings'));
             } else {
-                $msg = 'Algolia HTTP ' . $code;
-                $this->log_error('algolia', 'Test failed: ' . $msg);
-                $redirect = add_query_arg(['vpp_err'=> rawurlencode($msg)], admin_url('admin.php?page=vpp_settings'));
+                $redirect = add_query_arg(['vpp_err'=> 'Algolia HTTP ' . $code], admin_url('admin.php?page=vpp_settings'));
             }
         }
         wp_safe_redirect($redirect); exit;
@@ -854,7 +848,7 @@ class VPP_Plugin {
         $s = $this->get_settings();
         $token = trim($s['cloudflare']['api_token'] ?? '');
         $zone  = trim($s['cloudflare']['zone_id'] ?? '');
-        if (!$token || !$zone) { $err = 'Cloudflare credentials not configured.'; $this->log_error('cloudflare', $err); return false; }
+        if (!$token || !$zone) { $err = 'Cloudflare credentials not configured.'; return false; }
 
         $endpoint = "https://api.cloudflare.com/client/v4/zones/{$zone}/purge_cache";
         $payload = empty($urls)
@@ -862,7 +856,6 @@ class VPP_Plugin {
             : ['files' => array_values(array_filter($urls))];
         if (empty($payload['purge_everything']) && empty($payload['files'])) {
             $err = 'No URLs provided for purge.';
-            $this->log_error('cloudflare', $err);
             return false;
         }
 
@@ -876,13 +869,12 @@ class VPP_Plugin {
             'timeout' => 15,
         ];
         $resp = wp_remote_post($endpoint, $args);
-        if (is_wp_error($resp)) { $err = 'Cloudflare request failed: ' . $resp->get_error_message(); $this->log_error('cloudflare', $err); return false; }
+        if (is_wp_error($resp)) { $err = 'Cloudflare request failed: ' . $resp->get_error_message(); return false; }
         $code = wp_remote_retrieve_response_code($resp);
         $body = json_decode(wp_remote_retrieve_body($resp), true);
         if ($code < 200 || $code >= 300 || (is_array($body) && isset($body['success']) && !$body['success'])) {
             $msg = is_array($body) && !empty($body['errors'][0]['message']) ? $body['errors'][0]['message'] : ('HTTP ' . $code);
             $err = 'Cloudflare purge failed: ' . $msg;
-            $this->log_error('cloudflare', $err);
             return false;
         }
         return true;
@@ -893,7 +885,7 @@ class VPP_Plugin {
         return $this->purge_cloudflare([$url]);
     }
 
-    private function rebuild_sitemaps(&$summary = '', &$err = null, &$meta = null) {
+    private function rebuild_sitemaps(&$summary = '', &$err = null) {
         $mysqli = $this->db_connect($err);
         if (!$mysqli) { return false; }
 
@@ -911,14 +903,12 @@ class VPP_Plugin {
         if (empty($uploads['basedir']) || empty($uploads['baseurl'])) {
             @$mysqli->close();
             $err = 'Uploads directory is not writable.';
-            $this->log_error('sitemap', $err);
             return false;
         }
         $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps';
         if (!wp_mkdir_p($dir)) {
             @$mysqli->close();
             $err = 'Failed to create sitemap directory.';
-            $this->log_error('sitemap', $err);
             return false;
         }
         $dir = trailingslashit($dir);
@@ -944,7 +934,6 @@ class VPP_Plugin {
             $xml .= '</urlset>';
             if (@file_put_contents($path, $xml) === false) {
                 $err = 'Failed to write ' . $filename;
-                $this->log_error('sitemap', $err);
                 return false;
             }
             $files[] = [
@@ -965,7 +954,6 @@ class VPP_Plugin {
             if (!$res) {
                 @$mysqli->close();
                 $err = 'DB query failed: ' . $mysqli->error;
-                $this->log_error('sitemap', $err);
                 return false;
             }
 
@@ -1018,7 +1006,6 @@ class VPP_Plugin {
         $index_xml .= '</sitemapindex>';
         if (@file_put_contents($index_path, $index_xml) === false) {
             $err = 'Failed to write sitemap-index.xml';
-            $this->log_error('sitemap', $err);
             return false;
         }
 
@@ -1028,53 +1015,7 @@ class VPP_Plugin {
             $total
         );
 
-        $meta = [
-            'file_count' => count($files),
-            'total' => $total,
-            'generated_at' => current_time('timestamp'),
-            'index_url' => $base_url . 'sitemap-index.xml',
-        ];
-        update_option(self::SITEMAP_META_OPTION, $meta, false);
-
         return true;
-    }
-
-    private function ping_search_engines($index_url, &$message = '') {
-        if (!$index_url) {
-            $message = 'No sitemap URL available for ping.';
-            $this->log_error('sitemap_ping', $message);
-            return false;
-        }
-
-        $endpoints = [
-            'Google' => 'https://www.google.com/ping?sitemap=%s',
-            'Bing'   => 'https://www.bing.com/ping?sitemap=%s',
-        ];
-
-        $messages = [];
-        $all_ok = true;
-        foreach ($endpoints as $label => $pattern) {
-            $url = sprintf($pattern, rawurlencode($index_url));
-            $resp = wp_remote_get($url, ['timeout' => 10]);
-            if (is_wp_error($resp)) {
-                $err = $resp->get_error_message();
-                $messages[] = sprintf('%s ping failed: %s.', $label, $err);
-                $this->log_error('sitemap_ping', $label . ': ' . $err);
-                $all_ok = false;
-                continue;
-            }
-            $code = wp_remote_retrieve_response_code($resp);
-            if ($code >= 200 && $code < 300) {
-                $messages[] = sprintf('%s ping OK.', $label);
-            } else {
-                $messages[] = sprintf('%s ping failed: HTTP %d.', $label, $code);
-                $this->log_error('sitemap_ping', $label . ' HTTP ' . $code);
-                $all_ok = false;
-            }
-        }
-
-        $message = implode(' ', $messages);
-        return $all_ok;
     }
 
     private function push_algolia($product, &$err = null) {
@@ -1165,7 +1106,10 @@ class VPP_Plugin {
                 $ok++;
             } else { $fail++; $msg = $err ?: 'Unknown error'; }
         }
-        $redirect = add_query_arg($fail ? ['vpp_err'=> rawurlencode("Published {$ok}, failed {$fail}. {$msg}")] : ['vpp_msg'=> rawurlencode("Published {$ok}, failed {$fail}.")], admin_url('admin.php?page=vpp_settings'));
+        $params = $fail
+            ? ['vpp_err'=> "Published {$ok}, failed {$fail}. {$msg}"]
+            : ['vpp_msg'=> "Published {$ok}, failed {$fail}."];
+        $redirect = add_query_arg($params, admin_url('admin.php?page=vpp_settings'));
         wp_safe_redirect($redirect); exit;
     }
 
@@ -1181,7 +1125,37 @@ class VPP_Plugin {
             if ($product && $this->push_algolia($product, $err)) { $ok++; }
             else { $fail++; $msg = $err ?: 'Unknown error'; }
         }
-        $redirect = add_query_arg($fail ? ['vpp_err'=> rawurlencode("Algolia push: {$ok} ok, {$fail} failed. {$msg}")] : ['vpp_msg'=> rawurlencode("Algolia push: {$ok} ok, {$fail} failed.")], admin_url('admin.php?page=vpp_settings'));
+        $params = $fail
+            ? ['vpp_err'=> "Algolia push: {$ok} ok, {$fail} failed. {$msg}"]
+            : ['vpp_msg'=> "Algolia push: {$ok} ok, {$fail} failed."];
+        $redirect = add_query_arg($params, admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_purge_cache() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $err = null;
+        $ok = $this->purge_cloudflare([], $err);
+        if ($ok) {
+            $redirect = add_query_arg(['vpp_msg' => 'Cloudflare cache purged.'], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $redirect = add_query_arg(['vpp_err' => $err ?: 'Cloudflare purge failed.'], admin_url('admin.php?page=vpp_settings'));
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_rebuild_sitemaps() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $summary = '';
+        $err = null;
+        $ok = $this->rebuild_sitemaps($summary, $err);
+        if ($ok) {
+            $redirect = add_query_arg(['vpp_msg' => $summary ?: 'Sitemap rebuilt.'], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $redirect = add_query_arg(['vpp_err' => $err ?: 'Sitemap rebuild failed.'], admin_url('admin.php?page=vpp_settings'));
+        }
         wp_safe_redirect($redirect); exit;
     }
 
