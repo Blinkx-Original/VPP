@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.3.11
+ * Version: 1.3.12
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.11';
+    const VERSION = '1.3.12';
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
@@ -65,6 +65,9 @@ class VPP_Plugin {
 
         // Yoast meta description filter (keep in sync), we still print manual fallback in the head
         add_filter('wpseo_metadesc', [$this, 'filter_yoast_metadesc'], 99, 1);
+        if (defined('WPSEO_VERSION')) {
+            add_filter('wpseo_frontend_presenter_classes', [$this, 'filter_yoast_presenters'], 20, 1);
+        }
     }
 
     public static function on_activate() { self::instance()->register_rewrite(); flush_rewrite_rules(); }
@@ -968,6 +971,21 @@ class VPP_Plugin {
         return $meta;
     }
 
+    public function filter_yoast_presenters($presenters) {
+        if (!$this->current_vpp_slug()) {
+            return $presenters;
+        }
+        if (!is_array($presenters)) {
+            return $presenters;
+        }
+        foreach ($presenters as $key => $presenter) {
+            if (is_string($presenter) && stripos($presenter, 'Meta_Description_Presenter') !== false) {
+                unset($presenters[$key]);
+            }
+        }
+        return array_values($presenters);
+    }
+
     private function build_meta_description($p) {
         $desc = '';
         if (!empty($p['meta_description'])) { $desc = (string)$p['meta_description']; }
@@ -1029,6 +1047,15 @@ class VPP_Plugin {
         $this->last_meta_source = $this->last_meta_source ?: 'Manual tag';
         $this->last_meta_value = $meta_description;
 
+        $css_url = plugins_url('assets/vpp.css', __FILE__);
+        $css_href = add_query_arg('ver', self::VERSION, $css_url);
+        $inline_css = '';
+        $css_path = plugin_dir_path(__FILE__) . 'assets/vpp.css';
+        if (is_readable($css_path)) {
+            $inline_css = trim(file_get_contents($css_path));
+        }
+        $canonical = home_url('/p/' . $p['slug']);
+
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
         ?>
@@ -1039,13 +1066,20 @@ class VPP_Plugin {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title><?php echo esc_html($title); ?></title>
 <?php if (!defined('WPSEO_VERSION')): ?>
-<link rel="canonical" href="<?php echo esc_url(home_url('/p/' . $p['slug'])); ?>">
-<meta name="description" content="<?php echo esc_attr($meta_description); ?>">
+<link rel="canonical" href="<?php echo esc_url($canonical); ?>">
 <?php endif; ?>
-<link rel="stylesheet" href="<?php echo esc_url(plugins_url('assets/vpp.css', __FILE__)); ?>?ver=<?php echo esc_attr(self::VERSION); ?>">
+<meta name="description" content="<?php echo esc_attr($meta_description); ?>" data-vpp-meta="description">
+<meta property="og:description" content="<?php echo esc_attr($meta_description); ?>" data-vpp-meta="og-description">
+<meta name="twitter:description" content="<?php echo esc_attr($meta_description); ?>" data-vpp-meta="twitter-description">
+<link rel="preload" href="<?php echo esc_url($css_href); ?>" as="style">
+<link rel="stylesheet" href="<?php echo esc_url($css_href); ?>">
+<?php if ($inline_css !== ''): ?>
+<style id="vpp-inline-css"><?php echo $inline_css; ?></style>
+<?php endif; ?>
 <?php wp_head(); ?>
 </head>
 <body class="vpp-body">
+<?php if (function_exists('wp_body_open')) { wp_body_open(); } ?>
 <main class="vpp-container">
   <article class="vpp">
     <section class="vpp-hero card-elevated">
