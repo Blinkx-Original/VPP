@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.2.0
+ * Version: 1.3.4
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.0';
+    const VERSION = '1.3.4';
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
@@ -28,8 +28,6 @@ class VPP_Plugin {
         add_action('init', [$this, 'register_rewrite']);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
         add_filter('query_vars', [$this, 'add_query_var']);
-        register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
-        register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
 
         if (is_admin()) {
             add_action('admin_menu', [$this, 'admin_menu']);
@@ -43,6 +41,8 @@ class VPP_Plugin {
             add_action('admin_post_vpp_rebuild_sitemaps', [$this, 'handle_rebuild_sitemaps']);
             add_action('admin_post_vpp_edit_load', [$this, 'handle_edit_load']);
             add_action('admin_post_vpp_edit_save', [$this, 'handle_edit_save']);
+            add_action('admin_post_vpp_download_log', [$this, 'handle_download_log']);
+            add_action('admin_post_vpp_clear_log', [$this, 'handle_clear_log']);
             add_action('admin_notices', [$this, 'maybe_admin_notice']);
         }
 
@@ -60,7 +60,7 @@ class VPP_Plugin {
     }
 
     public function enqueue_assets() {
-        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], '1.2.0');
+        wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
         if (get_query_var(self::QUERY_VAR)) wp_enqueue_style('vpp-styles');
     }
 
@@ -1159,39 +1159,6 @@ class VPP_Plugin {
         wp_safe_redirect($redirect); exit;
     }
 
-    public function handle_purge_cache() {
-        if (!current_user_can('manage_options')) wp_die('Forbidden');
-        check_admin_referer(self::NONCE_KEY);
-        $err = null;
-        $ok = $this->purge_cloudflare([], $err);
-        if ($ok) {
-            $redirect = add_query_arg(['vpp_msg' => rawurlencode('Cloudflare cache purged.')], admin_url('admin.php?page=vpp_settings'));
-        } else {
-            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Cloudflare purge failed.')], admin_url('admin.php?page=vpp_settings'));
-        }
-        wp_safe_redirect($redirect); exit;
-    }
-
-    public function handle_rebuild_sitemaps() {
-        if (!current_user_can('manage_options')) wp_die('Forbidden');
-        check_admin_referer(self::NONCE_KEY);
-        $summary = '';
-        $err = null;
-        $meta = null;
-        $ok = $this->rebuild_sitemaps($summary, $err, $meta);
-        if ($ok) {
-            $ping_msg = '';
-            $ping_ok = $this->ping_search_engines($meta['index_url'] ?? '', $ping_msg);
-            $message = trim(implode(' ', array_filter([$summary, $ping_msg])));
-            if (!$message) { $message = $summary ?: 'Sitemap rebuilt.'; }
-            $key = $ping_ok ? 'vpp_msg' : 'vpp_err';
-            $redirect = add_query_arg([$key => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
-        } else {
-            $redirect = add_query_arg(['vpp_err' => rawurlencode($err ?: 'Sitemap rebuild failed.')], admin_url('admin.php?page=vpp_settings'));
-        }
-        wp_safe_redirect($redirect); exit;
-    }
-
     public function handle_download_log() {
         if (!current_user_can('manage_options')) wp_die('Forbidden');
         check_admin_referer(self::NONCE_KEY);
@@ -1293,17 +1260,50 @@ class VPP_Plugin {
 
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
+        $body_class_filter = function ($classes) {
+            $classes[] = 'vpp-body';
+            return $classes;
+        };
+
+        $site_name = get_bloginfo('name');
+        $brand_model = trim(implode(' ', array_filter([$brand, $model])));
+        $meta_title = $title;
+        if ($brand_model !== '') {
+            $meta_title .= ' | ' . $brand_model;
+        }
+        if (!empty($site_name)) {
+            $meta_title .= ' | ' . $site_name;
+        }
+
+        $title_filter = function ($current) use ($meta_title) {
+            return $meta_title;
+        };
+
+        $title_parts_filter = function ($parts) use ($meta_title) {
+            $parts['title'] = $meta_title;
+            return $parts;
+        };
+
+        $canonical_url = home_url('/p/' . $p['slug']);
+        $rel_canonical_filter = function ($url) use ($canonical_url) {
+            return $canonical_url;
+        };
+        $yoast_canonical_filter = function ($url) use ($canonical_url) {
+            return $canonical_url;
+        };
+        $using_yoast = defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend');
+
+        add_filter('body_class', $body_class_filter);
+        add_filter('pre_get_document_title', $title_filter, 99);
+        add_filter('document_title_parts', $title_parts_filter, 99);
+        if ($using_yoast) {
+            add_filter('wpseo_canonical', $yoast_canonical_filter, 99);
+        } else {
+            add_filter('rel_canonical', $rel_canonical_filter, 99);
+        }
+
+        get_header();
         ?>
-<!doctype html>
-<html <?php language_attributes(); ?>>
-<head>
-<meta charset="<?php bloginfo('charset'); ?>">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?php echo esc_html($title); ?></title>
-<link rel="canonical" href="<?php echo esc_url(home_url('/p/' . $p['slug'])); ?>">
-<?php wp_head(); ?>
-</head>
-<body class="vpp-body">
 <main class="vpp-container">
   <article class="vpp">
     <section class="vpp-hero card-elevated">
@@ -1364,11 +1364,21 @@ class VPP_Plugin {
     </section>
   </article>
 </main>
-<?php wp_footer(); ?>
-</body>
-</html>
-        <?php
+<?php
+        get_footer();
+
+        remove_filter('body_class', $body_class_filter);
+        remove_filter('pre_get_document_title', $title_filter, 99);
+        remove_filter('document_title_parts', $title_parts_filter, 99);
+        if ($using_yoast) {
+            remove_filter('wpseo_canonical', $yoast_canonical_filter, 99);
+        } else {
+            remove_filter('rel_canonical', $rel_canonical_filter, 99);
+        }
     }
 }
+
+register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
+register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
 
 VPP_Plugin::instance();
