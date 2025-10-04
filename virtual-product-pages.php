@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.3.11
+ * Version: 1.3.16
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,123 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.11';
+    const VERSION = '1.3.16';
+    const CSS_FALLBACK = <<<CSS
+/* Minimal Vercel-like look */
+body.vpp-body {
+  background: #f9fafb;
+  color: #0f172a;
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+}
+.vpp-container { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }
+.vpp .card,
+.vpp .card-elevated {
+  background: linear-gradient(180deg, rgba(248,250,252,0.85), #ffffff 45%);
+  border-radius: 20px;
+  padding: 1.35rem;
+  box-shadow: 0 20px 60px rgba(15,23,42,0.08);
+  border: 1px solid rgba(148,163,184,0.15);
+}
+.vpp .card-elevated {
+  box-shadow: 0 28px 80px rgba(15,23,42,0.12), 0 1px 0 rgba(148,163,184,0.25);
+}
+.vpp-hero {
+  margin-bottom: 1.25rem;
+  background: linear-gradient(160deg, rgba(226,232,240,0.35), rgba(255,255,255,0.95));
+}
+.vpp-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 2rem; }
+@media (max-width: 900px) { .vpp-grid { grid-template-columns: 1fr; } }
+
+.vpp-media { display:flex; flex-direction:column; gap: .75rem; }
+.vpp-main-image {
+  width: 100%;
+  height: auto;
+  border-radius: 16px;
+  background: #f1f5f9;
+  box-shadow: 0 18px 40px rgba(15,23,42,0.12);
+}
+.vpp-thumbs { display:flex; gap: .5rem; flex-wrap: wrap; }
+.vpp-thumb {
+  width: 88px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 12px;
+  background: #f1f5f9;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 10px 24px rgba(15,23,42,0.08);
+}
+
+.vpp-placeholder {
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  height: 360px;
+  background: linear-gradient(180deg,#f8fafc,#e2e8f0);
+  border-radius: 16px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.6), 0 20px 40px rgba(15,23,42,0.08);
+}
+.vpp-ph-img {
+  width: 60%;
+  height: 70%;
+  border-radius: 16px;
+  background: repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 12px,#f8fafc 12px,#f8fafc 24px);
+}
+
+.vpp-summary {
+  display:flex;
+  flex-direction:column;
+  gap: .65rem;
+}
+.vpp-title { font-size: clamp(1.6rem, 2vw, 2.2rem); font-weight: 800; margin: 0; color: #111827; }
+.vpp-meta { color: #6b7280; margin: 0; }
+.vpp-short { color: #374151; font-size: .95rem; margin: .25rem 0 0; max-width: 50ch; }
+
+.vpp-cta-block { margin-top: .75rem; display:flex; flex-direction:column; gap: .5rem; }
+.vpp-cta-primary {
+  display:inline-block; text-decoration:none; padding: .9rem 1.4rem; font-weight: 700;
+  border-radius: 999px; background: linear-gradient(135deg,#2563eb,#3b82f6); color: #fff; position: relative;
+  box-shadow: 0 16px 32px rgba(37,99,235,0.45);
+  transition: transform .2s ease, box-shadow .2s ease;
+}
+/* luminous glow */
+.vpp-cta-primary.glow::before {
+  content:""; position:absolute; inset:-3px; border-radius: 999px;
+  background: radial-gradient( 120% 120% at 50% 0%, rgba(59,130,246,0.65), rgba(59,130,246,0.15) 60%, transparent 70% );
+  filter: blur(8px); z-index:-1;
+}
+.vpp-cta-primary:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 22px 44px rgba(37,99,235,0.55);
+}
+.vpp-cta-secondary { display:flex; gap: .5rem; flex-wrap:wrap; }
+.vpp-cta-secondary-btn {
+  display:inline-block;
+  text-decoration:none;
+  padding: .65rem 1rem;
+  font-weight: 600;
+  border-radius: 999px;
+  background: rgba(226,232,240,0.7);
+  color: #1e293b;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+}
+
+.vpp-content {
+  margin-top: 1.5rem;
+  background: linear-gradient(180deg, rgba(248,250,252,0.9), #ffffff 55%);
+}
+.vpp-content h2 { font-size: 1.25rem; margin: 1rem 0 .5rem; }
+.vpp-content h3 { font-size: 1.05rem; margin: .75rem 0 .25rem; }
+.vpp-content table { width:100%; border-collapse: collapse; margin: .75rem 0; }
+.vpp-content th, .vpp-content td { border: 1px solid #e5e7eb; padding: .5rem .6rem; text-align:left; }
+.vpp-content a { color: #2563eb; }
+
+/* inline admin messages */
+.vpp-inline { padding:.25rem .5rem; border-radius:8px; font-size:12px; }
+.vpp-inline.ok { background:#e6ffed; color:#065f46; }
+.vpp-inline.err { background:#fee2e2; color:#991b1b; }
+CSS;
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
@@ -23,6 +139,11 @@ class VPP_Plugin {
     // runtime debug
     private $last_meta_source = '';
     private $last_meta_value = '';
+
+    private $cached_inline_css = null;
+    private $current_inline_css = '';
+    private $current_meta_description = '';
+    private $current_manual_canonical = '';
 
     public static function instance() {
         if (self::$instance === null) { self::$instance = new self(); }
@@ -35,6 +156,10 @@ class VPP_Plugin {
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
         register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
         register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
+
+        add_action('wp_head', [$this, 'inject_meta_tags'], 0);
+        add_action('wp_head', [$this, 'inject_inline_css_head'], 0);
+        add_filter('body_class', [$this, 'filter_body_class']);
 
         if (is_admin()) {
             add_action('admin_menu', [$this, 'admin_menu']);
@@ -65,6 +190,9 @@ class VPP_Plugin {
 
         // Yoast meta description filter (keep in sync), we still print manual fallback in the head
         add_filter('wpseo_metadesc', [$this, 'filter_yoast_metadesc'], 99, 1);
+        if (defined('WPSEO_VERSION')) {
+            add_filter('wpseo_frontend_presenter_classes', [$this, 'filter_yoast_presenters'], 20, 1);
+        }
     }
 
     public static function on_activate() { self::instance()->register_rewrite(); flush_rewrite_rules(); }
@@ -79,7 +207,13 @@ class VPP_Plugin {
 
     public function enqueue_assets() {
         wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
-        if (get_query_var(self::QUERY_VAR)) wp_enqueue_style('vpp-styles');
+        if (get_query_var(self::QUERY_VAR)) {
+            wp_enqueue_style('vpp-styles');
+            $inline = $this->load_css_contents();
+            if ($inline !== '') {
+                wp_add_inline_style('vpp-styles', $inline);
+            }
+        }
     }
 
     /* ========= SETTINGS ========= */
@@ -968,6 +1102,21 @@ class VPP_Plugin {
         return $meta;
     }
 
+    public function filter_yoast_presenters($presenters) {
+        if (!$this->current_vpp_slug()) {
+            return $presenters;
+        }
+        if (!is_array($presenters)) {
+            return $presenters;
+        }
+        foreach ($presenters as $key => $presenter) {
+            if (is_string($presenter) && stripos($presenter, 'Meta_Description_Presenter') !== false) {
+                unset($presenters[$key]);
+            }
+        }
+        return array_values($presenters);
+    }
+
     private function build_meta_description($p) {
         $desc = '';
         if (!empty($p['meta_description'])) { $desc = (string)$p['meta_description']; }
@@ -1029,23 +1178,33 @@ class VPP_Plugin {
         $this->last_meta_source = $this->last_meta_source ?: 'Manual tag';
         $this->last_meta_value = $meta_description;
 
+        $css_url = plugins_url('assets/vpp.css', __FILE__);
+        $css_href = add_query_arg('ver', self::VERSION, $css_url);
+        $inline_css = $this->load_css_contents();
+        $this->current_inline_css = $inline_css;
+        $canonical = home_url('/p/' . $p['slug']);
+
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
+        status_header(200);
+
+        $this->current_meta_description = $meta_description;
+        $this->current_manual_canonical = defined('WPSEO_VERSION') ? '' : $canonical;
+        $this->current_inline_css = $inline_css;
+
+        global $wp_query;
+        if (isset($wp_query) && $wp_query instanceof \WP_Query) {
+            $wp_query->is_404 = false;
+            $wp_query->is_page = true;
+            $wp_query->is_singular = true;
+        }
+
+        get_header();
+
+        if ($inline_css !== '') {
+            echo '<style id="vpp-inline-css-fallback">' . $inline_css . '</style>';
+        }
         ?>
-<!doctype html>
-<html <?php language_attributes(); ?>>
-<head>
-<meta charset="<?php bloginfo('charset'); ?>">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title><?php echo esc_html($title); ?></title>
-<?php if (!defined('WPSEO_VERSION')): ?>
-<link rel="canonical" href="<?php echo esc_url(home_url('/p/' . $p['slug'])); ?>">
-<meta name="description" content="<?php echo esc_attr($meta_description); ?>">
-<?php endif; ?>
-<link rel="stylesheet" href="<?php echo esc_url(plugins_url('assets/vpp.css', __FILE__)); ?>?ver=<?php echo esc_attr(self::VERSION); ?>">
-<?php wp_head(); ?>
-</head>
-<body class="vpp-body">
 <main class="vpp-container">
   <article class="vpp">
     <section class="vpp-hero card-elevated">
@@ -1091,11 +1250,81 @@ class VPP_Plugin {
     </section>
   </article>
 </main>
-<?php wp_footer(); ?>
-</body>
-</html>
         <?php
+        get_footer();
+
+        $this->current_meta_description = '';
+        $this->current_manual_canonical = '';
+        $this->current_inline_css = '';
     }
+
+    public function filter_body_class($classes) {
+        if ($this->current_vpp_slug()) {
+            $classes[] = 'vpp-body';
+        }
+        return $classes;
+    }
+
+    public function inject_meta_tags() {
+        if (!$this->current_vpp_slug()) {
+            return;
+        }
+
+        $meta = $this->current_meta_description;
+        if ($meta === '') {
+            $slug = $this->current_vpp_slug();
+            if ($slug) {
+                $err = null;
+                $product = $this->fetch_product_by_slug($slug, $err);
+                if ($product) {
+                    $meta = $this->build_meta_description($product);
+                    $this->current_meta_description = $meta;
+                }
+            }
+        }
+
+        if ($meta !== '') {
+            echo '<meta name="description" content="' . esc_attr($meta) . '" data-vpp-meta="description">' . "\n";
+            echo '<meta property="og:description" content="' . esc_attr($meta) . '" data-vpp-meta="og-description">' . "\n";
+            echo '<meta name="twitter:description" content="' . esc_attr($meta) . '" data-vpp-meta="twitter-description">' . "\n";
+        }
+
+        if ($this->current_manual_canonical !== '') {
+            echo '<link rel="canonical" href="' . esc_url($this->current_manual_canonical) . '">' . "\n";
+        }
+    }
+
+    public function inject_inline_css_head() {
+        if (!$this->current_vpp_slug()) {
+            return;
+        }
+        $inline = $this->current_inline_css;
+        if ($inline === '') {
+            $inline = $this->load_css_contents();
+        }
+        if ($inline === '') {
+            return;
+        }
+        echo '<style id="vpp-inline-css">' . $inline . '</style>';
+    }
+
+    private function load_css_contents() {
+        if ($this->cached_inline_css !== null) {
+            return $this->cached_inline_css;
+        }
+        $css_path = plugin_dir_path(__FILE__) . 'assets/vpp.css';
+        if (is_readable($css_path)) {
+            $css = file_get_contents($css_path);
+            if (is_string($css)) {
+                $css = trim($css);
+                if ($css !== '') {
+                    return $this->cached_inline_css = $css;
+                }
+            }
+        }
+        return $this->cached_inline_css = trim(self::CSS_FALLBACK);
+    }
+
 }
 
 VPP_Plugin::instance();
