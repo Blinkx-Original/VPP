@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.3.4
+ * Version: 1.3.8
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,10 +13,13 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.4';
+    const VERSION = '1.3.8';
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
+    const META_DEBUG_OPTION = 'vpp_meta_debug';
+
+    private $current_meta_description = '';
 
     private static $instance = null;
     public static function instance() {
@@ -131,7 +134,7 @@ class VPP_Plugin {
                     <tr><th scope="row">TiDB Database</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][database]" value="<?php echo esc_attr($s['tidb']['database']); ?>" class="regular-text"></td></tr>
                     <tr><th scope="row">TiDB User</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][user]" value="<?php echo esc_attr($s['tidb']['user']); ?>" class="regular-text"></td></tr>
                     <tr><th scope="row">TiDB Password</th><td><input type="password" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][pass]" value="<?php echo esc_attr($s['tidb']['pass']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">TiDB Table</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][table]" value="<?php echo esc_attr($s['tidb']['table']); ?>" class="regular-text"><p class="description">Expected columns: id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url, is_published, last_tidb_update_at</p></td></tr>
+                    <tr><th scope="row">TiDB Table</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][table]" value="<?php echo esc_attr($s['tidb']['table']); ?>" class="regular-text"><p class="description">Expected columns: id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, meta_description, cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url, is_published, last_tidb_update_at</p></td></tr>
                     <tr><th scope="row">SSL CA Path</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][ssl_ca]" value="<?php echo esc_attr($s['tidb']['ssl_ca']); ?>" class="regular-text"><p class="description">TiDB Serverless requires TLS. Typical paths: <code>/etc/ssl/certs/ca-certificates.crt</code> (Debian/Ubuntu) or <code>/etc/pki/tls/certs/ca-bundle.crt</code> (CentOS). You may also upload a CA file and reference the absolute path.</p></td></tr>
                 </tbody></table>
 
@@ -224,6 +227,22 @@ class VPP_Plugin {
 
         $log_excerpt = $this->get_log_excerpt();
 
+        $meta_debug = get_option(self::META_DEBUG_OPTION, []);
+        if (!is_array($meta_debug)) { $meta_debug = []; }
+        $meta_source_label = isset($meta_debug['source']) && $meta_debug['source'] ? $meta_debug['source'] : 'Not recorded yet';
+        $meta_output_value = isset($meta_debug['output']) ? (string)$meta_debug['output'] : '';
+        $meta_output_trimmed = trim($meta_output_value);
+        if ($meta_output_value === ' ') { $meta_output_trimmed = '[space]'; }
+        if ($meta_output_trimmed === '') { $meta_output_trimmed = '—'; }
+        if ($meta_output_trimmed !== '—') {
+            if (function_exists('mb_substr')) {
+                $meta_output_trimmed = mb_substr($meta_output_trimmed, 0, 100);
+            } else {
+                $meta_output_trimmed = substr($meta_output_trimmed, 0, 100);
+            }
+        }
+        $meta_yoast_flag = !empty($meta_debug['yoast_active']);
+
         ?>
         <div class="wrap">
             <h1>VPP Status</h1>
@@ -299,6 +318,17 @@ class VPP_Plugin {
                             }
                             ?>
                         </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Meta description source</th>
+                        <td>
+                            <?php echo esc_html($meta_source_label); ?>
+                            <span style="margin-left:0.5rem;">Yoast detected: <?php echo esc_html($meta_yoast_flag ? 'Yes' : 'No'); ?></span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Meta description value</th>
+                        <td><?php echo esc_html($meta_output_trimmed); ?></td>
                     </tr>
                 </tbody>
             </table>
@@ -473,6 +503,7 @@ class VPP_Plugin {
                         <tr><th scope="row">Model</th><td><input type="text" name="model" value="<?php echo esc_attr($row['model']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">SKU</th><td><input type="text" name="sku" value="<?php echo esc_attr($row['sku']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Short summary (max 150 chars)</th><td><input type="text" maxlength="150" name="short_summary" value="<?php echo esc_attr($row['short_summary'] ?? ''); ?>" class="regular-text"><p class="description">Appears on the right of the hero, above the CTAs. No HTML.</p></td></tr>
+                        <tr><th scope="row">Meta description</th><td><textarea name="meta_description" rows="3" maxlength="160" class="large-text" placeholder="Defaults to the H1 if left blank."><?php echo esc_textarea($row['meta_description'] ?? ''); ?></textarea><p class="description">Shown in search results (max ~160 characters). Leave empty to reuse the H1 automatically.</p></td></tr>
                         <tr><th scope="row">Images</th><td>
                             <textarea name="images_json" rows="3" style="width:100%;" placeholder='Either JSON array ["https://...","https://..."] or one URL per line'><?php
                                 $images_val = $row['images_json'];
@@ -575,6 +606,13 @@ class VPP_Plugin {
         $sku = sanitize_text_field($_POST['sku'] ?? '');
         $short_summary = sanitize_text_field($_POST['short_summary'] ?? '');
         if (strlen($short_summary) > 150) $short_summary = substr($short_summary, 0, 150);
+        $meta_description = sanitize_textarea_field($_POST['meta_description'] ?? '');
+        $meta_description = trim(preg_replace('/\s+/', ' ', $meta_description));
+        if (function_exists('mb_substr')) {
+            $meta_description = mb_substr($meta_description, 0, 160);
+        } else {
+            $meta_description = substr($meta_description, 0, 160);
+        }
         $images_json = $this->normalize_images_input($_POST['images_json'] ?? '');
         $cta_lead_url = esc_url_raw($_POST['cta_lead_url'] ?? '');
         $cta_stripe_url = esc_url_raw($_POST['cta_stripe_url'] ?? '');
@@ -599,6 +637,7 @@ class VPP_Plugin {
             'model' => $model,
             'sku' => $sku,
             'short_summary' => $short_summary,
+            'meta_description' => $meta_description,
             'images_json' => $images_json,
             'cta_lead_url' => $cta_lead_url,
             'cta_stripe_url' => $cta_stripe_url,
@@ -779,11 +818,15 @@ class VPP_Plugin {
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
         $mysqli = $this->db_connect($err);
         if (!$mysqli) return null;
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html,
-                       short_summary,
-                       cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url,
-                       is_published, last_tidb_update_at
-                FROM `{$table}` WHERE slug = ? LIMIT 2";
+        $has_meta_description = $this->column_exists($mysqli, $table, 'meta_description');
+        $select_cols = [
+            'id', 'slug', 'title_h1', 'brand', 'model', 'sku', 'images_json', 'desc_html',
+            'short_summary',
+            $has_meta_description ? 'meta_description' : "'' AS meta_description",
+            'cta_lead_url', 'cta_stripe_url', 'cta_affiliate_url', 'cta_paypal_url',
+            'is_published', 'last_tidb_update_at'
+        ];
+        $sql = "SELECT " . implode(', ', $select_cols) . " FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
         $stmt->bind_param('s', $slug);
@@ -801,11 +844,15 @@ class VPP_Plugin {
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
         $mysqli = $this->db_connect($err);
         if (!$mysqli) return null;
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html,
-                       short_summary,
-                       cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url,
-                       is_published, last_tidb_update_at
-                FROM `{$table}` WHERE id = ? LIMIT 1";
+        $has_meta_description = $this->column_exists($mysqli, $table, 'meta_description');
+        $select_cols = [
+            'id', 'slug', 'title_h1', 'brand', 'model', 'sku', 'images_json', 'desc_html',
+            'short_summary',
+            $has_meta_description ? 'meta_description' : "'' AS meta_description",
+            'cta_lead_url', 'cta_stripe_url', 'cta_affiliate_url', 'cta_paypal_url',
+            'is_published', 'last_tidb_update_at'
+        ];
+        $sql = "SELECT " . implode(', ', $select_cols) . " FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
         $stmt->bind_param('i', $id);
@@ -1046,7 +1093,9 @@ class VPP_Plugin {
 
         // snippet: short_summary if present, else trimmed desc_html
         $snippet = '';
-        if (!empty($product['short_summary'])) {
+        if (!empty($product['meta_description'])) {
+            $snippet = $product['meta_description'];
+        } elseif (!empty($product['short_summary'])) {
             $snippet = $product['short_summary'];
         } elseif (!empty($product['desc_html'])) {
             $snippet = wp_strip_all_tags($product['desc_html']);
@@ -1240,6 +1289,29 @@ class VPP_Plugin {
         return $out;
     }
 
+    private function is_vpp_main_view() {
+        if (!get_query_var(self::QUERY_VAR)) { return false; }
+        if (!is_main_query()) { return false; }
+        if (is_feed() || is_preview() || is_404()) { return false; }
+        return true;
+    }
+
+    private function build_meta_description_value($raw, $fallback) {
+        $candidate = trim((string)$raw);
+        if ($candidate === '') { $candidate = (string)$fallback; }
+        $candidate = wp_strip_all_tags($candidate, true);
+        $candidate = trim(preg_replace('/\s+/', ' ', $candidate));
+        $candidate = str_replace(chr(34), "'", $candidate);
+        if (function_exists('mb_substr')) {
+            $candidate = mb_substr($candidate, 0, 160);
+        } else {
+            $candidate = substr($candidate, 0, 160);
+        }
+        $candidate = trim($candidate);
+        if ($candidate === '') { $candidate = ' '; }
+        return $candidate;
+    }
+
     private function render_product($p) {
         $title = $p['title_h1'] ?: $p['slug'];
         $brand = $p['brand'] ?? '';
@@ -1258,6 +1330,9 @@ class VPP_Plugin {
         $short_summary = isset($p['short_summary']) ? trim((string)$p['short_summary']) : '';
         if (strlen($short_summary) > 150) { $short_summary = substr($short_summary, 0, 150); }
 
+        $meta_description = $this->build_meta_description_value($p['meta_description'] ?? '', $title);
+        $this->current_meta_description = $meta_description;
+
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
         $body_class_filter = function ($classes) {
@@ -1265,23 +1340,75 @@ class VPP_Plugin {
             return $classes;
         };
 
-        $title_filter = function ($current) use ($title) {
-            return $title;
+        $title_filter = function ($current_title) use ($title, $brand, $model) {
+            $segments = [$title];
+            $brand_model = trim(implode(' ', array_filter([$brand, $model])));
+            if ($brand_model !== '') {
+                $segments[] = $brand_model;
+            }
+            $site_name = get_bloginfo('name', 'display');
+            if (!empty($site_name)) {
+                $segments[] = $site_name;
+            }
+            return implode(' | ', $segments);
         };
 
-        $title_parts_filter = function ($parts) use ($title) {
+        $title_parts_filter = function ($parts) use ($title, $brand, $model) {
             $parts['title'] = $title;
+            $brand_model = trim(implode(' ', array_filter([$brand, $model])));
+            if ($brand_model !== '') {
+                $parts['tagline'] = $brand_model;
+            } else {
+                unset($parts['tagline']);
+            }
+            $site_name = get_bloginfo('name', 'display');
+            if (!empty($site_name)) {
+                $parts['site'] = $site_name;
+            }
             return $parts;
         };
 
-        $head_tag = function () use ($p) {
-            echo '<link rel="canonical" href="' . esc_url(home_url('/p/' . $p['slug'])) . '">';
+        $canonical_url = home_url(user_trailingslashit('p/' . $p['slug']));
+        $canonical_filter = function ($existing) use ($canonical_url) {
+            return $canonical_url;
         };
+        $canonical_hook = (defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend')) ? 'wpseo_canonical' : 'rel_canonical';
+
+        $yoast_active = (defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend'));
+        $meta_source_label = $yoast_active ? 'Yoast filter' : 'Core fallback';
+        $meta_debug_payload = [
+            'source' => $meta_source_label,
+            'output' => $meta_description,
+            'yoast_active' => $yoast_active ? 1 : 0,
+            'updated_at' => time(),
+        ];
+        update_option(self::META_DEBUG_OPTION, $meta_debug_payload, false);
+
+        $self = $this;
+        $meta_description_filter = null;
+        $meta_description_action = null;
+        if ($yoast_active) {
+            $meta_description_filter = function ($existing) use ($self) {
+                if (!$self->is_vpp_main_view()) {
+                    return is_string($existing) ? $existing : '';
+                }
+                $value = $self->current_meta_description !== '' ? $self->current_meta_description : ' ';
+                return $value;
+            };
+        } else {
+            $meta_description_action = function () use ($self) {
+                if (!$self->is_vpp_main_view()) { return; }
+                $value = $self->current_meta_description !== '' ? $self->current_meta_description : ' ';
+                echo '<meta name="description" content="' . esc_attr($value) . '" />' . "\n";
+            };
+        }
 
         add_filter('body_class', $body_class_filter);
         add_filter('pre_get_document_title', $title_filter, 99);
         add_filter('document_title_parts', $title_parts_filter, 99);
-        add_action('wp_head', $head_tag, 1);
+        add_filter($canonical_hook, $canonical_filter, 10, 1);
+        if ($meta_description_filter) { add_filter('wpseo_metadesc', $meta_description_filter, 99, 1); }
+        if ($meta_description_action) { add_action('wp_head', $meta_description_action, 1); }
 
         get_header();
         ?>
@@ -1351,7 +1478,9 @@ class VPP_Plugin {
         remove_filter('body_class', $body_class_filter);
         remove_filter('pre_get_document_title', $title_filter, 99);
         remove_filter('document_title_parts', $title_parts_filter, 99);
-        remove_action('wp_head', $head_tag, 1);
+        remove_filter($canonical_hook, $canonical_filter, 10);
+        if ($meta_description_filter) { remove_filter('wpseo_metadesc', $meta_description_filter, 99); }
+        if ($meta_description_action) { remove_action('wp_head', $meta_description_action, 1); }
     }
 }
 
