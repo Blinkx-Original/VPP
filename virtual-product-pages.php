@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.3.14
+ * Version: 1.3.15
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.14';
+    const VERSION = '1.3.15';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -140,6 +140,9 @@ CSS;
     private $last_meta_source = '';
     private $last_meta_value = '';
 
+    private $cached_inline_css = null;
+    private $current_inline_css = '';
+
     public static function instance() {
         if (self::$instance === null) { self::$instance = new self(); }
         return self::$instance;
@@ -151,6 +154,8 @@ CSS;
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
         register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
         register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
+
+        add_action('wp_head', [$this, 'inject_inline_css_head'], 0);
 
         if (is_admin()) {
             add_action('admin_menu', [$this, 'admin_menu']);
@@ -1172,6 +1177,7 @@ CSS;
         $css_url = plugins_url('assets/vpp.css', __FILE__);
         $css_href = add_query_arg('ver', self::VERSION, $css_url);
         $inline_css = $this->load_css_contents();
+        $this->current_inline_css = $inline_css;
         $canonical = home_url('/p/' . $p['slug']);
 
         @header('Content-Type: text/html; charset=utf-8');
@@ -1191,13 +1197,13 @@ CSS;
 <meta name="twitter:description" content="<?php echo esc_attr($meta_description); ?>" data-vpp-meta="twitter-description">
 <link rel="preload" href="<?php echo esc_url($css_href); ?>" as="style">
 <link rel="stylesheet" href="<?php echo esc_url($css_href); ?>">
-<?php if ($inline_css !== ''): ?>
-<style id="vpp-inline-css"><?php echo $inline_css; ?></style>
-<?php endif; ?>
 <?php wp_head(); ?>
 </head>
 <body class="vpp-body">
 <?php if (function_exists('wp_body_open')) { wp_body_open(); } ?>
+<?php if ($inline_css !== ''): ?>
+<style id="vpp-inline-css-fallback"><?php echo $inline_css; ?></style>
+<?php endif; ?>
 <main class="vpp-container">
   <article class="vpp">
     <section class="vpp-hero card-elevated">
@@ -1249,16 +1255,35 @@ CSS;
         <?php
     }
 
+    public function inject_inline_css_head() {
+        if (!$this->current_vpp_slug()) {
+            return;
+        }
+        $inline = $this->current_inline_css;
+        if ($inline === '') {
+            $inline = $this->load_css_contents();
+        }
+        if ($inline === '') {
+            return;
+        }
+        echo '<style id="vpp-inline-css">' . $inline . '</style>';
+    }
+
     private function load_css_contents() {
+        if ($this->cached_inline_css !== null) {
+            return $this->cached_inline_css;
+        }
         $css_path = plugin_dir_path(__FILE__) . 'assets/vpp.css';
         if (is_readable($css_path)) {
             $css = file_get_contents($css_path);
             if (is_string($css)) {
                 $css = trim($css);
-                if ($css !== '') return $css;
+                if ($css !== '') {
+                    return $this->cached_inline_css = $css;
+                }
             }
         }
-        return trim(self::CSS_FALLBACK);
+        return $this->cached_inline_css = trim(self::CSS_FALLBACK);
     }
 
 }
