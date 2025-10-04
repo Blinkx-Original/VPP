@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.3.8
+ * Version: 1.3.9
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.8';
+    const VERSION = '1.3.9';
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
@@ -1375,7 +1375,7 @@ class VPP_Plugin {
         $canonical_hook = (defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend')) ? 'wpseo_canonical' : 'rel_canonical';
 
         $yoast_active = (defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend'));
-        $meta_source_label = $yoast_active ? 'Yoast filter' : 'Core fallback';
+        $meta_source_label = $yoast_active ? 'Yoast filter + manual tag' : 'Core fallback';
         $meta_debug_payload = [
             'source' => $meta_source_label,
             'output' => $meta_description,
@@ -1386,7 +1386,13 @@ class VPP_Plugin {
 
         $self = $this;
         $meta_description_filter = null;
-        $meta_description_action = null;
+        $meta_description_output_filter = null;
+        $meta_description_presentation_filter = null;
+        $meta_description_action = function () use ($self) {
+            if (!$self->is_vpp_main_view()) { return; }
+            $value = $self->current_meta_description !== '' ? $self->current_meta_description : ' ';
+            echo '<meta name="description" content="' . esc_attr($value) . '" />' . "\n";
+        };
         if ($yoast_active) {
             $meta_description_filter = function ($existing) use ($self) {
                 if (!$self->is_vpp_main_view()) {
@@ -1395,11 +1401,25 @@ class VPP_Plugin {
                 $value = $self->current_meta_description !== '' ? $self->current_meta_description : ' ';
                 return $value;
             };
-        } else {
-            $meta_description_action = function () use ($self) {
-                if (!$self->is_vpp_main_view()) { return; }
+            $meta_description_output_filter = function ($should_output) use ($self) {
+                if (!$self->is_vpp_main_view()) { return $should_output; }
+                return false;
+            };
+            $meta_description_presentation_filter = function ($presentation) use ($self) {
+                if (!$self->is_vpp_main_view()) { return $presentation; }
                 $value = $self->current_meta_description !== '' ? $self->current_meta_description : ' ';
-                echo '<meta name="description" content="' . esc_attr($value) . '" />' . "\n";
+                if (is_object($presentation)) {
+                    if (method_exists($presentation, 'set_description')) {
+                        $presentation->set_description($value);
+                    }
+                    if (property_exists($presentation, 'description')) {
+                        $presentation->description = $value;
+                    }
+                    if (property_exists($presentation, 'metadesc')) {
+                        $presentation->metadesc = $value;
+                    }
+                }
+                return $presentation;
             };
         }
 
@@ -1408,7 +1428,9 @@ class VPP_Plugin {
         add_filter('document_title_parts', $title_parts_filter, 99);
         add_filter($canonical_hook, $canonical_filter, 10, 1);
         if ($meta_description_filter) { add_filter('wpseo_metadesc', $meta_description_filter, 99, 1); }
-        if ($meta_description_action) { add_action('wp_head', $meta_description_action, 1); }
+        if ($meta_description_output_filter) { add_filter('wpseo_output_metadesc', $meta_description_output_filter, 99, 1); }
+        if ($meta_description_presentation_filter) { add_filter('wpseo_frontend_presentation', $meta_description_presentation_filter, 99, 1); }
+        add_action('wp_head', $meta_description_action, 1);
 
         get_header();
         ?>
@@ -1480,7 +1502,9 @@ class VPP_Plugin {
         remove_filter('document_title_parts', $title_parts_filter, 99);
         remove_filter($canonical_hook, $canonical_filter, 10);
         if ($meta_description_filter) { remove_filter('wpseo_metadesc', $meta_description_filter, 99); }
-        if ($meta_description_action) { remove_action('wp_head', $meta_description_action, 1); }
+        if ($meta_description_output_filter) { remove_filter('wpseo_output_metadesc', $meta_description_output_filter, 99); }
+        if ($meta_description_presentation_filter) { remove_filter('wpseo_frontend_presentation', $meta_description_presentation_filter, 99); }
+        remove_action('wp_head', $meta_description_action, 1);
     }
 }
 
