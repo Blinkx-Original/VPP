@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.3.4
+ * Version: 1.3.5
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.4';
+    const VERSION = '1.3.5';
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
@@ -1265,23 +1265,44 @@ class VPP_Plugin {
             return $classes;
         };
 
-        $title_filter = function ($current) use ($title) {
-            return $title;
+        $title_filter = function ($current_title) use ($title, $brand, $model) {
+            $segments = [$title];
+            $brand_model = trim(implode(' ', array_filter([$brand, $model])));
+            if ($brand_model !== '') {
+                $segments[] = $brand_model;
+            }
+            $site_name = get_bloginfo('name', 'display');
+            if (!empty($site_name)) {
+                $segments[] = $site_name;
+            }
+            return implode(' | ', $segments);
         };
 
-        $title_parts_filter = function ($parts) use ($title) {
+        $title_parts_filter = function ($parts) use ($title, $brand, $model) {
             $parts['title'] = $title;
+            $brand_model = trim(implode(' ', array_filter([$brand, $model])));
+            if ($brand_model !== '') {
+                $parts['tagline'] = $brand_model;
+            } else {
+                unset($parts['tagline']);
+            }
+            $site_name = get_bloginfo('name', 'display');
+            if (!empty($site_name)) {
+                $parts['site'] = $site_name;
+            }
             return $parts;
         };
 
-        $head_tag = function () use ($p) {
-            echo '<link rel="canonical" href="' . esc_url(home_url('/p/' . $p['slug'])) . '">';
+        $canonical_url = home_url(user_trailingslashit('p/' . $p['slug']));
+        $canonical_filter = function ($existing) use ($canonical_url) {
+            return $canonical_url;
         };
+        $canonical_hook = (defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend')) ? 'wpseo_canonical' : 'rel_canonical';
 
         add_filter('body_class', $body_class_filter);
         add_filter('pre_get_document_title', $title_filter, 99);
         add_filter('document_title_parts', $title_parts_filter, 99);
-        add_action('wp_head', $head_tag, 1);
+        add_filter($canonical_hook, $canonical_filter, 10, 1);
 
         get_header();
         ?>
@@ -1351,7 +1372,7 @@ class VPP_Plugin {
         remove_filter('body_class', $body_class_filter);
         remove_filter('pre_get_document_title', $title_filter, 99);
         remove_filter('document_title_parts', $title_parts_filter, 99);
-        remove_action('wp_head', $head_tag, 1);
+        remove_filter($canonical_hook, $canonical_filter, 10);
     }
 }
 
