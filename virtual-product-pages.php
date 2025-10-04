@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, and an Edit Product tool that writes back to TiDB.
- * Version: 1.3.7
+ * Version: 1.3.8
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,10 +13,13 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.3.7';
+    const VERSION = '1.3.8';
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
+    const META_DEBUG_OPTION = 'vpp_meta_debug';
+
+    private $current_meta_description = '';
 
     private static $instance = null;
     public static function instance() {
@@ -224,6 +227,22 @@ class VPP_Plugin {
 
         $log_excerpt = $this->get_log_excerpt();
 
+        $meta_debug = get_option(self::META_DEBUG_OPTION, []);
+        if (!is_array($meta_debug)) { $meta_debug = []; }
+        $meta_source_label = isset($meta_debug['source']) && $meta_debug['source'] ? $meta_debug['source'] : 'Not recorded yet';
+        $meta_output_value = isset($meta_debug['output']) ? (string)$meta_debug['output'] : '';
+        $meta_output_trimmed = trim($meta_output_value);
+        if ($meta_output_value === ' ') { $meta_output_trimmed = '[space]'; }
+        if ($meta_output_trimmed === '') { $meta_output_trimmed = '—'; }
+        if ($meta_output_trimmed !== '—') {
+            if (function_exists('mb_substr')) {
+                $meta_output_trimmed = mb_substr($meta_output_trimmed, 0, 100);
+            } else {
+                $meta_output_trimmed = substr($meta_output_trimmed, 0, 100);
+            }
+        }
+        $meta_yoast_flag = !empty($meta_debug['yoast_active']);
+
         ?>
         <div class="wrap">
             <h1>VPP Status</h1>
@@ -299,6 +318,17 @@ class VPP_Plugin {
                             }
                             ?>
                         </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Meta description source</th>
+                        <td>
+                            <?php echo esc_html($meta_source_label); ?>
+                            <span style="margin-left:0.5rem;">Yoast detected: <?php echo esc_html($meta_yoast_flag ? 'Yes' : 'No'); ?></span>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th scope="row">Meta description value</th>
+                        <td><?php echo esc_html($meta_output_trimmed); ?></td>
                     </tr>
                 </tbody>
             </table>
@@ -1259,6 +1289,29 @@ class VPP_Plugin {
         return $out;
     }
 
+    private function is_vpp_main_view() {
+        if (!get_query_var(self::QUERY_VAR)) { return false; }
+        if (!is_main_query()) { return false; }
+        if (is_feed() || is_preview() || is_404()) { return false; }
+        return true;
+    }
+
+    private function build_meta_description_value($raw, $fallback) {
+        $candidate = trim((string)$raw);
+        if ($candidate === '') { $candidate = (string)$fallback; }
+        $candidate = wp_strip_all_tags($candidate, true);
+        $candidate = trim(preg_replace('/\s+/', ' ', $candidate));
+        $candidate = str_replace(chr(34), "'", $candidate);
+        if (function_exists('mb_substr')) {
+            $candidate = mb_substr($candidate, 0, 160);
+        } else {
+            $candidate = substr($candidate, 0, 160);
+        }
+        $candidate = trim($candidate);
+        if ($candidate === '') { $candidate = ' '; }
+        return $candidate;
+    }
+
     private function render_product($p) {
         $title = $p['title_h1'] ?: $p['slug'];
         $brand = $p['brand'] ?? '';
@@ -1277,15 +1330,8 @@ class VPP_Plugin {
         $short_summary = isset($p['short_summary']) ? trim((string)$p['short_summary']) : '';
         if (strlen($short_summary) > 150) { $short_summary = substr($short_summary, 0, 150); }
 
-        $raw_meta_description = isset($p['meta_description']) ? trim((string)$p['meta_description']) : '';
-        if ($raw_meta_description === '') { $raw_meta_description = $title; }
-        $meta_description = wp_strip_all_tags($raw_meta_description, true);
-        $meta_description = trim(preg_replace('/\s+/', ' ', $meta_description));
-        if (function_exists('mb_substr')) {
-            $meta_description = mb_substr($meta_description, 0, 160);
-        } else {
-            $meta_description = substr($meta_description, 0, 160);
-        }
+        $meta_description = $this->build_meta_description_value($p['meta_description'] ?? '', $title);
+        $this->current_meta_description = $meta_description;
 
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
@@ -1329,16 +1375,31 @@ class VPP_Plugin {
         $canonical_hook = (defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend')) ? 'wpseo_canonical' : 'rel_canonical';
 
         $yoast_active = (defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend'));
+        $meta_source_label = $yoast_active ? 'Yoast filter' : 'Core fallback';
+        $meta_debug_payload = [
+            'source' => $meta_source_label,
+            'output' => $meta_description,
+            'yoast_active' => $yoast_active ? 1 : 0,
+            'updated_at' => time(),
+        ];
+        update_option(self::META_DEBUG_OPTION, $meta_debug_payload, false);
+
+        $self = $this;
         $meta_description_filter = null;
         $meta_description_action = null;
         if ($yoast_active) {
-            $meta_description_filter = function ($existing) use ($meta_description) {
-                return $meta_description;
+            $meta_description_filter = function ($existing) use ($self) {
+                if (!$self->is_vpp_main_view()) {
+                    return is_string($existing) ? $existing : '';
+                }
+                $value = $self->current_meta_description !== '' ? $self->current_meta_description : ' ';
+                return $value;
             };
         } else {
-            $meta_description_action = function () use ($meta_description) {
-                if ($meta_description === '') { return; }
-                echo '<meta name="description" content="' . esc_attr($meta_description) . '" />' . "\n";
+            $meta_description_action = function () use ($self) {
+                if (!$self->is_vpp_main_view()) { return; }
+                $value = $self->current_meta_description !== '' ? $self->current_meta_description : ' ';
+                echo '<meta name="description" content="' . esc_attr($value) . '" />' . "\n";
             };
         }
 
@@ -1346,7 +1407,7 @@ class VPP_Plugin {
         add_filter('pre_get_document_title', $title_filter, 99);
         add_filter('document_title_parts', $title_parts_filter, 99);
         add_filter($canonical_hook, $canonical_filter, 10, 1);
-        if ($meta_description_filter) { add_filter('wpseo_metadesc', $meta_description_filter, 10, 1); }
+        if ($meta_description_filter) { add_filter('wpseo_metadesc', $meta_description_filter, 99, 1); }
         if ($meta_description_action) { add_action('wp_head', $meta_description_action, 1); }
 
         get_header();
@@ -1418,7 +1479,7 @@ class VPP_Plugin {
         remove_filter('pre_get_document_title', $title_filter, 99);
         remove_filter('document_title_parts', $title_parts_filter, 99);
         remove_filter($canonical_hook, $canonical_filter, 10);
-        if ($meta_description_filter) { remove_filter('wpseo_metadesc', $meta_description_filter, 10); }
+        if ($meta_description_filter) { remove_filter('wpseo_metadesc', $meta_description_filter, 99); }
         if ($meta_description_action) { remove_action('wp_head', $meta_description_action, 1); }
     }
 }
