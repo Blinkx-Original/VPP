@@ -1265,42 +1265,23 @@ class VPP_Plugin {
             return $classes;
         };
 
-        $site_name = get_bloginfo('name');
-        $brand_model = trim(implode(' ', array_filter([$brand, $model])));
-        $meta_title = $title;
-        if ($brand_model !== '') {
-            $meta_title .= ' | ' . $brand_model;
-        }
-        if (!empty($site_name)) {
-            $meta_title .= ' | ' . $site_name;
-        }
-
-        $title_filter = function ($current) use ($meta_title) {
-            return $meta_title;
+        $title_filter = function ($current) use ($title) {
+            return $title;
         };
 
-        $title_parts_filter = function ($parts) use ($meta_title) {
-            $parts['title'] = $meta_title;
+        $title_parts_filter = function ($parts) use ($title) {
+            $parts['title'] = $title;
             return $parts;
         };
 
-        $canonical_url = home_url('/p/' . $p['slug']);
-        $rel_canonical_filter = function ($url) use ($canonical_url) {
-            return $canonical_url;
+        $head_tag = function () use ($p) {
+            echo '<link rel="canonical" href="' . esc_url(home_url('/p/' . $p['slug'])) . '">';
         };
-        $yoast_canonical_filter = function ($url) use ($canonical_url) {
-            return $canonical_url;
-        };
-        $using_yoast = defined('WPSEO_VERSION') || class_exists('WPSEO_Frontend');
 
         add_filter('body_class', $body_class_filter);
         add_filter('pre_get_document_title', $title_filter, 99);
         add_filter('document_title_parts', $title_parts_filter, 99);
-        if ($using_yoast) {
-            add_filter('wpseo_canonical', $yoast_canonical_filter, 99);
-        } else {
-            add_filter('rel_canonical', $rel_canonical_filter, 99);
-        }
+        add_action('wp_head', $head_tag, 1);
 
         get_header();
         ?>
@@ -1370,11 +1351,7 @@ class VPP_Plugin {
         remove_filter('body_class', $body_class_filter);
         remove_filter('pre_get_document_title', $title_filter, 99);
         remove_filter('document_title_parts', $title_parts_filter, 99);
-        if ($using_yoast) {
-            remove_filter('wpseo_canonical', $yoast_canonical_filter, 99);
-        } else {
-            remove_filter('rel_canonical', $rel_canonical_filter, 99);
-        }
+        remove_action('wp_head', $head_tag, 1);
     }
 }
 
