@@ -1,5 +1,5 @@
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
-body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;
+body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-scheme:light;
   -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
   font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.55}
 
