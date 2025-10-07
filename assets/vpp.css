@@ -39,7 +39,7 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
 .vpp-short{margin:.2rem 0 0;color:#374151;font-size:.98rem;max-width:60ch}
 
 .vpp-cta-block{margin-top:.75rem;display:flex;flex-direction:column;gap:.75rem}
-.vpp-cta-button{display:flex;align-items:center;justify-content:center;text-decoration:none;color:#fff;
+.vpp-cta-button{display:flex;align-items:center;justify-content:center;text-decoration:none;color:#fff!important;
   background:linear-gradient(135deg,var(--brand-1),var(--brand-2));border-radius:999px;font-weight:700;padding:.95rem 1.4rem;
   position:relative;box-shadow:0 16px 32px rgba(37,99,235,.4);transition:transform .2s, box-shadow .2s;min-height:56px;text-align:center}
 .vpp-cta-button.glow::before{content:"";position:absolute;inset:-3px;border-radius:999px;
