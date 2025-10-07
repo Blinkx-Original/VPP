@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.4.0
+ * Version: 1.4.1
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.4.0';
+    const VERSION = '1.4.1';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -87,34 +87,40 @@ body.vpp-body {
 .vpp-meta { color: #6b7280; margin: 0; }
 .vpp-short { color: #374151; font-size: .95rem; margin: .25rem 0 0; max-width: 50ch; }
 
-.vpp-cta-block { margin-top: .75rem; display:flex; flex-direction:column; gap: .5rem; }
-.vpp-cta-primary {
-  display:inline-block; text-decoration:none; padding: .9rem 1.4rem; font-weight: 700;
-  border-radius: 999px; background: linear-gradient(135deg,#2563eb,#3b82f6); color: #fff; position: relative;
-  box-shadow: 0 16px 32px rgba(37,99,235,0.45);
-  transition: transform .2s ease, box-shadow .2s ease;
-}
-/* luminous glow */
-.vpp-cta-primary.glow::before {
-  content:""; position:absolute; inset:-3px; border-radius: 999px;
-  background: radial-gradient( 120% 120% at 50% 0%, rgba(59,130,246,0.65), rgba(59,130,246,0.15) 60%, transparent 70% );
-  filter: blur(8px); z-index:-1;
-}
-.vpp-cta-primary:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 22px 44px rgba(37,99,235,0.55);
-}
-.vpp-cta-secondary { display:flex; gap: .5rem; flex-wrap:wrap; }
-.vpp-cta-secondary-btn {
-  display:inline-block;
-  text-decoration:none;
-  padding: .65rem 1rem;
-  font-weight: 600;
-  border-radius: 999px;
-  background: rgba(226,232,240,0.7);
-  color: #1e293b;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
-}
+        .vpp-cta-block { margin-top: .75rem; display:flex; flex-direction:column; gap: .75rem; }
+        .vpp-cta-button {
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          text-decoration:none;
+          padding: .95rem 1.4rem;
+          font-weight: 700;
+          border-radius: 999px;
+          background: linear-gradient(135deg,#2563eb,#3b82f6);
+          color: #fff;
+          position: relative;
+          box-shadow: 0 16px 32px rgba(37,99,235,0.4);
+          transition: transform .2s ease, box-shadow .2s ease;
+          min-height: 56px;
+          text-align: center;
+        }
+        .vpp-cta-button.glow::before {
+          content:"";
+          position:absolute;
+          inset:-3px;
+          border-radius: 999px;
+          background: radial-gradient( 120% 120% at 50% 0%, rgba(59,130,246,0.65), rgba(59,130,246,0.15) 60%, transparent 70% );
+          filter: blur(8px);
+          z-index:-1;
+        }
+        .vpp-cta-button:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 24px 48px rgba(37,99,235,0.55);
+        }
+        .vpp-cta-button:focus-visible {
+          outline: 3px solid rgba(59,130,246,0.45);
+          outline-offset: 2px;
+        }
 
 .vpp-content {
   margin-top: 1.5rem;
@@ -147,6 +153,7 @@ CSS;
     private $current_product_slug = null;
     private $current_meta_description = '';
     private $current_canonical = '';
+    private $table_columns_cache = [];
 
     public static function instance() {
         if (self::$instance === null) { self::$instance = new self(); }
@@ -448,15 +455,97 @@ CSS;
         return $mysqli;
     }
 
-    private function column_exists($mysqli, $table, $col) {
+    private function get_table_columns($mysqli, $table) {
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
+        if ($table === '') { return []; }
+        if (isset($this->table_columns_cache[$table])) {
+            return $this->table_columns_cache[$table];
+        }
+
         $table_esc = $mysqli->real_escape_string($table);
-        $col_esc = $mysqli->real_escape_string($col);
-        $sql = "SHOW COLUMNS FROM `{$table_esc}` LIKE '{$col_esc}'";
+        $sql = "SHOW COLUMNS FROM `{$table_esc}`";
         $r = @$mysqli->query($sql);
-        if (!$r) return false;
-        $exists = (bool)$r->fetch_row();
-        $r->close();
-        return $exists;
+        $cols = [];
+        if ($r) {
+            while ($row = $r->fetch_assoc()) {
+                if (isset($row['Field'])) {
+                    $cols[] = $row['Field'];
+                }
+            }
+            $r->close();
+        }
+        $this->table_columns_cache[$table] = $cols;
+        return $cols;
+    }
+
+    private function clear_table_columns_cache($table) {
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
+        unset($this->table_columns_cache[$table]);
+    }
+
+    private function column_exists($mysqli, $table, $col) {
+        $cols = $this->get_table_columns($mysqli, $table);
+        return in_array($col, $cols, true);
+    }
+
+    private function ensure_cta_label_columns($mysqli, $table) {
+        $table_clean = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
+        if ($table_clean === '') {
+            return;
+        }
+
+        $definitions = [
+            'cta_lead_label' => 'ALTER TABLE `%s` ADD COLUMN `cta_lead_label` VARCHAR(120) NOT NULL DEFAULT \'\' AFTER `cta_lead_url`',
+            'cta_stripe_label' => 'ALTER TABLE `%s` ADD COLUMN `cta_stripe_label` VARCHAR(120) NOT NULL DEFAULT \'\' AFTER `cta_stripe_url`',
+            'cta_affiliate_label' => 'ALTER TABLE `%s` ADD COLUMN `cta_affiliate_label` VARCHAR(120) NOT NULL DEFAULT \'\' AFTER `cta_affiliate_url`',
+            'cta_paypal_label' => 'ALTER TABLE `%s` ADD COLUMN `cta_paypal_label` VARCHAR(120) NOT NULL DEFAULT \'\' AFTER `cta_paypal_url`',
+        ];
+
+        foreach ($definitions as $column => $sql_template) {
+            if ($this->column_exists($mysqli, $table_clean, $column)) {
+                continue;
+            }
+            $table_esc = $mysqli->real_escape_string($table_clean);
+            $sql = sprintf($sql_template, $table_esc);
+            if (@$mysqli->query($sql)) {
+                $this->clear_table_columns_cache($table_clean);
+            } else {
+                $this->log_error('db_schema', sprintf('Failed adding %s: %s', $column, $mysqli->error));
+            }
+        }
+    }
+
+    private function build_cta_select_clause($mysqli, $table) {
+        $columns = [
+            'cta_lead_url',
+            'cta_lead_label',
+            'cta_stripe_url',
+            'cta_stripe_label',
+            'cta_affiliate_url',
+            'cta_affiliate_label',
+            'cta_paypal_url',
+            'cta_paypal_label',
+        ];
+        $existing = array_flip($this->get_table_columns($mysqli, $table));
+        $parts = [];
+        foreach ($columns as $col) {
+            if (isset($existing[$col])) {
+                $parts[] = ", `{$col}`";
+            } else {
+                $parts[] = ", '' AS {$col}";
+            }
+        }
+        return implode('', $parts);
+    }
+
+    private function sanitize_cta_label($value) {
+        $value = sanitize_text_field($value ?? '');
+        if (function_exists('mb_substr')) {
+            $value = mb_substr($value, 0, 80);
+        } else {
+            $value = substr($value, 0, 80);
+        }
+        return trim($value);
     }
 
     private function select_has_meta_column($mysqli, $table) {
@@ -470,7 +559,8 @@ CSS;
         if (!$mysqli) return null;
         $has_meta = $this->select_has_meta_column($mysqli, $table);
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}
+        $cta_sql = $this->build_cta_select_clause($mysqli, $table);
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -491,7 +581,8 @@ CSS;
         if (!$mysqli) return null;
         $has_meta = $this->select_has_meta_column($mysqli, $table);
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}
+        $cta_sql = $this->build_cta_select_clause($mysqli, $table);
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -574,11 +665,15 @@ CSS;
                                 echo esc_textarea($images_val);
                             ?></textarea>
                         </td></tr>
-                        <tr><th scope="row">CTAs</th><td style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-                            <input type="url" placeholder="Lead URL" name="cta_lead_url" value="<?php echo esc_attr($row['cta_lead_url'] ?? ''); ?>"/>
-                            <input type="url" placeholder="Stripe URL" name="cta_stripe_url" value="<?php echo esc_attr($row['cta_stripe_url'] ?? ''); ?>"/>
-                            <input type="url" placeholder="Affiliate URL" name="cta_affiliate_url" value="<?php echo esc_attr($row['cta_affiliate_url'] ?? ''); ?>"/>
-                            <input type="url" placeholder="PayPal URL" name="cta_paypal_url" value="<?php echo esc_attr($row['cta_paypal_url'] ?? ''); ?>"/>
+                        <tr><th scope="row">CTAs</th><td style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;">
+                            <input type="text" placeholder="Lead button label" name="cta_lead_label" value="<?php echo esc_attr($row['cta_lead_label'] ?? ''); ?>" aria-label="Lead button label"/>
+                            <input type="url" placeholder="Lead URL" name="cta_lead_url" value="<?php echo esc_attr($row['cta_lead_url'] ?? ''); ?>" aria-label="Lead button URL"/>
+                            <input type="text" placeholder="Stripe button label" name="cta_stripe_label" value="<?php echo esc_attr($row['cta_stripe_label'] ?? ''); ?>" aria-label="Stripe button label"/>
+                            <input type="url" placeholder="Stripe URL" name="cta_stripe_url" value="<?php echo esc_attr($row['cta_stripe_url'] ?? ''); ?>" aria-label="Stripe button URL"/>
+                            <input type="text" placeholder="Affiliate button label" name="cta_affiliate_label" value="<?php echo esc_attr($row['cta_affiliate_label'] ?? ''); ?>" aria-label="Affiliate button label"/>
+                            <input type="url" placeholder="Affiliate URL" name="cta_affiliate_url" value="<?php echo esc_attr($row['cta_affiliate_url'] ?? ''); ?>" aria-label="Affiliate button URL"/>
+                            <input type="text" placeholder="PayPal button label" name="cta_paypal_label" value="<?php echo esc_attr($row['cta_paypal_label'] ?? ''); ?>" aria-label="PayPal button label"/>
+                            <input type="url" placeholder="PayPal URL" name="cta_paypal_url" value="<?php echo esc_attr($row['cta_paypal_url'] ?? ''); ?>" aria-label="PayPal button URL"/>
                         </td></tr>
                         <tr><th scope="row">Published</th><td><label><input type="checkbox" name="is_published" value="1" <?php checked(!empty($row['is_published'])); ?>> Mark as published</label></td></tr>
                     </tbody></table>
@@ -646,9 +741,13 @@ CSS;
         $meta_description = sanitize_text_field($_POST['meta_description'] ?? '');
         if (strlen($meta_description) > 160) $meta_description = substr($meta_description, 0, 160);
         $images_json = $this->normalize_images_input($_POST['images_json'] ?? '');
+        $cta_lead_label = $this->sanitize_cta_label($_POST['cta_lead_label'] ?? '');
         $cta_lead_url = esc_url_raw($_POST['cta_lead_url'] ?? '');
+        $cta_stripe_label = $this->sanitize_cta_label($_POST['cta_stripe_label'] ?? '');
         $cta_stripe_url = esc_url_raw($_POST['cta_stripe_url'] ?? '');
+        $cta_affiliate_label = $this->sanitize_cta_label($_POST['cta_affiliate_label'] ?? '');
         $cta_affiliate_url = esc_url_raw($_POST['cta_affiliate_url'] ?? '');
+        $cta_paypal_label = $this->sanitize_cta_label($_POST['cta_paypal_label'] ?? '');
         $cta_paypal_url = esc_url_raw($_POST['cta_paypal_url'] ?? '');
         $desc_html = wp_kses_post($_POST['desc_html'] ?? '');
         $is_published = !empty($_POST['is_published']) ? 1 : 0;
@@ -662,6 +761,9 @@ CSS;
             wp_safe_redirect($redirect); exit;
         }
 
+        $this->ensure_cta_label_columns($mysqli, $table);
+        $existing_cols = array_flip($this->get_table_columns($mysqli, $table));
+
         $cols = [
             'title_h1' => $title_h1,
             'brand' => $brand,
@@ -670,9 +772,13 @@ CSS;
             'short_summary' => $short_summary,
             'meta_description' => $meta_description,
             'images_json' => $images_json,
+            'cta_lead_label' => $cta_lead_label,
             'cta_lead_url' => $cta_lead_url,
+            'cta_stripe_label' => $cta_stripe_label,
             'cta_stripe_url' => $cta_stripe_url,
+            'cta_affiliate_label' => $cta_affiliate_label,
             'cta_affiliate_url' => $cta_affiliate_url,
+            'cta_paypal_label' => $cta_paypal_label,
             'cta_paypal_url' => $cta_paypal_url,
             'desc_html' => $desc_html,
             'is_published' => $is_published,
@@ -681,16 +787,17 @@ CSS;
         $bind_types = '';
         $bind_values = [];
         foreach ($cols as $col => $val) {
-            if ($col === 'meta_description' && !$this->column_exists($mysqli, $table, 'meta_description')) {
-                continue; // tolerate missing column
+            if (!isset($existing_cols[$col])) {
+                if ($col === 'meta_description') {
+                    continue;
+                }
+                continue;
             }
-            if ($this->column_exists($mysqli, $table, $col) || $col !== 'meta_description') {
-                $set_parts[] = "`{$col}` = ?";
-                $bind_types .= ($col === 'is_published') ? 'i' : 's';
-                $bind_values[] = $val;
-            }
+            $set_parts[] = "`{$col}` = ?";
+            $bind_types .= ($col === 'is_published') ? 'i' : 's';
+            $bind_values[] = $val;
         }
-        if ($this->column_exists($mysqli, $table, 'last_tidb_update_at')) {
+        if (isset($existing_cols['last_tidb_update_at'])) {
             $set_parts[] = "last_tidb_update_at = NOW()";
         }
 
@@ -1225,6 +1332,50 @@ CSS;
         $short_summary = isset($p['short_summary']) ? trim((string)$p['short_summary']) : '';
         if (strlen($short_summary) > 150) { $short_summary = substr($short_summary, 0, 150); }
 
+        $cta_definitions = [
+            [
+                'url' => $p['cta_lead_url'] ?? '',
+                'label' => $p['cta_lead_label'] ?? '',
+                'fallback' => 'Request a Quote',
+                'rel' => 'nofollow',
+            ],
+            [
+                'url' => $p['cta_stripe_url'] ?? '',
+                'label' => $p['cta_stripe_label'] ?? '',
+                'fallback' => 'Buy via Stripe',
+                'rel' => 'nofollow',
+            ],
+            [
+                'url' => $p['cta_affiliate_url'] ?? '',
+                'label' => $p['cta_affiliate_label'] ?? '',
+                'fallback' => 'Buy Now',
+                'rel' => 'sponsored nofollow',
+            ],
+            [
+                'url' => $p['cta_paypal_url'] ?? '',
+                'label' => $p['cta_paypal_label'] ?? '',
+                'fallback' => 'Pay with PayPal',
+                'rel' => 'nofollow',
+            ],
+        ];
+
+        $cta_buttons = [];
+        foreach ($cta_definitions as $def) {
+            $url = trim((string)$def['url']);
+            if ($url === '') {
+                continue;
+            }
+            $label = trim((string)$def['label']);
+            if ($label === '') {
+                $label = $def['fallback'];
+            }
+            $cta_buttons[] = [
+                'url' => $url,
+                'label' => $label,
+                'rel' => $def['rel'],
+            ];
+        }
+
         $meta_description = $this->build_meta_description($p);
         $this->current_product = $p;
         $this->current_product_slug = $p['slug'];
@@ -1272,14 +1423,13 @@ CSS;
                   <h1 class="vpp-title"><?php echo esc_html($title); ?></h1>
                   <?php if ($meta_line): ?><p class="vpp-meta"><?php echo esc_html($meta_line); ?></p><?php endif; ?>
                   <?php if ($short_summary): ?><p class="vpp-short"><?php echo esc_html($short_summary); ?></p><?php endif; ?>
+                  <?php if (!empty($cta_buttons)): ?>
                   <div class="vpp-cta-block">
-                    <a class="vpp-cta-primary glow" href="<?php echo esc_url($p['cta_lead_url'] ?? '#'); ?>" rel="nofollow">Request a Quote</a>
-                    <div class="vpp-cta-secondary">
-                      <?php if (!empty($p['cta_stripe_url'])): ?><a class="vpp-cta-secondary-btn" href="<?php echo esc_url($p['cta_stripe_url']); ?>" rel="nofollow">Buy via Stripe</a><?php endif; ?>
-                      <?php if (!empty($p['cta_affiliate_url'])): ?><a class="vpp-cta-secondary-btn" href="<?php echo esc_url($p['cta_affiliate_url']); ?>" rel="sponsored nofollow">Buy Now</a><?php endif; ?>
-                      <?php if (!empty($p['cta_paypal_url'])): ?><a class="vpp-cta-secondary-btn" href="<?php echo esc_url($p['cta_paypal_url']); ?>" rel="nofollow">Pay with PayPal</a><?php endif; ?>
-                    </div>
+                    <?php foreach ($cta_buttons as $btn): ?>
+                      <a class="vpp-cta-button glow" href="<?php echo esc_url($btn['url']); ?>"<?php echo $btn['rel'] ? ' rel="' . esc_attr($btn['rel']) . '"' : ''; ?>><?php echo esc_html($btn['label']); ?></a>
+                    <?php endforeach; ?>
                   </div>
+                  <?php endif; ?>
                 </div>
               </div>
             </section>
