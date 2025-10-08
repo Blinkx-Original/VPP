@@ -2070,6 +2070,618 @@ CSS;
         return true;
     }
 
+    /* ========= PUBLISHING HELPERS ========= */
+
+    private function parse_publish_inputs(array $source, &$err = null) {
+        $from_raw = isset($source['publish_from']) ? sanitize_text_field(wp_unslash($source['publish_from'])) : '';
+        $to_raw = isset($source['publish_to']) ? sanitize_text_field(wp_unslash($source['publish_to'])) : '';
+        if ($from_raw === '' || $to_raw === '') {
+            $err = 'Enter both "From" and "To" timestamps in UTC (YYYY-MM-DD HH:MM).';
+            return null;
+        }
+        $tz = new DateTimeZone('UTC');
+        $from_dt = DateTime::createFromFormat('Y-m-d H:i', $from_raw, $tz);
+        $from_errors = DateTime::getLastErrors();
+        if (!$from_dt || ($from_errors['warning_count'] ?? 0) > 0 || ($from_errors['error_count'] ?? 0) > 0) {
+            $err = 'Invalid "From" timestamp (use YYYY-MM-DD HH:MM in UTC).';
+            return null;
+        }
+        $to_dt = DateTime::createFromFormat('Y-m-d H:i', $to_raw, $tz);
+        $to_errors = DateTime::getLastErrors();
+        if (!$to_dt || ($to_errors['warning_count'] ?? 0) > 0 || ($to_errors['error_count'] ?? 0) > 0) {
+            $err = 'Invalid "To" timestamp (use YYYY-MM-DD HH:MM in UTC).';
+            return null;
+        }
+        $from_ts = $from_dt->getTimestamp();
+        $to_ts = $to_dt->getTimestamp();
+        if ($to_ts <= $from_ts) {
+            $err = 'The "To" timestamp must be greater than "From".';
+            return null;
+        }
+        $batch_limit = isset($source['batch_limit']) ? (int)$source['batch_limit'] : 1000;
+        if ($batch_limit < 1) { $batch_limit = 1; }
+        if ($batch_limit > 50000) { $batch_limit = 50000; }
+        $ping_google = !empty($source['ping_google']) ? 1 : 0;
+        $mark_published = !empty($source['mark_published']) ? 1 : 0;
+        return [
+            'from' => $from_dt->format('Y-m-d H:i'),
+            'to' => $to_dt->format('Y-m-d H:i'),
+            'from_sql' => $from_dt->format('Y-m-d H:i:00'),
+            'to_sql' => $to_dt->format('Y-m-d H:i:00'),
+            'from_ts' => $from_ts,
+            'to_ts' => $to_ts,
+            'batch_limit' => $batch_limit,
+            'ping_google' => $ping_google,
+            'mark_published' => $mark_published,
+        ];
+    }
+
+    private function count_products_in_range($mysqli, $table, $from_sql, $to_sql, &$err = null) {
+        $sql = "SELECT COUNT(*) AS cnt FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ?";
+        $stmt = $mysqli->prepare($sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            return null;
+        }
+        $stmt->bind_param('ss', $from_sql, $to_sql);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $row = $res ? $res->fetch_assoc() : null;
+        if ($res) { $res->free(); }
+        $stmt->close();
+        return isset($row['cnt']) ? (int)$row['cnt'] : 0;
+    }
+
+    private function build_publish_select_clause($mysqli, $table) {
+        $cols = array_flip($this->get_table_columns($mysqli, $table));
+        $select = ['`id`', '`slug`', '`updated_at`'];
+        $select[] = isset($cols['sku']) ? '`sku`' : "'' AS sku";
+        $select[] = isset($cols['brand']) ? '`brand`' : "'' AS brand";
+        if (isset($cols['title_h1'])) {
+            $select[] = '`title_h1`';
+        } elseif (isset($cols['name'])) {
+            $select[] = '`name` AS title_h1';
+        } else {
+            $select[] = '`slug` AS title_h1';
+        }
+        if (isset($cols['short_description'])) {
+            $select[] = '`short_description`';
+        } elseif (isset($cols['short_summary'])) {
+            $select[] = '`short_summary` AS short_description';
+        } else {
+            $select[] = "'' AS short_description";
+        }
+        $select[] = isset($cols['price']) ? '`price`' : "'' AS price";
+        $select[] = isset($cols['categories']) ? '`categories`' : "'' AS categories";
+        if (isset($cols['image'])) {
+            $select[] = '`image`';
+        } else {
+            $select[] = "'' AS image";
+        }
+        $select[] = isset($cols['images_json']) ? '`images_json`' : "'' AS images_json";
+        if (isset($cols['is_published'])) {
+            $select[] = '`is_published`';
+        }
+        return implode(', ', $select);
+    }
+
+    private function fetch_publish_batch($mysqli, $table, $select_clause, $from_sql, $to_sql, $limit, $offset, &$err = null) {
+        $sql = "SELECT {$select_clause} FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT ? OFFSET ?";
+        $stmt = $mysqli->prepare($sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            return false;
+        }
+        $limit = (int)$limit;
+        $offset = (int)$offset;
+        $stmt->bind_param('ssii', $from_sql, $to_sql, $limit, $offset);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $rows = [];
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                $rows[] = $row;
+            }
+            $res->free();
+        }
+        $stmt->close();
+        return $rows;
+    }
+
+    private function mark_products_as_published($mysqli, $table, array $ids) {
+        $ids = array_values(array_filter(array_map('intval', $ids)));
+        if (empty($ids)) {
+            return 0;
+        }
+        $updated = 0;
+        foreach (array_chunk($ids, 500) as $chunk) {
+            $id_list = implode(',', $chunk);
+            $sql = "UPDATE `{$table}` SET `is_published` = 1 WHERE `id` IN ({$id_list})";
+            $ok = @$mysqli->query($sql);
+            if ($ok && $mysqli->affected_rows > 0) {
+                $updated += $mysqli->affected_rows;
+            }
+        }
+        return $updated;
+    }
+
+    private function run_publish_preview(array $inputs, &$total, &$samples, &$err = null) {
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return false;
+        }
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            $err = 'Invalid TiDB table name.';
+            @$mysqli->close();
+            return false;
+        }
+        if (!$this->column_exists($mysqli, $table, 'updated_at')) {
+            $err = 'Table is missing updated_at column.';
+            @$mysqli->close();
+            return false;
+        }
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        if ($total === null) {
+            @$mysqli->close();
+            return false;
+        }
+        $samples = [];
+        $sql = "SELECT `slug` FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT 20";
+        $stmt = $mysqli->prepare($sql);
+        if ($stmt) {
+            $stmt->bind_param('ss', $inputs['from_sql'], $inputs['to_sql']);
+            $stmt->execute();
+            $res = $stmt->get_result();
+            if ($res) {
+                while ($row = $res->fetch_assoc()) {
+                    if (!empty($row['slug'])) {
+                        $samples[] = (string)$row['slug'];
+                    }
+                }
+                $res->free();
+            }
+            $stmt->close();
+        }
+        @$mysqli->close();
+        return true;
+    }
+
+    private function fetch_publish_rows(array $inputs, $mark_published, &$err = null) {
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return false;
+        }
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            $err = 'Invalid TiDB table name.';
+            @$mysqli->close();
+            return false;
+        }
+        if (!$this->column_exists($mysqli, $table, 'updated_at')) {
+            $err = 'Table is missing updated_at column.';
+            @$mysqli->close();
+            return false;
+        }
+        $select_clause = $this->build_publish_select_clause($mysqli, $table);
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        if ($total === null) {
+            @$mysqli->close();
+            return false;
+        }
+        $limit = min($inputs['batch_limit'], $total);
+        $rows = [];
+        $offset = 0;
+        $batches = 0;
+        while ($limit > 0) {
+            $chunk = min(200, $limit);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $offset, $err);
+            if ($batch === false) {
+                @$mysqli->close();
+                return false;
+            }
+            if (empty($batch)) {
+                break;
+            }
+            $rows = array_merge($rows, $batch);
+            $offset += count($batch);
+            $limit -= count($batch);
+            $batches++;
+            if (count($batch) < $chunk) {
+                break;
+            }
+        }
+        if ($mark_published && !empty($rows) && $this->column_exists($mysqli, $table, 'is_published')) {
+            $this->mark_products_as_published($mysqli, $table, array_column($rows, 'id'));
+        }
+        @$mysqli->close();
+        return [
+            'total' => $total,
+            'rows' => $rows,
+            'batches' => $batches,
+        ];
+    }
+
+    private function extract_slug_from_loc($loc) {
+        if (!is_string($loc) || $loc === '') {
+            return '';
+        }
+        $path = parse_url($loc, PHP_URL_PATH);
+        if (!$path) {
+            return '';
+        }
+        $path = trim($path, '/');
+        if ($path === '') {
+            return '';
+        }
+        $parts = explode('/', $path);
+        $index = array_search('p', $parts, true);
+        if ($index !== false && isset($parts[$index + 1])) {
+            $slug = $parts[$index + 1];
+        } else {
+            $slug = end($parts);
+        }
+        return sanitize_title($slug);
+    }
+
+    private function read_sitemap_entries($path) {
+        $entries = [];
+        if (!@file_exists($path)) {
+            return $entries;
+        }
+        $xml = @simplexml_load_file($path);
+        if (!$xml) {
+            return $entries;
+        }
+        foreach ($xml->url as $url) {
+            $loc = (string)$url->loc;
+            $slug = $this->extract_slug_from_loc($loc);
+            if ($slug === '') {
+                continue;
+            }
+            $lastmod = (string)$url->lastmod;
+            if ($lastmod === '') {
+                $lastmod = gmdate('c');
+            }
+            $entries[] = [
+                'slug' => $slug,
+                'lastmod' => $lastmod,
+            ];
+        }
+        return $entries;
+    }
+
+    private function write_sitemap_file($path, array $entries) {
+        $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        foreach ($entries as $entry) {
+            $slug = sanitize_title($entry['slug'] ?? '');
+            if ($slug === '') {
+                continue;
+            }
+            $loc = home_url('/p/' . $slug . '/');
+            $lastmod = $entry['lastmod'] ?? gmdate('c');
+            $xml .= "  <url>\n";
+            $xml .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
+            $xml .= '    <lastmod>' . htmlspecialchars($lastmod, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</lastmod>' . "\n";
+            $xml .= "  </url>\n";
+        }
+        $xml .= '</urlset>';
+        if (strlen($xml) > 50 * 1024 * 1024) {
+            return false;
+        }
+        return @file_put_contents($path, $xml) !== false;
+    }
+
+    private function refresh_sitemap_index($dir, $base_url, &$err = null) {
+        $files = glob($dir . '*.xml') ?: [];
+        $entries = [];
+        foreach ($files as $file) {
+            $name = basename($file);
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+                continue;
+            }
+            $entries[] = [
+                'loc' => $base_url . $name,
+                'lastmod' => gmdate('c', @filemtime($file) ?: time()),
+            ];
+        }
+        usort($entries, function ($a, $b) {
+            return strcmp($a['loc'], $b['loc']);
+        });
+        $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        $xml .= '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        foreach ($entries as $entry) {
+            $xml .= "  <sitemap>\n";
+            $xml .= '    <loc>' . htmlspecialchars($entry['loc'], ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
+            $xml .= '    <lastmod>' . htmlspecialchars($entry['lastmod'], ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</lastmod>' . "\n";
+            $xml .= "  </sitemap>\n";
+        }
+        $xml .= '</sitemapindex>';
+        $index_path = $dir . 'sitemap_index.xml';
+        if (@file_put_contents($index_path, $xml) === false) {
+            $err = 'Failed to write sitemap_index.xml';
+            return false;
+        }
+        @file_put_contents($dir . 'sitemap-index.xml', $xml);
+        return $base_url . 'sitemap_index.xml';
+    }
+
+    private function update_sitemaps_with_products(array $items, $ping_google, &$notes, &$err = null) {
+        if (empty($items)) {
+            $notes = 'No sitemap entries to update.';
+            return true;
+        }
+        $uploads = wp_upload_dir();
+        if (empty($uploads['basedir']) || empty($uploads['baseurl'])) {
+            $err = 'Uploads directory is not writable.';
+            return false;
+        }
+        $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps/';
+        if (!wp_mkdir_p($dir)) {
+            $err = 'Failed to create sitemap directory.';
+            return false;
+        }
+        $base_url = trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/';
+        $existing_files = glob($dir . '*.xml') ?: [];
+        $items_map = [];
+        foreach ($items as $item) {
+            $slug = sanitize_title($item['slug']);
+            if ($slug === '') {
+                continue;
+            }
+            $items_map[$slug] = [
+                'slug' => $slug,
+                'lastmod' => $item['lastmod'],
+            ];
+        }
+        if (empty($items_map)) {
+            $notes = 'No valid sitemap entries found.';
+            return true;
+        }
+        $files_touched = 0;
+        $filtered_files = [];
+        foreach ($existing_files as $file) {
+            $name = basename($file);
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+                continue;
+            }
+            $filtered_files[] = $file;
+        }
+        sort($filtered_files, SORT_NATURAL);
+        foreach ($filtered_files as $file) {
+            $entries = $this->read_sitemap_entries($file);
+            $changed = false;
+            foreach ($entries as &$entry) {
+                $slug = $entry['slug'];
+                if (isset($items_map[$slug])) {
+                    $entry['lastmod'] = $items_map[$slug]['lastmod'];
+                    unset($items_map[$slug]);
+                    $changed = true;
+                }
+            }
+            if ($changed) {
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    $err = 'Failed to write ' . basename($file);
+                    return false;
+                }
+                $files_touched++;
+            }
+        }
+        $remaining = array_values($items_map);
+        $date_prefix = gmdate('Ymd');
+        $max_entries = 50000;
+        if (!empty($remaining)) {
+            foreach ($filtered_files as $file) {
+                if (empty($remaining)) {
+                    break;
+                }
+                $name = basename($file);
+                if (!preg_match('/^products-' . $date_prefix . '-\\d+\\.xml$/', $name)) {
+                    continue;
+                }
+                $entries = $this->read_sitemap_entries($file);
+                $count = count($entries);
+                if ($count >= $max_entries) {
+                    continue;
+                }
+                $space = $max_entries - $count;
+                if ($space <= 0) {
+                    continue;
+                }
+                $add = array_splice($remaining, 0, $space);
+                foreach ($add as $item) {
+                    $entries[] = $item;
+                }
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    $err = 'Failed to write ' . basename($file);
+                    return false;
+                }
+                $files_touched++;
+            }
+        }
+        if (!empty($remaining)) {
+            $existing_indexes = [];
+            foreach ($filtered_files as $file) {
+                $name = basename($file);
+                if (preg_match('/^products-' . $date_prefix . '-(\d+)\.xml$/', $name, $m)) {
+                    $existing_indexes[] = (int)$m[1];
+                }
+            }
+            $index = empty($existing_indexes) ? 0 : max($existing_indexes);
+            while (!empty($remaining)) {
+                $chunk = array_splice($remaining, 0, $max_entries);
+                $index++;
+                $filename = sprintf('products-%s-%d.xml', $date_prefix, $index);
+                $path = $dir . $filename;
+                if (!$this->write_sitemap_file($path, $chunk)) {
+                    $err = 'Failed to write ' . $filename;
+                    return false;
+                }
+                $files_touched++;
+                $filtered_files[] = $path;
+            }
+        }
+        $index_url = $this->refresh_sitemap_index($dir, $base_url, $err);
+        if ($index_url === false) {
+            return false;
+        }
+        $notes = $files_touched ? sprintf('Updated %d sitemap file(s).', $files_touched) : 'Sitemap unchanged.';
+        if ($ping_google && $index_url) {
+            $resp = wp_remote_get('https://www.google.com/ping?sitemap=' . rawurlencode($index_url), ['timeout' => 10]);
+            if (is_wp_error($resp)) {
+                $notes .= ' Google ping failed.';
+            } else {
+                $code = wp_remote_retrieve_response_code($resp);
+                if ($code >= 200 && $code < 300) {
+                    $notes .= ' Google ping sent.';
+                } else {
+                    $notes .= ' Google ping HTTP ' . $code . '.';
+                }
+            }
+        }
+        return true;
+    }
+
+    private function normalize_publish_categories($raw) {
+        if (is_array($raw)) {
+            $out = [];
+            foreach ($raw as $item) {
+                $item = trim((string)$item);
+                if ($item !== '') {
+                    $out[] = $item;
+                }
+            }
+            return empty($out) ? null : array_values(array_unique($out));
+        }
+        if (!is_string($raw)) {
+            return null;
+        }
+        $raw = trim($raw);
+        if ($raw === '') {
+            return null;
+        }
+        if ($raw[0] === '[' || $raw[0] === '{') {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                return $this->normalize_publish_categories($decoded);
+            }
+        }
+        $parts = array_filter(array_map('trim', explode(',', $raw)));
+        return empty($parts) ? null : array_values(array_unique($parts));
+    }
+
+    private function build_algolia_publish_record(array $row) {
+        $slug = sanitize_title($row['slug'] ?? '');
+        if ($slug === '') {
+            return null;
+        }
+        $sku = trim((string)($row['sku'] ?? ''));
+        if ($sku === '') {
+            $sku = $slug;
+        }
+        $title = trim((string)($row['title_h1'] ?? ''));
+        if ($title === '') {
+            $title = $slug;
+        }
+        $record = [
+            'objectID' => $sku,
+            'sku' => $sku,
+            'slug' => $slug,
+            'brand' => (string)($row['brand'] ?? ''),
+            'title_h1' => $title,
+            'name' => $title,
+            'short_description' => (string)($row['short_description'] ?? ''),
+            'url' => home_url('/p/' . $slug . '/'),
+        ];
+        if (isset($row['price']) && $row['price'] !== '') {
+            $record['price'] = is_numeric($row['price']) ? 0 + $row['price'] : (string)$row['price'];
+        }
+        $categories = $this->normalize_publish_categories($row['categories'] ?? null);
+        if ($categories !== null) {
+            $record['categories'] = $categories;
+        }
+        $image = '';
+        if (!empty($row['image'])) {
+            $image = (string)$row['image'];
+        }
+        if (!$image && !empty($row['images_json'])) {
+            $decoded = json_decode($row['images_json'], true);
+            if (is_array($decoded)) {
+                $first = reset($decoded);
+                if (is_string($first)) {
+                    $image = $first;
+                }
+            }
+        }
+        if ($image) {
+            $record['image'] = $image;
+        }
+        if (!empty($row['updated_at'])) {
+            $ts = strtotime($row['updated_at'] . ' UTC');
+            if ($ts === false) {
+                $ts = strtotime($row['updated_at']);
+            }
+            if ($ts !== false) {
+                $record['updated_at'] = gmdate('c', $ts);
+            }
+        }
+        return $record;
+    }
+
+    private function send_algolia_batch(array $records, &$err = null) {
+        if (empty($records)) {
+            return true;
+        }
+        $settings = $this->get_settings();
+        $app = trim($settings['algolia']['app_id'] ?? '');
+        $key = trim($settings['algolia']['admin_key'] ?? '');
+        $index = trim($settings['algolia']['index'] ?? '');
+        if (!$app || !$key || !$index) {
+            $err = 'Algolia not configured.';
+            return false;
+        }
+        $endpoint = "https://{$app}-dsn.algolia.net/1/indexes/" . rawurlencode($index) . '/batch';
+        $payload = ['requests' => []];
+        foreach ($records as $record) {
+            $payload['requests'][] = [
+                'action' => 'updateObject',
+                'body' => $record,
+            ];
+        }
+        $args = [
+            'method' => 'POST',
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'X-Algolia-API-Key' => $key,
+                'X-Algolia-Application-Id' => $app,
+            ],
+            'timeout' => 20,
+            'body' => wp_json_encode($payload),
+        ];
+        $resp = wp_remote_request($endpoint, $args);
+        if (is_wp_error($resp)) {
+            $err = 'Algolia request failed: ' . $resp->get_error_message();
+            return false;
+        }
+        $code = wp_remote_retrieve_response_code($resp);
+        if ($code < 200 || $code >= 300) {
+            $body = wp_remote_retrieve_body($resp);
+            $snippet = '';
+            if ($body) {
+                $snippet = function_exists('mb_substr') ? mb_substr($body, 0, 120) : substr($body, 0, 120);
+                $snippet = trim((string)$snippet);
+            }
+            $err = 'Algolia HTTP ' . $code . ($snippet !== '' ? ': ' . $snippet : '');
+            return false;
+        }
+        return true;
+    }
+
     /* ========= DATA ========= */
 
     private function db_connect(&$err = null) {
