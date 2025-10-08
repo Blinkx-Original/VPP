@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.4.2
+ * Version: 1.4.5
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.4.2';
+    const VERSION = '1.4.5';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -140,6 +140,9 @@ CSS;
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
     const LOG_FILENAME = 'vpp.log';
+    const PUBLISH_STATE_OPTION = 'vpp_publish_state';
+    const PUBLISH_HISTORY_OPTION = 'vpp_publish_history';
+    const PUBLISH_RESUME_OPTION = 'vpp_publish_resume';
 
     private static $instance = null;
 
@@ -178,6 +181,13 @@ CSS;
             add_action('admin_post_vpp_test_algolia', [$this, 'handle_test_algolia']);
             add_action('admin_post_vpp_push_publish', [$this, 'handle_push_publish']);
             add_action('admin_post_vpp_push_algolia', [$this, 'handle_push_algolia']);
+            add_action('admin_post_vpp_publish_preview', [$this, 'handle_publish_preview']);
+            add_action('admin_post_vpp_publish_sitemap', [$this, 'handle_publish_sitemap']);
+            add_action('admin_post_vpp_publish_algolia', [$this, 'handle_publish_algolia']);
+            add_action('admin_post_vpp_publish_resume', [$this, 'handle_publish_resume']);
+            add_action('admin_post_vpp_publish_rotate_now', [$this, 'handle_publish_rotate_now']);
+            add_action('admin_post_vpp_publish_rebuild_index', [$this, 'handle_publish_rebuild_index']);
+            add_action('admin_post_vpp_publish_validate', [$this, 'handle_publish_validate']);
             add_action('admin_post_vpp_purge_cache', [$this, 'handle_purge_cache']);
             add_action('admin_post_vpp_rebuild_sitemaps', [$this, 'handle_rebuild_sitemaps']);
             add_action('admin_post_vpp_download_log', [$this, 'handle_download_log']);
@@ -236,7 +246,9 @@ CSS;
     /* ========= SETTINGS ========= */
 
     public function admin_menu() {
-        add_menu_page('Virtual Products', 'Virtual Products', 'manage_options', 'vpp_settings', [$this, 'render_settings_page'], 'dashicons-archive', 58);
+        add_menu_page('Virtual Products', 'Virtual Products', 'manage_options', 'vpp_settings', [$this, 'render_connectivity_page'], 'dashicons-archive', 58);
+        add_submenu_page('vpp_settings', 'Connectivity', 'Connectivity', 'manage_options', 'vpp_settings', [$this, 'render_connectivity_page']);
+        add_submenu_page('vpp_settings', 'Publishing', 'Publishing', 'manage_options', 'vpp_publishing', [$this, 'render_publishing_page']);
         add_submenu_page('vpp_settings', 'Edit Product', 'Edit Product', 'manage_options', 'vpp_edit', [$this, 'render_edit_page']);
         add_submenu_page('vpp_settings', 'VPP Status', 'VPP Status', 'manage_options', 'vpp_status', [$this, 'render_status_page']);
     }
@@ -284,12 +296,12 @@ CSS;
         return $out;
     }
 
-    public function render_settings_page() {
+    public function render_connectivity_page() {
         if (!current_user_can('manage_options')) return;
         $s = $this->get_settings();
         ?>
         <div class="wrap">
-            <h1>Virtual Product Pages</h1>
+            <h1>Connectivity</h1>
             <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                 <input type="hidden" name="action" value="vpp_save_settings"/>
                 <?php wp_nonce_field(self::NONCE_KEY); ?>
@@ -358,6 +370,528 @@ CSS;
             </form>
         </div>
         <?php
+    }
+
+    public function render_publishing_page() {
+        if (!current_user_can('manage_options')) return;
+        $state = $this->get_publish_state();
+        $inputs = $state['inputs'];
+        $from_val = $inputs['from'];
+        $to_val = $inputs['to'];
+        $batch_limit = (int)$inputs['batch_limit'];
+        $delay_ms = (int)$inputs['delay_ms'];
+        $range_text = $from_val && $to_val ? sprintf('Range: %s UTC → %s UTC', $from_val, $to_val) : 'Range: —';
+        $message = $state['message'];
+        $message_type = $state['message_type'];
+        $result = $state['result'];
+        $samples = $state['samples'];
+        $total = $state['total'];
+        $history = $this->get_publish_history();
+        $validation = $state['validation'];
+        $sitemap_urls = $this->get_sitemap_index_urls();
+        $notice_class = 'success';
+        if ($message_type === 'error') {
+            $notice_class = 'error';
+        } elseif ($message_type === 'warning') {
+            $notice_class = 'warning';
+        }
+
+        $presets = $this->get_publishing_presets();
+        $admin_post = admin_url('admin-post.php');
+        $resume_entries = $this->get_publish_resume_data();
+        $resume_notices = [];
+        $resume_labels = [
+            'sitemap' => 'Publish to Sitemap',
+            'algolia' => 'Push to Algolia',
+        ];
+        foreach ($resume_labels as $key => $label) {
+            if (empty($resume_entries[$key]) || !is_array($resume_entries[$key])) {
+                continue;
+            }
+            $entry = $resume_entries[$key];
+            $total_limit = isset($entry['limit']) ? (int)$entry['limit'] : (int)($entry['total'] ?? 0);
+            $processed = isset($entry['processed']) ? (int)$entry['processed'] : 0;
+            if ($total_limit > 0 && $processed >= $total_limit) {
+                continue;
+            }
+            $resume_notices[$key] = [
+                'label' => $label,
+                'batch' => max(1, (int)($entry['batches_done'] ?? 0) + 1),
+                'processed' => $processed,
+                'limit' => $total_limit,
+                'from' => $entry['inputs']['from'] ?? '',
+                'to' => $entry['inputs']['to'] ?? '',
+            ];
+        }
+        ?>
+        <div class="wrap vpp-publishing">
+            <h1>Publishing</h1>
+            <p class="description">Push products from TiDB to Algolia and the sitemap within a UTC date range.</p>
+
+            <?php if ($message): ?>
+                <div class="notice notice-<?php echo esc_attr($notice_class); ?> is-dismissible"><p><?php echo esc_html($message); ?></p></div>
+            <?php endif; ?>
+
+            <?php if (!empty($resume_notices)): ?>
+                <?php foreach ($resume_notices as $action => $notice): ?>
+                    <div class="notice notice-warning">
+                        <p>
+                            <strong>Resume available:</strong>
+                            A previous <?php echo esc_html($notice['label']); ?> run was interrupted for
+                            <code><?php echo esc_html($notice['from']); ?></code> → <code><?php echo esc_html($notice['to']); ?></code>.
+                            Resume from batch #<?php echo (int)$notice['batch']; ?>?
+                        </p>
+                        <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                            <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                                <input type="hidden" name="action" value="vpp_publish_resume"/>
+                                <input type="hidden" name="target" value="<?php echo esc_attr($action); ?>"/>
+                                <input type="hidden" name="mode" value="resume"/>
+                                <button type="submit" class="button button-primary">Resume <?php echo esc_html($notice['label']); ?></button>
+                            </form>
+                            <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                                <input type="hidden" name="action" value="vpp_publish_resume"/>
+                                <input type="hidden" name="target" value="<?php echo esc_attr($action); ?>"/>
+                                <input type="hidden" name="mode" value="clear"/>
+                                <button type="submit" class="button">Dismiss</button>
+                            </form>
+                        </div>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+
+            <form id="vpp-publishing-form" method="post" action="<?php echo esc_url($admin_post); ?>">
+                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                <h2 class="title">Date Range</h2>
+                <table class="form-table">
+                    <tbody>
+                        <tr>
+                            <th scope="row"><label for="vpp-publish-from">DateTime From (UTC)</label></th>
+                            <td>
+                                <input type="text" id="vpp-publish-from" name="publish_from" value="<?php echo esc_attr($from_val); ?>" class="regular-text" placeholder="YYYY-MM-DD HH:MM" autocomplete="off">
+                                <p class="description">Input format: YYYY-MM-DD HH:MM (UTC)</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><label for="vpp-publish-to">DateTime To (UTC)</label></th>
+                            <td>
+                                <input type="text" id="vpp-publish-to" name="publish_to" value="<?php echo esc_attr($to_val); ?>" class="regular-text" placeholder="YYYY-MM-DD HH:MM" autocomplete="off">
+                                <div class="vpp-preset-buttons" style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+                                    <?php foreach ($presets as $preset): ?>
+                                        <button type="button" class="button" data-from="<?php echo esc_attr($preset['from']); ?>" data-to="<?php echo esc_attr($preset['to']); ?>"><?php echo esc_html($preset['label']); ?></button>
+                                    <?php endforeach; ?>
+                                </div>
+                                <p class="description" id="vpp-range-text"><?php echo esc_html($range_text); ?></p>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h2 class="title" style="margin-top:24px;">Publishing Runs</h2>
+                <table class="form-table">
+                    <tbody>
+                        <tr>
+                            <th scope="row"><label for="vpp-batch-limit">Batch Limit</label></th>
+                            <td>
+                                <input type="number" id="vpp-batch-limit" name="batch_limit" value="<?php echo esc_attr($batch_limit); ?>" min="1" step="1" style="width:120px;">
+                                <p class="description">Maximum number of products processed per run.</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><label for="vpp-delay-ms">Delay (ms) between batches</label></th>
+                            <td>
+                                <input type="number" id="vpp-delay-ms" name="delay_ms" value="<?php echo esc_attr($delay_ms); ?>" min="0" step="50" style="width:120px;">
+                                <p class="description">Soft rate limit applied after each batch (default 200 ms).</p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row">Sitemap Options</th>
+                            <td>
+                                <label><input type="checkbox" name="ping_google" value="1" <?php checked(!empty($inputs['ping_google'])); ?>> Ping Google after sitemap update</label><br>
+                                <label><input type="checkbox" name="mark_published" value="1" <?php checked(!empty($inputs['mark_published'])); ?>> Mark records as published</label>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <p class="submit" style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
+                    <button type="submit" class="button" formaction="<?php echo esc_url($admin_post . '?action=vpp_publish_preview'); ?>">Preview Range</button>
+                    <button type="submit" class="button button-primary" formaction="<?php echo esc_url($admin_post . '?action=vpp_publish_sitemap'); ?>">Publish to Sitemap</button>
+                    <button type="submit" class="button button-primary" formaction="<?php echo esc_url($admin_post . '?action=vpp_publish_algolia'); ?>">Push to Algolia</button>
+                </p>
+            </form>
+
+            <div class="vpp-sitemap-maintenance card" style="margin-top:32px; padding:16px; max-width:940px;">
+                <h2 class="title">Sitemap Maintenance</h2>
+                <p>Manual tools to keep sitemap files healthy.</p>
+                <?php if (!empty($sitemap_urls)): ?>
+                    <p class="description" style="margin-top:4px;">
+                        Sitemap index URL:
+                        <a href="<?php echo esc_url($sitemap_urls['primary']); ?>" target="_blank" rel="noopener noreferrer">
+                            <code><?php echo esc_html($sitemap_urls['primary']); ?></code>
+                        </a>
+                    </p>
+                    <?php if (!empty($sitemap_urls['legacy']) && $sitemap_urls['legacy'] !== $sitemap_urls['primary']): ?>
+                        <p class="description" style="margin-top:4px;">
+                            Legacy alias:
+                            <a href="<?php echo esc_url($sitemap_urls['legacy']); ?>" target="_blank" rel="noopener noreferrer">
+                                <code><?php echo esc_html($sitemap_urls['legacy']); ?></code>
+                            </a>
+                        </p>
+                    <?php endif; ?>
+                <?php endif; ?>
+                <div style="display:flex; flex-wrap:wrap; gap:12px;">
+                    <form method="post" action="<?php echo esc_url($admin_post); ?>" style="margin:0;">
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <input type="hidden" name="action" value="vpp_publish_rotate_now"/>
+                        <button type="submit" class="button">Rotate Now (Start New Sitemap Set)</button>
+                    </form>
+                    <form method="post" action="<?php echo esc_url($admin_post); ?>" style="margin:0;">
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <input type="hidden" name="action" value="vpp_publish_rebuild_index"/>
+                        <button type="submit" class="button">Rebuild sitemap_index.xml</button>
+                    </form>
+                    <form method="post" action="<?php echo esc_url($admin_post); ?>" style="margin:0;">
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <input type="hidden" name="action" value="vpp_publish_validate"/>
+                        <button type="submit" class="button">Validate Sitemaps</button>
+                    </form>
+                </div>
+
+                <?php if (!empty($validation)): ?>
+                    <div style="margin-top:16px;">
+                        <h3>Validation Summary</h3>
+                        <table class="widefat striped" style="max-width:900px;">
+                            <thead>
+                                <tr>
+                                    <th>Status</th>
+                                    <th>File</th>
+                                    <th>URLs</th>
+                                    <th>Size</th>
+                                    <th>Last Modified (UTC)</th>
+                                    <th>Notes</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($validation as $row): ?>
+                                    <tr>
+                                        <td><?php echo esc_html($row['icon'] ?? ''); ?></td>
+                                        <td><code><?php echo esc_html($row['file'] ?? ''); ?></code></td>
+                                        <td><?php echo esc_html(number_format_i18n((int)($row['urls'] ?? 0))); ?></td>
+                                        <td><?php echo esc_html($row['size_human'] ?? ''); ?></td>
+                                        <td><?php echo esc_html($row['last_modified'] ?? ''); ?></td>
+                                        <td><?php echo esc_html($row['note'] ?? ''); ?></td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endif; ?>
+            </div>
+
+            <div class="vpp-publish-summary" style="margin-top:24px;">
+                <h2>Latest Result</h2>
+                <?php if ($result): ?>
+                    <table class="widefat striped" style="max-width:720px;">
+                        <tbody>
+                            <tr><th scope="row">Action</th><td><?php echo esc_html(ucfirst($result['action'])); ?></td></tr>
+                            <tr><th scope="row">Total in Range</th><td><?php echo esc_html(number_format_i18n((int)$total)); ?></td></tr>
+                            <tr><th scope="row">Processed</th><td><?php echo esc_html(number_format_i18n((int)($result['processed'] ?? 0))); ?></td></tr>
+                            <tr><th scope="row">Skipped</th><td><?php echo esc_html(number_format_i18n((int)($result['skipped'] ?? 0))); ?></td></tr>
+                            <tr><th scope="row">Failed</th><td><?php echo esc_html(number_format_i18n((int)($result['failed'] ?? 0))); ?></td></tr>
+                            <tr><th scope="row">Batches</th><td><?php echo esc_html(number_format_i18n((int)($result['batches'] ?? 0))); ?></td></tr>
+                            <tr><th scope="row">Duration</th><td><?php echo esc_html($result['duration'] ?? '—'); ?></td></tr>
+                            <?php if (!empty($result['notes'])): ?>
+                                <tr><th scope="row">Notes</th><td><?php echo esc_html($result['notes']); ?></td></tr>
+                            <?php endif; ?>
+                        </tbody>
+                    </table>
+                <?php else: ?>
+                    <p>No publishing actions executed yet.</p>
+                <?php endif; ?>
+            </div>
+
+            <div class="vpp-publish-preview" style="margin-top:24px;">
+                <h2>Preview Samples</h2>
+                <?php if (!empty($samples)): ?>
+                    <p>Showing up to 20 slugs ordered by updated_at ASC.</p>
+                    <ol>
+                        <?php foreach ($samples as $slug): ?>
+                            <li><code><?php echo esc_html($slug); ?></code></li>
+                        <?php endforeach; ?>
+                    </ol>
+                <?php else: ?>
+                    <p>No samples available.</p>
+                <?php endif; ?>
+            </div>
+
+            <div class="vpp-publish-history" style="margin-top:24px;">
+                <h2>History (Last 10)</h2>
+                <?php if (!empty($history)): ?>
+                    <table class="widefat striped" style="max-width:920px;">
+                        <thead>
+                            <tr>
+                                <th>Executed (UTC)</th>
+                                <th>Action</th>
+                                <th>Date Range</th>
+                                <th>Processed</th>
+                                <th>Duration</th>
+                                <th>Batch Limit</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($history as $entry): ?>
+                                <tr>
+                                    <td><?php echo esc_html($entry['timestamp']); ?></td>
+                                    <td><?php echo esc_html($entry['action']); ?></td>
+                                    <td><code><?php echo esc_html($entry['from']); ?></code> → <code><?php echo esc_html($entry['to']); ?></code></td>
+                                    <td><?php echo esc_html(number_format_i18n((int)$entry['processed'])); ?></td>
+                                    <td><?php echo esc_html($entry['duration']); ?></td>
+                                    <td><?php echo esc_html((int)$entry['batch_limit']); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                <?php else: ?>
+                    <p>No executions logged yet.</p>
+                <?php endif; ?>
+            </div>
+        </div>
+
+        <script>
+        (function(){
+            const form = document.getElementById('vpp-publishing-form');
+            if (!form) { return; }
+            const fromInput = document.getElementById('vpp-publish-from');
+            const toInput = document.getElementById('vpp-publish-to');
+            const rangeText = document.getElementById('vpp-range-text');
+            const buttons = form.querySelectorAll('.vpp-preset-buttons button');
+            buttons.forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const from = btn.getAttribute('data-from');
+                    const to = btn.getAttribute('data-to');
+                    if (from && fromInput) { fromInput.value = from; }
+                    if (to && toInput) { toInput.value = to; }
+                    if (rangeText) {
+                        if (from && to) {
+                            rangeText.textContent = 'Range: ' + from + ' UTC → ' + to + ' UTC';
+                        } else {
+                            rangeText.textContent = 'Range: —';
+                        }
+                    }
+                });
+            });
+        })();
+        </script>
+        <?php
+    }
+
+    private function get_publish_state() {
+        $state = get_option(self::PUBLISH_STATE_OPTION);
+        if (!is_array($state)) {
+            $state = [];
+        }
+        $defaults = [
+            'inputs' => [
+                'from' => '',
+                'to' => '',
+                'batch_limit' => 1000,
+                'delay_ms' => 200,
+                'ping_google' => 0,
+                'mark_published' => 1,
+            ],
+            'message' => '',
+            'message_type' => 'success',
+            'result' => null,
+            'samples' => [],
+            'total' => 0,
+            'validation' => [],
+        ];
+        $inputs = isset($state['inputs']) && is_array($state['inputs']) ? $state['inputs'] : [];
+        $state = array_merge($defaults, $state);
+        $state['inputs'] = array_merge($defaults['inputs'], $inputs);
+        $state['inputs']['batch_limit'] = max(1, (int)$state['inputs']['batch_limit']);
+        $state['inputs']['delay_ms'] = max(0, (int)$state['inputs']['delay_ms']);
+        $state['inputs']['from'] = is_string($state['inputs']['from']) ? $state['inputs']['from'] : '';
+        $state['inputs']['to'] = is_string($state['inputs']['to']) ? $state['inputs']['to'] : '';
+        $state['message'] = is_string($state['message']) ? $state['message'] : '';
+        $state['message_type'] = $state['message_type'] === 'error' ? 'error' : 'success';
+        $state['samples'] = is_array($state['samples']) ? $state['samples'] : [];
+        $state['total'] = isset($state['total']) ? (int)$state['total'] : 0;
+        $state['validation'] = is_array($state['validation']) ? $state['validation'] : [];
+        return $state;
+    }
+
+    private function save_publish_state(array $state) {
+        update_option(self::PUBLISH_STATE_OPTION, $state, false);
+    }
+
+    private function get_publish_history() {
+        $history = get_option(self::PUBLISH_HISTORY_OPTION);
+        if (!is_array($history)) {
+            return [];
+        }
+        return $history;
+    }
+
+    private function add_publish_history_entry(array $entry) {
+        $history = $this->get_publish_history();
+        array_unshift($history, $entry);
+        if (count($history) > 10) {
+            $history = array_slice($history, 0, 10);
+        }
+        update_option(self::PUBLISH_HISTORY_OPTION, $history, false);
+    }
+
+    private function get_publish_resume_data() {
+        $data = get_option(self::PUBLISH_RESUME_OPTION);
+        if (!is_array($data)) {
+            $data = [];
+        }
+        return $data;
+    }
+
+    private function get_publish_resume_entry($action) {
+        $data = $this->get_publish_resume_data();
+        if (isset($data[$action]) && is_array($data[$action])) {
+            return $data[$action];
+        }
+        return null;
+    }
+
+    private function set_publish_resume_entry($action, $entry) {
+        $data = $this->get_publish_resume_data();
+        if ($entry === null) {
+            unset($data[$action]);
+        } else {
+            $entry['action'] = $action;
+            $data[$action] = $entry;
+        }
+        update_option(self::PUBLISH_RESUME_OPTION, $data, false);
+    }
+
+    private function get_sitemap_meta() {
+        $meta = get_option(self::SITEMAP_META_OPTION);
+        if (!is_array($meta)) {
+            $meta = [];
+        }
+        if (!isset($meta['locks']) || !is_array($meta['locks'])) {
+            $meta['locks'] = [];
+        }
+        return $meta;
+    }
+
+    private function save_sitemap_meta(array $meta) {
+        if (!isset($meta['locks']) || !is_array($meta['locks'])) {
+            $meta['locks'] = [];
+        }
+        update_option(self::SITEMAP_META_OPTION, $meta, false);
+    }
+
+    private function get_sitemap_storage_paths() {
+        $uploads = wp_upload_dir();
+        if (empty($uploads['basedir']) || empty($uploads['baseurl'])) {
+            return null;
+        }
+        $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps/';
+        $url = trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/';
+        $legacy_dir = trailingslashit($uploads['basedir']) . 'vpp/';
+        $legacy_url = trailingslashit($uploads['baseurl']) . 'vpp/';
+        return [
+            'dir' => $dir,
+            'url' => $url,
+            'legacy_dir' => $legacy_dir,
+            'legacy_url' => $legacy_url,
+        ];
+    }
+
+    private function get_sitemap_index_urls() {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            return [];
+        }
+        $urls = [
+            'primary' => $storage['url'] . 'sitemap_index.xml',
+        ];
+        if (!empty($storage['legacy_url'])) {
+            $urls['legacy'] = $storage['legacy_url'] . 'sitemap_index.xml';
+        }
+        return $urls;
+    }
+
+    private function get_publishing_presets() {
+        $tz = new DateTimeZone('UTC');
+        $now = new DateTime('now', $tz);
+        $now->setTime((int)$now->format('H'), (int)$now->format('i'));
+        $today_start = (clone $now);
+        $today_start->setTime(0, 0);
+        $tomorrow = (clone $today_start);
+        $tomorrow->modify('+1 day');
+        $yesterday = (clone $today_start);
+        $yesterday->modify('-1 day');
+        $last24 = (clone $now);
+        $last24->modify('-24 hours');
+        $last7 = (clone $now);
+        $last7->modify('-7 days');
+        return [
+            [
+                'label' => 'Today (UTC)',
+                'from' => $today_start->format('Y-m-d H:i'),
+                'to' => $tomorrow->format('Y-m-d H:i'),
+            ],
+            [
+                'label' => 'Yesterday + Today (UTC)',
+                'from' => $yesterday->format('Y-m-d H:i'),
+                'to' => $tomorrow->format('Y-m-d H:i'),
+            ],
+            [
+                'label' => 'Last 24 h (UTC)',
+                'from' => $last24->format('Y-m-d H:i'),
+                'to' => $now->format('Y-m-d H:i'),
+            ],
+            [
+                'label' => 'Last 7 days (UTC)',
+                'from' => $last7->format('Y-m-d H:i'),
+                'to' => $now->format('Y-m-d H:i'),
+            ],
+        ];
+    }
+
+    private function format_publish_duration($seconds) {
+        if ($seconds < 0) {
+            $seconds = 0;
+        }
+        if ($seconds < 60) {
+            return sprintf('%.2fs', $seconds);
+        }
+        $minutes = floor($seconds / 60);
+        $remaining = $seconds - ($minutes * 60);
+        if ($minutes >= 60) {
+            $hours = floor($minutes / 60);
+            $minutes = $minutes % 60;
+            return sprintf('%dh %dm %.1fs', $hours, $minutes, $remaining);
+        }
+        return sprintf('%dm %.1fs', $minutes, $remaining);
+    }
+
+    private function format_bytes($bytes) {
+        $bytes = (float)$bytes;
+        if ($bytes <= 0) {
+            return '0 B';
+        }
+        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        $power = (int)floor(log($bytes, 1024));
+        $power = max(0, min($power, count($units) - 1));
+        $value = $bytes / pow(1024, $power);
+        if ($value >= 100) {
+            $formatted = number_format_i18n($value, 0);
+        } elseif ($value >= 10) {
+            $formatted = number_format_i18n($value, 1);
+        } else {
+            $formatted = number_format_i18n($value, 2);
+        }
+        return $formatted . ' ' . $units[$power];
     }
 
     public function maybe_admin_notice() {
@@ -434,6 +968,1162 @@ CSS;
         $time = current_time('mysql');
         $line = sprintf("[%s] [%s] %s\n", $time, strtoupper($context), trim((string)$message));
         @file_put_contents($path, $line, FILE_APPEND | LOCK_EX);
+    }
+
+    /* ========= PUBLISHING HELPERS ========= */
+
+    private function parse_publish_inputs(array $source, &$err = null) {
+        $from_raw = isset($source['publish_from']) ? sanitize_text_field(wp_unslash($source['publish_from'])) : '';
+        $to_raw = isset($source['publish_to']) ? sanitize_text_field(wp_unslash($source['publish_to'])) : '';
+        if ($from_raw === '' || $to_raw === '') {
+            $err = 'Enter both "From" and "To" timestamps in UTC (YYYY-MM-DD HH:MM).';
+            return null;
+        }
+        $tz = new DateTimeZone('UTC');
+        $from_dt = DateTime::createFromFormat('Y-m-d H:i', $from_raw, $tz);
+        $from_errors = DateTime::getLastErrors();
+        if (!$from_dt || ($from_errors['warning_count'] ?? 0) > 0 || ($from_errors['error_count'] ?? 0) > 0) {
+            $err = 'Invalid "From" timestamp (use YYYY-MM-DD HH:MM in UTC).';
+            return null;
+        }
+        $to_dt = DateTime::createFromFormat('Y-m-d H:i', $to_raw, $tz);
+        $to_errors = DateTime::getLastErrors();
+        if (!$to_dt || ($to_errors['warning_count'] ?? 0) > 0 || ($to_errors['error_count'] ?? 0) > 0) {
+            $err = 'Invalid "To" timestamp (use YYYY-MM-DD HH:MM in UTC).';
+            return null;
+        }
+        $from_ts = $from_dt->getTimestamp();
+        $to_ts = $to_dt->getTimestamp();
+        if ($to_ts <= $from_ts) {
+            $err = 'The "To" timestamp must be greater than "From".';
+            return null;
+        }
+        $batch_limit = isset($source['batch_limit']) ? (int)$source['batch_limit'] : 1000;
+        if ($batch_limit < 1) { $batch_limit = 1; }
+        if ($batch_limit > 50000) { $batch_limit = 50000; }
+        $delay_ms = isset($source['delay_ms']) ? (int)$source['delay_ms'] : 200;
+        if ($delay_ms < 0) { $delay_ms = 0; }
+        if ($delay_ms > 60000) { $delay_ms = 60000; }
+        $ping_google = !empty($source['ping_google']) ? 1 : 0;
+        $mark_published = !empty($source['mark_published']) ? 1 : 0;
+        return [
+            'from' => $from_dt->format('Y-m-d H:i'),
+            'to' => $to_dt->format('Y-m-d H:i'),
+            'from_sql' => $from_dt->format('Y-m-d H:i:00'),
+            'to_sql' => $to_dt->format('Y-m-d H:i:00'),
+            'from_ts' => $from_ts,
+            'to_ts' => $to_ts,
+            'batch_limit' => $batch_limit,
+            'delay_ms' => $delay_ms,
+            'ping_google' => $ping_google,
+            'mark_published' => $mark_published,
+        ];
+    }
+
+    private function count_products_in_range($mysqli, $table, $from_sql, $to_sql, &$err = null) {
+        $sql = "SELECT COUNT(*) AS cnt FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ?";
+        $stmt = $mysqli->prepare($sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            return null;
+        }
+        $stmt->bind_param('ss', $from_sql, $to_sql);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $row = $res ? $res->fetch_assoc() : null;
+        if ($res) { $res->free(); }
+        $stmt->close();
+        return isset($row['cnt']) ? (int)$row['cnt'] : 0;
+    }
+
+    private function build_publish_select_clause($mysqli, $table) {
+        $cols = array_flip($this->get_table_columns($mysqli, $table));
+        $select = ['`id`', '`slug`', '`updated_at`'];
+        $select[] = isset($cols['sku']) ? '`sku`' : "'' AS sku";
+        $select[] = isset($cols['brand']) ? '`brand`' : "'' AS brand";
+        if (isset($cols['title_h1'])) {
+            $select[] = '`title_h1`';
+        } elseif (isset($cols['name'])) {
+            $select[] = '`name` AS title_h1';
+        } else {
+            $select[] = '`slug` AS title_h1';
+        }
+        if (isset($cols['short_description'])) {
+            $select[] = '`short_description`';
+        } elseif (isset($cols['short_summary'])) {
+            $select[] = '`short_summary` AS short_description';
+        } else {
+            $select[] = "'' AS short_description";
+        }
+        $select[] = isset($cols['price']) ? '`price`' : "'' AS price";
+        $select[] = isset($cols['categories']) ? '`categories`' : "'' AS categories";
+        if (isset($cols['image'])) {
+            $select[] = '`image`';
+        } else {
+            $select[] = "'' AS image";
+        }
+        $select[] = isset($cols['images_json']) ? '`images_json`' : "'' AS images_json";
+        if (isset($cols['is_published'])) {
+            $select[] = '`is_published`';
+        }
+        return implode(', ', $select);
+    }
+
+    private function fetch_publish_batch($mysqli, $table, $select_clause, $from_sql, $to_sql, $limit, $offset, &$err = null) {
+        $sql = "SELECT {$select_clause} FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT ? OFFSET ?";
+        $stmt = $mysqli->prepare($sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            return false;
+        }
+        $limit = (int)$limit;
+        $offset = (int)$offset;
+        $stmt->bind_param('ssii', $from_sql, $to_sql, $limit, $offset);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $rows = [];
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                $rows[] = $row;
+            }
+            $res->free();
+        }
+        $stmt->close();
+        return $rows;
+    }
+
+    private function mark_products_as_published($mysqli, $table, array $ids) {
+        $ids = array_values(array_filter(array_map('intval', $ids)));
+        if (empty($ids)) {
+            return 0;
+        }
+        $updated = 0;
+        foreach (array_chunk($ids, 500) as $chunk) {
+            $id_list = implode(',', $chunk);
+            $sql = "UPDATE `{$table}` SET `is_published` = 1 WHERE `id` IN ({$id_list})";
+            $ok = @$mysqli->query($sql);
+            if ($ok && $mysqli->affected_rows > 0) {
+                $updated += $mysqli->affected_rows;
+            }
+        }
+        return $updated;
+    }
+
+    private function run_publish_preview(array $inputs, &$total, &$samples, &$err = null) {
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return false;
+        }
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            $err = 'Invalid TiDB table name.';
+            @$mysqli->close();
+            return false;
+        }
+        if (!$this->column_exists($mysqli, $table, 'updated_at')) {
+            $err = 'Table is missing updated_at column.';
+            @$mysqli->close();
+            return false;
+        }
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        if ($total === null) {
+            @$mysqli->close();
+            return false;
+        }
+        $samples = [];
+        $sql = "SELECT `slug` FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT 20";
+        $stmt = $mysqli->prepare($sql);
+        if ($stmt) {
+            $stmt->bind_param('ss', $inputs['from_sql'], $inputs['to_sql']);
+            $stmt->execute();
+            $res = $stmt->get_result();
+            if ($res) {
+                while ($row = $res->fetch_assoc()) {
+                    if (!empty($row['slug'])) {
+                        $samples[] = (string)$row['slug'];
+                    }
+                }
+                $res->free();
+            }
+            $stmt->close();
+        }
+        @$mysqli->close();
+        return true;
+    }
+
+    private function perform_publish_sitemap(array $inputs, $resume_entry = null) {
+        $start = microtime(true);
+        $err = null;
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return [
+                'message' => $err ?: 'Failed to connect to TiDB.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'sitemap',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            @$mysqli->close();
+            return [
+                'message' => 'Invalid TiDB table name.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'sitemap',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        if (!$this->column_exists($mysqli, $table, 'updated_at')) {
+            @$mysqli->close();
+            return [
+                'message' => 'Table is missing updated_at column.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'sitemap',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        $select_clause = $this->build_publish_select_clause($mysqli, $table);
+        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        if ($total_in_range === null) {
+            @$mysqli->close();
+            return [
+                'message' => $err ?: 'Failed to count products.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'sitemap',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        $limit = min($inputs['batch_limit'], $total_in_range);
+        $result = [
+            'action' => 'sitemap',
+            'processed' => 0,
+            'skipped' => max(0, $total_in_range - $limit),
+            'failed' => 0,
+            'batches' => 0,
+            'duration' => '',
+        ];
+
+        if ($limit <= 0) {
+            @$mysqli->close();
+            $this->set_publish_resume_entry('sitemap', null);
+            $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+            return [
+                'message' => 'No products matched the selected range.',
+                'message_type' => 'success',
+                'result' => $result,
+                'total' => $total_in_range,
+            ];
+        }
+
+        $resume = $resume_entry && is_array($resume_entry) ? $resume_entry : null;
+        if ($resume) {
+            $resume['notes'] = isset($resume['notes']) && is_array($resume['notes']) ? $resume['notes'] : [];
+        }
+
+        $processed_rows = $resume ? max(0, (int)($resume['processed'] ?? 0)) : 0;
+        $processed_valid = $resume ? max(0, (int)($resume['processed_valid'] ?? 0)) : 0;
+        $failed_rows = $resume ? max(0, (int)($resume['failed'] ?? 0)) : 0;
+        $next_offset = $resume ? max(0, (int)($resume['next_offset'] ?? $processed_rows)) : $processed_rows;
+        $batches_done = $resume ? max(0, (int)($resume['batches_done'] ?? 0)) : 0;
+        $notes_parts = $resume ? $resume['notes'] : [];
+
+        if ($processed_rows >= $limit) {
+            @$mysqli->close();
+            $this->set_publish_resume_entry('sitemap', null);
+            $result['processed'] = $processed_valid;
+            $result['failed'] = $failed_rows;
+            $result['batches'] = $batches_done;
+            $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+            return [
+                'message' => 'Previous sitemap run already completed.',
+                'message_type' => 'success',
+                'result' => $result,
+                'total' => $total_in_range,
+            ];
+        }
+
+        $resume_payload = [
+            'inputs' => $inputs,
+            'limit' => $limit,
+            'total' => $total_in_range,
+            'processed' => $processed_rows,
+            'processed_valid' => $processed_valid,
+            'failed' => $failed_rows,
+            'batches_done' => $batches_done,
+            'next_offset' => $next_offset,
+            'notes' => $notes_parts,
+            'timestamp' => gmdate('c'),
+        ];
+        $this->set_publish_resume_entry('sitemap', $resume_payload);
+
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $completed = true;
+        $last_error = '';
+
+        while ($processed_rows < $limit) {
+            $chunk = min(200, $limit - $processed_rows);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err);
+            if ($batch === false) {
+                $completed = false;
+                $last_error = $err ?: 'Failed to fetch batch.';
+                break;
+            }
+            if (empty($batch)) {
+                break;
+            }
+
+            $batch_count = count($batch);
+            $prepared = [];
+            $batch_failed = 0;
+            foreach ($batch as $row) {
+                $slug = sanitize_title($row['slug'] ?? '');
+                $updated = trim((string)($row['updated_at'] ?? ''));
+                if ($slug === '' || $updated === '') {
+                    $batch_failed++;
+                    continue;
+                }
+                $ts = strtotime($updated . ' UTC');
+                if ($ts === false) {
+                    $ts = strtotime($updated);
+                }
+                if ($ts === false) {
+                    $batch_failed++;
+                    continue;
+                }
+                $prepared[] = [
+                    'slug' => $slug,
+                    'lastmod' => gmdate('c', $ts),
+                ];
+            }
+
+            $should_ping = !empty($inputs['ping_google']) && ($processed_rows + $batch_count >= $limit);
+            $batch_notes = '';
+            $ok = empty($prepared) ? true : $this->update_sitemaps_with_products($prepared, $should_ping, $batch_notes, $err);
+            if (!$ok) {
+                $completed = false;
+                $last_error = $err ?: 'Failed to update sitemap files.';
+                break;
+            }
+            if ($batch_notes !== '') {
+                $notes_parts[] = $batch_notes;
+            }
+            if (!empty($inputs['mark_published']) && $has_mark_column) {
+                $this->mark_products_as_published($mysqli, $table, array_column($batch, 'id'));
+            }
+
+            $processed_rows += $batch_count;
+            $processed_valid += count($prepared);
+            $failed_rows += $batch_failed;
+            $next_offset += $batch_count;
+            $batches_done++;
+
+            $resume_payload['processed'] = $processed_rows;
+            $resume_payload['processed_valid'] = $processed_valid;
+            $resume_payload['failed'] = $failed_rows;
+            $resume_payload['batches_done'] = $batches_done;
+            $resume_payload['next_offset'] = $next_offset;
+            $resume_payload['notes'] = $notes_parts;
+            $resume_payload['timestamp'] = gmdate('c');
+            $this->set_publish_resume_entry('sitemap', $resume_payload);
+
+            if (!empty($inputs['delay_ms']) && $processed_rows < $limit) {
+                usleep((int)$inputs['delay_ms'] * 1000);
+            }
+        }
+
+        @$mysqli->close();
+
+        if (!$completed) {
+            $result['processed'] = $processed_valid;
+            $result['failed'] = $failed_rows;
+            $result['batches'] = $batches_done;
+            $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+            $this->set_publish_resume_entry('sitemap', $resume_payload);
+            return [
+                'message' => $last_error,
+                'message_type' => 'error',
+                'result' => $result,
+                'total' => $total_in_range,
+            ];
+        }
+
+        $this->set_publish_resume_entry('sitemap', null);
+        $result['processed'] = $processed_valid;
+        $result['failed'] = $failed_rows;
+        $result['batches'] = $batches_done;
+        $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+        $result['notes'] = empty($notes_parts) ? '' : implode(' | ', array_unique($notes_parts));
+        $message = sprintf('Updated sitemap for %d product(s).', $processed_valid);
+        if ($result['skipped'] > 0) {
+            $message .= sprintf(' %d product(s) not processed due to batch limit.', $result['skipped']);
+        }
+        if ($failed_rows > 0) {
+            $message .= sprintf(' %d product(s) skipped due to missing data.', $failed_rows);
+        }
+
+        return [
+            'message' => $message,
+            'message_type' => 'success',
+            'result' => $result,
+            'total' => $total_in_range,
+            'history' => [
+                'timestamp' => gmdate('Y-m-d H:i'),
+                'action' => 'Sitemap',
+                'from' => $inputs['from'],
+                'to' => $inputs['to'],
+                'processed' => $processed_valid,
+                'duration' => $result['duration'],
+                'batch_limit' => $inputs['batch_limit'],
+            ],
+        ];
+    }
+
+    private function perform_publish_algolia(array $inputs, $resume_entry = null) {
+        $start = microtime(true);
+        $err = null;
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return [
+                'message' => $err ?: 'Failed to connect to TiDB.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'algolia',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            @$mysqli->close();
+            return [
+                'message' => 'Invalid TiDB table name.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'algolia',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        if (!$this->column_exists($mysqli, $table, 'updated_at')) {
+            @$mysqli->close();
+            return [
+                'message' => 'Table is missing updated_at column.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'algolia',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        $select_clause = $this->build_publish_select_clause($mysqli, $table);
+        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        if ($total_in_range === null) {
+            @$mysqli->close();
+            return [
+                'message' => $err ?: 'Failed to count products.',
+                'message_type' => 'error',
+                'result' => [
+                    'action' => 'algolia',
+                    'processed' => 0,
+                    'skipped' => 0,
+                    'failed' => 0,
+                    'batches' => 0,
+                    'duration' => $this->format_publish_duration(microtime(true) - $start),
+                ],
+                'total' => 0,
+            ];
+        }
+
+        $limit = min($inputs['batch_limit'], $total_in_range);
+        $result = [
+            'action' => 'algolia',
+            'processed' => 0,
+            'skipped' => max(0, $total_in_range - $limit),
+            'failed' => 0,
+            'batches' => 0,
+            'duration' => '',
+        ];
+
+        if ($limit <= 0) {
+            @$mysqli->close();
+            $this->set_publish_resume_entry('algolia', null);
+            $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+            return [
+                'message' => 'No products matched the selected range.',
+                'message_type' => 'success',
+                'result' => $result,
+                'total' => $total_in_range,
+            ];
+        }
+
+        $resume = $resume_entry && is_array($resume_entry) ? $resume_entry : null;
+        $processed_rows = $resume ? max(0, (int)($resume['processed'] ?? 0)) : 0;
+        $processed_valid = $resume ? max(0, (int)($resume['processed_valid'] ?? 0)) : 0;
+        $failed_rows = $resume ? max(0, (int)($resume['failed'] ?? 0)) : 0;
+        $next_offset = $resume ? max(0, (int)($resume['next_offset'] ?? $processed_rows)) : $processed_rows;
+        $batches_done = $resume ? max(0, (int)($resume['batches_done'] ?? 0)) : 0;
+        $notes = '';
+
+        if ($processed_rows >= $limit) {
+            @$mysqli->close();
+            $this->set_publish_resume_entry('algolia', null);
+            $result['processed'] = $processed_valid;
+            $result['failed'] = $failed_rows;
+            $result['batches'] = $batches_done;
+            $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+            if ($notes !== '') {
+                $result['notes'] = $notes;
+            }
+            return [
+                'message' => 'Previous Algolia run already completed.',
+                'message_type' => 'success',
+                'result' => $result,
+                'total' => $total_in_range,
+            ];
+        }
+
+        $resume_payload = [
+            'inputs' => $inputs,
+            'limit' => $limit,
+            'total' => $total_in_range,
+            'processed' => $processed_rows,
+            'processed_valid' => $processed_valid,
+            'failed' => $failed_rows,
+            'batches_done' => $batches_done,
+            'next_offset' => $next_offset,
+            'notes' => $notes,
+            'timestamp' => gmdate('c'),
+        ];
+        $this->set_publish_resume_entry('algolia', $resume_payload);
+
+        $completed = true;
+        $last_error = '';
+
+        while ($processed_rows < $limit) {
+            $chunk = min(200, $limit - $processed_rows);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err);
+            if ($batch === false) {
+                $completed = false;
+                $last_error = $err ?: 'Failed to fetch batch.';
+                break;
+            }
+            if (empty($batch)) {
+                break;
+            }
+
+            $batch_count = count($batch);
+            $records = [];
+            $batch_failed = 0;
+            foreach ($batch as $row) {
+                $record = $this->build_algolia_publish_record($row);
+                if ($record === null) {
+                    $batch_failed++;
+                    continue;
+                }
+                $records[] = $record;
+            }
+
+            $sent = 0;
+            $buffer = [];
+            $batch_error = null;
+            foreach ($records as $record) {
+                $buffer[] = $record;
+                if (count($buffer) >= 100) {
+                    if ($this->send_algolia_batch($buffer, $batch_error)) {
+                        $sent += count($buffer);
+                        $buffer = [];
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            if ($batch_error === null && !empty($buffer)) {
+                if ($this->send_algolia_batch($buffer, $batch_error)) {
+                    $sent += count($buffer);
+                }
+            }
+
+            if ($batch_error !== null) {
+                $completed = false;
+                $last_error = $batch_error;
+                $notes = $batch_error;
+                break;
+            }
+
+            $processed_rows += $batch_count;
+            $processed_valid += $sent;
+            $failed_rows += $batch_failed;
+            $next_offset += $batch_count;
+            $batches_done++;
+
+            $resume_payload['processed'] = $processed_rows;
+            $resume_payload['processed_valid'] = $processed_valid;
+            $resume_payload['failed'] = $failed_rows;
+            $resume_payload['batches_done'] = $batches_done;
+            $resume_payload['next_offset'] = $next_offset;
+            $resume_payload['notes'] = $notes;
+            $resume_payload['timestamp'] = gmdate('c');
+            $this->set_publish_resume_entry('algolia', $resume_payload);
+
+            if (!empty($inputs['delay_ms']) && $processed_rows < $limit) {
+                usleep((int)$inputs['delay_ms'] * 1000);
+            }
+        }
+
+        @$mysqli->close();
+
+        if (!$completed) {
+            $result['processed'] = $processed_valid;
+            $result['failed'] = $failed_rows;
+            $result['batches'] = $batches_done;
+            $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+            $result['notes'] = $notes;
+            $this->set_publish_resume_entry('algolia', $resume_payload);
+            return [
+                'message' => $last_error,
+                'message_type' => 'error',
+                'result' => $result,
+                'total' => $total_in_range,
+            ];
+        }
+
+        $this->set_publish_resume_entry('algolia', null);
+        $result['processed'] = $processed_valid;
+        $result['failed'] = $failed_rows;
+        $result['batches'] = $batches_done;
+        $result['duration'] = $this->format_publish_duration(microtime(true) - $start);
+        if ($notes !== '') {
+            $result['notes'] = $notes;
+        }
+
+        $message = sprintf('Pushed %d product(s) to Algolia.', $processed_valid);
+        $skipped_due_to_limit = max(0, $total_in_range - $limit);
+        if ($skipped_due_to_limit > 0) {
+            $message .= sprintf(' %d product(s) remain due to batch limit.', $skipped_due_to_limit);
+        }
+        if ($failed_rows > 0) {
+            $message .= sprintf(' %d product(s) skipped due to missing data.', $failed_rows);
+        }
+
+        return [
+            'message' => $message,
+            'message_type' => 'success',
+            'result' => $result,
+            'total' => $total_in_range,
+            'history' => [
+                'timestamp' => gmdate('Y-m-d H:i'),
+                'action' => 'Algolia',
+                'from' => $inputs['from'],
+                'to' => $inputs['to'],
+                'processed' => $processed_valid,
+                'duration' => $result['duration'],
+                'batch_limit' => $inputs['batch_limit'],
+            ],
+        ];
+    }
+
+    private function fetch_publish_rows(array $inputs, $mark_published, &$err = null) {
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return false;
+        }
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            $err = 'Invalid TiDB table name.';
+            @$mysqli->close();
+            return false;
+        }
+        if (!$this->column_exists($mysqli, $table, 'updated_at')) {
+            $err = 'Table is missing updated_at column.';
+            @$mysqli->close();
+            return false;
+        }
+        $select_clause = $this->build_publish_select_clause($mysqli, $table);
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        if ($total === null) {
+            @$mysqli->close();
+            return false;
+        }
+        $limit = min($inputs['batch_limit'], $total);
+        $rows = [];
+        $offset = 0;
+        $batches = 0;
+        while ($limit > 0) {
+            $chunk = min(200, $limit);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $offset, $err);
+            if ($batch === false) {
+                @$mysqli->close();
+                return false;
+            }
+            if (empty($batch)) {
+                break;
+            }
+            $rows = array_merge($rows, $batch);
+            $offset += count($batch);
+            $limit -= count($batch);
+            $batches++;
+            if (count($batch) < $chunk) {
+                break;
+            }
+        }
+        if ($mark_published && !empty($rows) && $this->column_exists($mysqli, $table, 'is_published')) {
+            $this->mark_products_as_published($mysqli, $table, array_column($rows, 'id'));
+        }
+        @$mysqli->close();
+        return [
+            'total' => $total,
+            'rows' => $rows,
+            'batches' => $batches,
+        ];
+    }
+
+    private function extract_slug_from_loc($loc) {
+        if (!is_string($loc) || $loc === '') {
+            return '';
+        }
+        $path = parse_url($loc, PHP_URL_PATH);
+        if (!$path) {
+            return '';
+        }
+        $path = trim($path, '/');
+        if ($path === '') {
+            return '';
+        }
+        $parts = explode('/', $path);
+        $index = array_search('p', $parts, true);
+        if ($index !== false && isset($parts[$index + 1])) {
+            $slug = $parts[$index + 1];
+        } else {
+            $slug = end($parts);
+        }
+        return sanitize_title($slug);
+    }
+
+    private function read_sitemap_entries($path) {
+        $entries = [];
+        if (!@file_exists($path)) {
+            return $entries;
+        }
+        $xml = @simplexml_load_file($path);
+        if (!$xml) {
+            return $entries;
+        }
+        foreach ($xml->url as $url) {
+            $loc = (string)$url->loc;
+            $slug = $this->extract_slug_from_loc($loc);
+            if ($slug === '') {
+                continue;
+            }
+            $lastmod = (string)$url->lastmod;
+            if ($lastmod === '') {
+                $lastmod = gmdate('c');
+            }
+            $entries[] = [
+                'slug' => $slug,
+                'lastmod' => $lastmod,
+            ];
+        }
+        return $entries;
+    }
+
+    private function write_sitemap_file($path, array $entries) {
+        $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        foreach ($entries as $entry) {
+            $slug = sanitize_title($entry['slug'] ?? '');
+            if ($slug === '') {
+                continue;
+            }
+            $loc = home_url('/p/' . $slug . '/');
+            $lastmod = $entry['lastmod'] ?? gmdate('c');
+            $xml .= "  <url>\n";
+            $xml .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
+            $xml .= '    <lastmod>' . htmlspecialchars($lastmod, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</lastmod>' . "\n";
+            $xml .= "  </url>\n";
+        }
+        $xml .= '</urlset>';
+        if (strlen($xml) > 50 * 1024 * 1024) {
+            return false;
+        }
+        return @file_put_contents($path, $xml) !== false;
+    }
+
+    private function refresh_sitemap_index(array $storage, &$err = null) {
+        $dir = $storage['dir'];
+        $base_url = $storage['url'];
+        $files = glob($dir . '*.xml') ?: [];
+        $entries = [];
+        foreach ($files as $file) {
+            $name = basename($file);
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+                continue;
+            }
+            $entries[] = [
+                'loc' => $base_url . $name,
+                'lastmod' => gmdate('c', @filemtime($file) ?: time()),
+            ];
+        }
+        usort($entries, function ($a, $b) {
+            return strcmp($a['loc'], $b['loc']);
+        });
+        $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+        $xml .= '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+        foreach ($entries as $entry) {
+            $xml .= "  <sitemap>\n";
+            $xml .= '    <loc>' . htmlspecialchars($entry['loc'], ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
+            $xml .= '    <lastmod>' . htmlspecialchars($entry['lastmod'], ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</lastmod>' . "\n";
+            $xml .= "  </sitemap>\n";
+        }
+        $xml .= '</sitemapindex>';
+        $index_path = $dir . 'sitemap_index.xml';
+        if (@file_put_contents($index_path, $xml) === false) {
+            $err = 'Failed to write sitemap_index.xml';
+            return false;
+        }
+        @file_put_contents($dir . 'sitemap-index.xml', $xml);
+        if (!empty($storage['legacy_dir'])) {
+            if (wp_mkdir_p($storage['legacy_dir'])) {
+                @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $xml);
+                @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $xml);
+            }
+        }
+        return $base_url . 'sitemap_index.xml';
+    }
+
+    private function update_sitemaps_with_products(array $items, $ping_google, &$notes, &$err = null) {
+        if (empty($items)) {
+            $notes = 'No sitemap entries to update.';
+            return true;
+        }
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            $err = 'Uploads directory is not writable.';
+            return false;
+        }
+        $dir = $storage['dir'];
+        if (!wp_mkdir_p($dir)) {
+            $err = 'Failed to create sitemap directory.';
+            return false;
+        }
+        $base_url = $storage['url'];
+        $existing_files = glob($dir . '*.xml') ?: [];
+        $meta = $this->get_sitemap_meta();
+        $locks = isset($meta['locks']) && is_array($meta['locks']) ? $meta['locks'] : [];
+        $items_map = [];
+        foreach ($items as $item) {
+            $slug = sanitize_title($item['slug']);
+            if ($slug === '') {
+                continue;
+            }
+            $items_map[$slug] = [
+                'slug' => $slug,
+                'lastmod' => $item['lastmod'],
+            ];
+        }
+        if (empty($items_map)) {
+            $notes = 'No valid sitemap entries found.';
+            return true;
+        }
+        $files_touched = 0;
+        $filtered_files = [];
+        foreach ($existing_files as $file) {
+            $name = basename($file);
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+                continue;
+            }
+            $filtered_files[] = $file;
+        }
+        sort($filtered_files, SORT_NATURAL);
+        foreach ($filtered_files as $file) {
+            $entries = $this->read_sitemap_entries($file);
+            $changed = false;
+            foreach ($entries as &$entry) {
+                $slug = $entry['slug'];
+                if (isset($items_map[$slug])) {
+                    $entry['lastmod'] = $items_map[$slug]['lastmod'];
+                    unset($items_map[$slug]);
+                    $changed = true;
+                }
+            }
+            if ($changed) {
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    $err = 'Failed to write ' . basename($file);
+                    return false;
+                }
+                $files_touched++;
+            }
+        }
+        $remaining = array_values($items_map);
+        $date_prefix = gmdate('Ymd');
+        $max_entries = 50000;
+        if (!empty($remaining)) {
+            foreach ($filtered_files as $file) {
+                if (empty($remaining)) {
+                    break;
+                }
+                $name = basename($file);
+                if (!preg_match('/^products-' . $date_prefix . '-\\d+\\.xml$/', $name)) {
+                    continue;
+                }
+                if (preg_match('/^products-(\d+)-(\d+)\.xml$/', $name, $match)) {
+                    $prefix_lock = isset($locks[$match[1]]) ? (int)$locks[$match[1]] : null;
+                    if ($prefix_lock !== null && (int)$match[2] <= $prefix_lock) {
+                        continue;
+                    }
+                }
+                $entries = $this->read_sitemap_entries($file);
+                $count = count($entries);
+                if ($count >= $max_entries) {
+                    continue;
+                }
+                $space = $max_entries - $count;
+                if ($space <= 0) {
+                    continue;
+                }
+                $add = array_splice($remaining, 0, $space);
+                foreach ($add as $item) {
+                    $entries[] = $item;
+                }
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    $err = 'Failed to write ' . basename($file);
+                    return false;
+                }
+                $files_touched++;
+            }
+        }
+        if (!empty($remaining)) {
+            $existing_indexes = [];
+            foreach ($filtered_files as $file) {
+                $name = basename($file);
+                if (preg_match('/^products-' . $date_prefix . '-(\d+)\.xml$/', $name, $m)) {
+                    $existing_indexes[] = (int)$m[1];
+                }
+            }
+            $index = empty($existing_indexes) ? 0 : max($existing_indexes);
+            while (!empty($remaining)) {
+                $chunk = array_splice($remaining, 0, $max_entries);
+                $index++;
+                $filename = sprintf('products-%s-%d.xml', $date_prefix, $index);
+                $path = $dir . $filename;
+                if (!$this->write_sitemap_file($path, $chunk)) {
+                    $err = 'Failed to write ' . $filename;
+                    return false;
+                }
+                $files_touched++;
+                $filtered_files[] = $path;
+            }
+        }
+        $index_url = $this->refresh_sitemap_index($storage, $err);
+        if ($index_url === false) {
+            return false;
+        }
+        $notes = $files_touched ? sprintf('Updated %d sitemap file(s).', $files_touched) : 'Sitemap unchanged.';
+        if ($ping_google && $index_url) {
+            $resp = wp_remote_get('https://www.google.com/ping?sitemap=' . rawurlencode($index_url), ['timeout' => 10]);
+            if (is_wp_error($resp)) {
+                $notes .= ' Google ping failed.';
+            } else {
+                $code = wp_remote_retrieve_response_code($resp);
+                if ($code >= 200 && $code < 300) {
+                    $notes .= ' Google ping sent.';
+                } else {
+                    $notes .= ' Google ping HTTP ' . $code . '.';
+                }
+            }
+        }
+        return true;
+    }
+
+    private function normalize_publish_categories($raw) {
+        if (is_array($raw)) {
+            $out = [];
+            foreach ($raw as $item) {
+                $item = trim((string)$item);
+                if ($item !== '') {
+                    $out[] = $item;
+                }
+            }
+            return empty($out) ? null : array_values(array_unique($out));
+        }
+        if (!is_string($raw)) {
+            return null;
+        }
+        $raw = trim($raw);
+        if ($raw === '') {
+            return null;
+        }
+        if ($raw[0] === '[' || $raw[0] === '{') {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                return $this->normalize_publish_categories($decoded);
+            }
+        }
+        $parts = array_filter(array_map('trim', explode(',', $raw)));
+        return empty($parts) ? null : array_values(array_unique($parts));
+    }
+
+    private function build_algolia_publish_record(array $row) {
+        $slug = sanitize_title($row['slug'] ?? '');
+        if ($slug === '') {
+            return null;
+        }
+        $sku = trim((string)($row['sku'] ?? ''));
+        if ($sku === '') {
+            $sku = $slug;
+        }
+        $title = trim((string)($row['title_h1'] ?? ''));
+        if ($title === '') {
+            $title = $slug;
+        }
+        $record = [
+            'objectID' => $sku,
+            'sku' => $sku,
+            'slug' => $slug,
+            'brand' => (string)($row['brand'] ?? ''),
+            'title_h1' => $title,
+            'name' => $title,
+            'short_description' => (string)($row['short_description'] ?? ''),
+            'url' => home_url('/p/' . $slug . '/'),
+        ];
+        if (isset($row['price']) && $row['price'] !== '') {
+            $record['price'] = is_numeric($row['price']) ? 0 + $row['price'] : (string)$row['price'];
+        }
+        $categories = $this->normalize_publish_categories($row['categories'] ?? null);
+        if ($categories !== null) {
+            $record['categories'] = $categories;
+        }
+        $image = '';
+        if (!empty($row['image'])) {
+            $image = (string)$row['image'];
+        }
+        if (!$image && !empty($row['images_json'])) {
+            $decoded = json_decode($row['images_json'], true);
+            if (is_array($decoded)) {
+                $first = reset($decoded);
+                if (is_string($first)) {
+                    $image = $first;
+                }
+            }
+        }
+        if ($image) {
+            $record['image'] = $image;
+        }
+        if (!empty($row['updated_at'])) {
+            $ts = strtotime($row['updated_at'] . ' UTC');
+            if ($ts === false) {
+                $ts = strtotime($row['updated_at']);
+            }
+            if ($ts !== false) {
+                $record['updated_at'] = gmdate('c', $ts);
+            }
+        }
+        return $record;
+    }
+
+    private function send_algolia_batch(array $records, &$err = null) {
+        if (empty($records)) {
+            return true;
+        }
+        $settings = $this->get_settings();
+        $app = trim($settings['algolia']['app_id'] ?? '');
+        $key = trim($settings['algolia']['admin_key'] ?? '');
+        $index = trim($settings['algolia']['index'] ?? '');
+        if (!$app || !$key || !$index) {
+            $err = 'Algolia not configured.';
+            return false;
+        }
+        $endpoint = "https://{$app}-dsn.algolia.net/1/indexes/" . rawurlencode($index) . '/batch';
+        $payload = ['requests' => []];
+        foreach ($records as $record) {
+            $payload['requests'][] = [
+                'action' => 'updateObject',
+                'body' => $record,
+            ];
+        }
+        $args = [
+            'method' => 'POST',
+            'headers' => [
+                'Content-Type' => 'application/json',
+                'X-Algolia-API-Key' => $key,
+                'X-Algolia-Application-Id' => $app,
+            ],
+            'timeout' => 20,
+            'body' => wp_json_encode($payload),
+        ];
+        $resp = wp_remote_request($endpoint, $args);
+        if (is_wp_error($resp)) {
+            $err = 'Algolia request failed: ' . $resp->get_error_message();
+            return false;
+        }
+        $code = wp_remote_retrieve_response_code($resp);
+        if ($code < 200 || $code >= 300) {
+            $body = wp_remote_retrieve_body($resp);
+            $snippet = '';
+            if ($body) {
+                $snippet = function_exists('mb_substr') ? mb_substr($body, 0, 120) : substr($body, 0, 120);
+                $snippet = trim((string)$snippet);
+            }
+            $err = 'Algolia HTTP ' . $code . ($snippet !== '' ? ': ' . $snippet : '');
+            return false;
+        }
+        return true;
     }
 
     /* ========= DATA ========= */
@@ -860,6 +2550,401 @@ CSS;
 
     /* ========= HANDLERS ========= */
 
+    public function handle_publish_preview() {
+        if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
+        check_admin_referer(self::NONCE_KEY);
+        $err = null;
+        $inputs = $this->parse_publish_inputs($_POST, $err);
+        $state = $this->get_publish_state();
+        if (!$inputs) {
+            $state['message'] = $err ?: 'Invalid date range.';
+            $state['message_type'] = 'error';
+            $state['inputs']['from'] = sanitize_text_field(wp_unslash($_POST['publish_from'] ?? ''));
+            $state['inputs']['to'] = sanitize_text_field(wp_unslash($_POST['publish_to'] ?? ''));
+            if (isset($_POST['batch_limit'])) {
+                $state['inputs']['batch_limit'] = max(1, (int)$_POST['batch_limit']);
+            }
+            if (isset($_POST['delay_ms'])) {
+                $state['inputs']['delay_ms'] = max(0, (int)$_POST['delay_ms']);
+            }
+            $state['inputs']['ping_google'] = !empty($_POST['ping_google']) ? 1 : 0;
+            $state['inputs']['mark_published'] = !empty($_POST['mark_published']) ? 1 : 0;
+            $state['result'] = null;
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $start = microtime(true);
+        $total = 0;
+        $samples = [];
+        $ok = $this->run_publish_preview($inputs, $total, $samples, $err);
+        $duration = $this->format_publish_duration(microtime(true) - $start);
+        $state['inputs'] = [
+            'from' => $inputs['from'],
+            'to' => $inputs['to'],
+            'batch_limit' => $inputs['batch_limit'],
+            'delay_ms' => $inputs['delay_ms'],
+            'ping_google' => $inputs['ping_google'],
+            'mark_published' => $inputs['mark_published'],
+        ];
+        $state['total'] = $total;
+        $state['samples'] = $samples;
+        $state['result'] = [
+            'action' => 'preview',
+            'processed' => min($total, $inputs['batch_limit']),
+            'skipped' => max(0, $total - $inputs['batch_limit']),
+            'failed' => $ok ? 0 : ($total ?: 0),
+            'batches' => 0,
+            'duration' => $duration,
+        ];
+        if ($ok) {
+            $state['message'] = sprintf('Preview found %d product(s).', $total);
+            $state['message_type'] = 'success';
+        } else {
+            $state['message'] = $err ?: 'Preview failed.';
+            $state['message_type'] = 'error';
+        }
+        $this->save_publish_state($state);
+        wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+        exit;
+    }
+
+    public function handle_publish_sitemap() {
+        if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
+        check_admin_referer(self::NONCE_KEY);
+        $err = null;
+        $inputs = $this->parse_publish_inputs($_POST, $err);
+        $state = $this->get_publish_state();
+        if (!$inputs) {
+            $state['message'] = $err ?: 'Invalid date range.';
+            $state['message_type'] = 'error';
+            $state['inputs']['from'] = sanitize_text_field(wp_unslash($_POST['publish_from'] ?? ''));
+            $state['inputs']['to'] = sanitize_text_field(wp_unslash($_POST['publish_to'] ?? ''));
+            if (isset($_POST['batch_limit'])) {
+                $state['inputs']['batch_limit'] = max(1, (int)$_POST['batch_limit']);
+            }
+            if (isset($_POST['delay_ms'])) {
+                $state['inputs']['delay_ms'] = max(0, (int)$_POST['delay_ms']);
+            }
+            $state['inputs']['ping_google'] = !empty($_POST['ping_google']) ? 1 : 0;
+            $state['inputs']['mark_published'] = !empty($_POST['mark_published']) ? 1 : 0;
+            $state['result'] = null;
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $outcome = $this->perform_publish_sitemap($inputs);
+        $state['inputs'] = [
+            'from' => $inputs['from'],
+            'to' => $inputs['to'],
+            'batch_limit' => $inputs['batch_limit'],
+            'delay_ms' => $inputs['delay_ms'],
+            'ping_google' => $inputs['ping_google'],
+            'mark_published' => $inputs['mark_published'],
+        ];
+        $state['total'] = (int)($outcome['total'] ?? 0);
+        $state['result'] = $outcome['result'] ?? null;
+        $state['message'] = $outcome['message'] ?? '';
+        $state['message_type'] = $outcome['message_type'] ?? 'success';
+        if (!empty($outcome['history']) && is_array($outcome['history'])) {
+            $this->add_publish_history_entry($outcome['history']);
+        }
+        $this->save_publish_state($state);
+        wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+        exit;
+    }
+
+    public function handle_publish_algolia() {
+        if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
+        check_admin_referer(self::NONCE_KEY);
+        $err = null;
+        $inputs = $this->parse_publish_inputs($_POST, $err);
+        $state = $this->get_publish_state();
+        if (!$inputs) {
+            $state['message'] = $err ?: 'Invalid date range.';
+            $state['message_type'] = 'error';
+            $state['inputs']['from'] = sanitize_text_field(wp_unslash($_POST['publish_from'] ?? ''));
+            $state['inputs']['to'] = sanitize_text_field(wp_unslash($_POST['publish_to'] ?? ''));
+            if (isset($_POST['batch_limit'])) {
+                $state['inputs']['batch_limit'] = max(1, (int)$_POST['batch_limit']);
+            }
+            if (isset($_POST['delay_ms'])) {
+                $state['inputs']['delay_ms'] = max(0, (int)$_POST['delay_ms']);
+            }
+            $state['inputs']['ping_google'] = !empty($_POST['ping_google']) ? 1 : 0;
+            $state['inputs']['mark_published'] = !empty($_POST['mark_published']) ? 1 : 0;
+            $state['result'] = null;
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $outcome = $this->perform_publish_algolia($inputs);
+        $state['inputs'] = [
+            'from' => $inputs['from'],
+            'to' => $inputs['to'],
+            'batch_limit' => $inputs['batch_limit'],
+            'delay_ms' => $inputs['delay_ms'],
+            'ping_google' => $inputs['ping_google'],
+            'mark_published' => $inputs['mark_published'],
+        ];
+        $state['total'] = (int)($outcome['total'] ?? 0);
+        $state['result'] = $outcome['result'] ?? null;
+        $state['message'] = $outcome['message'] ?? '';
+        $state['message_type'] = $outcome['message_type'] ?? 'success';
+        if (!empty($outcome['history']) && is_array($outcome['history'])) {
+            $this->add_publish_history_entry($outcome['history']);
+        }
+        $this->save_publish_state($state);
+        wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+        exit;
+    }
+
+    public function handle_publish_resume() {
+        if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
+        check_admin_referer(self::NONCE_KEY);
+        $target = isset($_POST['target']) ? sanitize_key($_POST['target']) : '';
+        $mode = isset($_POST['mode']) ? sanitize_key($_POST['mode']) : '';
+        $state = $this->get_publish_state();
+        $valid_targets = ['sitemap', 'algolia'];
+
+        if (!in_array($target, $valid_targets, true)) {
+            $state['message'] = 'Unknown resume target.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        if ($mode === 'clear') {
+            $this->set_publish_resume_entry($target, null);
+            $state['message'] = ucfirst($target) . ' resume checkpoint cleared.';
+            $state['message_type'] = 'success';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        if ($mode !== 'resume') {
+            $state['message'] = 'Invalid resume action.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        $entry = $this->get_publish_resume_entry($target);
+        $inputs = isset($entry['inputs']) && is_array($entry['inputs']) ? $entry['inputs'] : null;
+        if (!$entry || !$inputs) {
+            $state['message'] = 'No resume checkpoint available.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        $outcome = $target === 'sitemap'
+            ? $this->perform_publish_sitemap($inputs, $entry)
+            : $this->perform_publish_algolia($inputs, $entry);
+
+        $state['inputs'] = [
+            'from' => $inputs['from'] ?? '',
+            'to' => $inputs['to'] ?? '',
+            'batch_limit' => isset($inputs['batch_limit']) ? (int)$inputs['batch_limit'] : ($state['inputs']['batch_limit'] ?? 1000),
+            'delay_ms' => isset($inputs['delay_ms']) ? (int)$inputs['delay_ms'] : ($state['inputs']['delay_ms'] ?? 200),
+            'ping_google' => !empty($inputs['ping_google']) ? 1 : 0,
+            'mark_published' => !empty($inputs['mark_published']) ? 1 : 0,
+        ];
+        $state['total'] = (int)($outcome['total'] ?? 0);
+        $state['result'] = $outcome['result'] ?? null;
+        $state['message'] = $outcome['message'] ?? '';
+        $state['message_type'] = $outcome['message_type'] ?? 'success';
+        if (!empty($outcome['history']) && is_array($outcome['history'])) {
+            $this->add_publish_history_entry($outcome['history']);
+        }
+        $this->save_publish_state($state);
+        wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+        exit;
+    }
+
+    public function handle_publish_rotate_now() {
+        if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
+        check_admin_referer(self::NONCE_KEY);
+        $state = $this->get_publish_state();
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            $state['message'] = 'Uploads directory is not writable.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $dir = $storage['dir'];
+        if (!wp_mkdir_p($dir)) {
+            $state['message'] = 'Failed to create sitemap directory.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $prefix = gmdate('Ymd');
+        $existing = glob($dir . 'products-' . $prefix . '-*.xml') ?: [];
+        $indexes = [];
+        foreach ($existing as $file) {
+            if (preg_match('/^products-' . $prefix . '-(\d+)\.xml$/', basename($file), $m)) {
+                $indexes[] = (int)$m[1];
+            }
+        }
+        $next_index = empty($indexes) ? 1 : max($indexes) + 1;
+        $filename = sprintf('products-%s-%d.xml', $prefix, $next_index);
+        $path = $dir . $filename;
+        if (!$this->write_sitemap_file($path, [])) {
+            $state['message'] = 'Failed to start new sitemap file.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        $meta = $this->get_sitemap_meta();
+        $meta['locks'][$prefix] = $next_index - 1;
+        $this->save_sitemap_meta($meta);
+
+        $refresh_err = null;
+        $this->refresh_sitemap_index($storage, $refresh_err);
+        if ($refresh_err) {
+            $state['message'] = $refresh_err;
+            $state['message_type'] = 'error';
+        } else {
+            $state['message'] = sprintf('Rotation complete. Next sitemap file: %s', $filename);
+            $state['message_type'] = 'success';
+        }
+        $this->save_publish_state($state);
+        wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+        exit;
+    }
+
+    public function handle_publish_rebuild_index() {
+        if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
+        check_admin_referer(self::NONCE_KEY);
+        $state = $this->get_publish_state();
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            $state['message'] = 'Uploads directory is not writable.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $dir = $storage['dir'];
+        if (!wp_mkdir_p($dir)) {
+            $state['message'] = 'Failed to create sitemap directory.';
+            $state['message_type'] = 'error';
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $files = glob($dir . 'products-*.xml') ?: [];
+        $err = null;
+        $this->refresh_sitemap_index($storage, $err);
+        if ($err) {
+            $state['message'] = $err;
+            $state['message_type'] = 'error';
+        } else {
+            $state['message'] = sprintf('Rebuilt sitemap_index.xml with %d file(s).', count($files));
+            $state['message_type'] = 'success';
+        }
+        $this->save_publish_state($state);
+        wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+        exit;
+    }
+
+    public function handle_publish_validate() {
+        if (!current_user_can('manage_options')) { wp_die('Forbidden'); }
+        check_admin_referer(self::NONCE_KEY);
+        $state = $this->get_publish_state();
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            $state['message'] = 'Uploads directory is not writable.';
+            $state['message_type'] = 'error';
+            $state['validation'] = [];
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+        $dir = $storage['dir'];
+        if (!wp_mkdir_p($dir)) {
+            $state['message'] = 'Failed to create sitemap directory.';
+            $state['message_type'] = 'error';
+            $state['validation'] = [];
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        $files = glob($dir . 'products-*.xml') ?: [];
+        $rows = [];
+        $total_urls = 0;
+        foreach ($files as $file) {
+            $name = basename($file);
+            $size = @filesize($file) ?: 0;
+            $mtime = @filemtime($file) ?: time();
+            $entries = $this->read_sitemap_entries($file);
+            $url_count = count($entries);
+            $total_urls += $url_count;
+            $status = 'ok';
+            $notes = [];
+            if ($url_count > 50000) {
+                $status = 'error';
+                $notes[] = 'URL count exceeds 50k limit.';
+            } elseif ($url_count >= 45000) {
+                $status = 'warn';
+                $notes[] = 'URL count nearing 50k limit.';
+            }
+            if ($size > 50 * 1024 * 1024) {
+                $status = 'error';
+                $notes[] = 'File size exceeds 50 MB.';
+            } elseif ($size >= 45 * 1024 * 1024 && $status !== 'error') {
+                $status = 'warn';
+                $notes[] = 'File size nearing 50 MB.';
+            }
+            if ($url_count === 0) {
+                $xml = @simplexml_load_file($file);
+                if ($xml === false) {
+                    $status = 'error';
+                    $notes[] = 'Unable to parse XML.';
+                }
+            }
+            $icon = '✅';
+            if ($status === 'warn') {
+                $icon = '⚠️';
+            } elseif ($status === 'error') {
+                $icon = '❌';
+            }
+            $rows[] = [
+                'file' => $name,
+                'urls' => $url_count,
+                'size_bytes' => $size,
+                'size_human' => $this->format_bytes($size),
+                'last_modified' => gmdate('Y-m-d H:i', $mtime),
+                'status' => $status,
+                'icon' => $icon,
+                'note' => implode(' ', $notes),
+            ];
+        }
+
+        if (empty($rows)) {
+            $state['message'] = 'No sitemap files found to validate.';
+            $state['message_type'] = 'warning';
+        } else {
+            $state['message'] = sprintf('Validated %d sitemap file(s) totaling %d URL(s).', count($rows), $total_urls);
+            $state['message_type'] = 'success';
+        }
+        $state['validation'] = $rows;
+        $this->save_publish_state($state);
+        wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+        exit;
+    }
+
     public function handle_save_settings() {
         if (!current_user_can('manage_options')) wp_die('Forbidden');
         check_admin_referer(self::NONCE_KEY);
@@ -1071,14 +3156,14 @@ CSS;
         $chunk_lastmod = 0;
         $files = [];
 
-        $uploads = wp_upload_dir();
-        if (empty($uploads['basedir']) || empty($uploads['baseurl'])) {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
             @$mysqli->close(); $err = 'Uploads directory is not writable.'; return false;
         }
-        $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps';
+        $dir = $storage['dir'];
         if (!wp_mkdir_p($dir)) { @$mysqli->close(); $err = 'Failed to create sitemap directory.'; return false; }
         $dir = trailingslashit($dir);
-        $base_url = trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/';
+        $base_url = $storage['url'];
 
         foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
         @unlink($dir . 'sitemap-index.xml');
@@ -1145,6 +3230,11 @@ CSS;
         }
         $index_xml .= '</sitemapindex>';
         if (@file_put_contents($index_path, $index_xml) === false) { $err = 'Failed to write sitemap-index.xml'; return false; }
+        @file_put_contents($dir . 'sitemap_index.xml', $index_xml);
+        if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
+            @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $index_xml);
+            @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $index_xml);
+        }
 
         $summary = sprintf('Generated %d sitemap file(s) covering %d product(s).', count($files), $total);
         return true;
