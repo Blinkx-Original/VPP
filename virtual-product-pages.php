@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.4.5
+ * Version: 1.4.6
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,7 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.4.5';
+    const VERSION = '1.4.6';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -312,7 +312,7 @@ CSS;
                     <tr><th scope="row">TiDB Database</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][database]" value="<?php echo esc_attr($s['tidb']['database']); ?>" class="regular-text"></td></tr>
                     <tr><th scope="row">TiDB User</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][user]" value="<?php echo esc_attr($s['tidb']['user']); ?>" class="regular-text"></td></tr>
                     <tr><th scope="row">TiDB Password</th><td><input type="password" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][pass]" value="<?php echo esc_attr($s['tidb']['pass']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">TiDB Table</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][table]" value="<?php echo esc_attr($s['tidb']['table']); ?>" class="regular-text"><p class="description">Expected columns: id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, meta_description, cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url, is_published, last_tidb_update_at</p></td></tr>
+                    <tr><th scope="row">TiDB Table</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][table]" value="<?php echo esc_attr($s['tidb']['table']); ?>" class="regular-text"><p class="description">Expected columns: id, slug, title_h1, brand, model, sku, images_json, schema_json, desc_html, short_summary, meta_description, cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url, is_published, last_tidb_update_at</p></td></tr>
                     <tr><th scope="row">SSL CA Path</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][ssl_ca]" value="<?php echo esc_attr($s['tidb']['ssl_ca']); ?>" class="regular-text"></td></tr>
                 </tbody></table>
 
@@ -1064,6 +1064,7 @@ CSS;
             $select[] = "'' AS image";
         }
         $select[] = isset($cols['images_json']) ? '`images_json`' : "'' AS images_json";
+        $select[] = isset($cols['schema_json']) ? '`schema_json`' : "'' AS schema_json";
         if (isset($cols['is_published'])) {
             $select[] = '`is_published`';
         }
@@ -2178,6 +2179,50 @@ CSS;
         return in_array($col, $cols, true);
     }
 
+    private function table_exists($mysqli, $table) {
+        $table_clean = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
+        if ($table_clean === '') {
+            return false;
+        }
+        $pattern = str_replace(['_', '%'], ['\\_', '\\%'], $table_clean);
+        $like = $mysqli->real_escape_string($pattern);
+        $sql = "SHOW TABLES LIKE '{$like}'";
+        $res = @$mysqli->query($sql);
+        if (!$res) {
+            return false;
+        }
+        $exists = $res->num_rows > 0;
+        $res->free();
+        return $exists;
+    }
+
+    private function maybe_add_schema_column($mysqli, $table_clean) {
+        if ($this->column_exists($mysqli, $table_clean, 'schema_json')) {
+            return;
+        }
+        $table_esc = $mysqli->real_escape_string($table_clean);
+        $sql = sprintf('ALTER TABLE `%s` ADD COLUMN `schema_json` TEXT NULL AFTER `images_json`', $table_esc);
+        if (@$mysqli->query($sql)) {
+            $this->clear_table_columns_cache($table_clean);
+        } else {
+            $this->log_error('db_schema', sprintf('Failed adding schema_json to %s: %s', $table_clean, $mysqli->error));
+        }
+    }
+
+    private function ensure_schema_json_column($mysqli, $table) {
+        $table_clean = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
+        if ($table_clean === '') {
+            return;
+        }
+
+        $this->maybe_add_schema_column($mysqli, $table_clean);
+
+        $import_table = 'import_buffer';
+        if ($this->table_exists($mysqli, $import_table)) {
+            $this->maybe_add_schema_column($mysqli, $import_table);
+        }
+    }
+
     private function ensure_cta_label_columns($mysqli, $table) {
         $table_clean = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
         if ($table_clean === '') {
@@ -2242,6 +2287,10 @@ CSS;
         return $this->column_exists($mysqli, $table, 'meta_description');
     }
 
+    private function select_has_schema_column($mysqli, $table) {
+        return $this->column_exists($mysqli, $table, 'schema_json');
+    }
+
     private function fetch_product_by_slug($slug, &$err = null) {
         $s = $this->get_settings();
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
@@ -2249,8 +2298,10 @@ CSS;
         if (!$mysqli) return null;
         $has_meta = $this->select_has_meta_column($mysqli, $table);
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
+        $has_schema = $this->select_has_schema_column($mysqli, $table);
+        $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -2271,8 +2322,10 @@ CSS;
         if (!$mysqli) return null;
         $has_meta = $this->select_has_meta_column($mysqli, $table);
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
+        $has_schema = $this->select_has_schema_column($mysqli, $table);
+        $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -2386,6 +2439,28 @@ CSS;
                         wp_editor($content, $editor_id, $settings);
                     ?>
 
+                    <?php $schema_json_val = (string)($row['schema_json'] ?? ''); ?>
+                    <table class="form-table"><tbody>
+                        <tr>
+                          <th scope="row"><label for="schema_json">Schema JSON (Product)</label></th>
+                          <td>
+                            <textarea id="schema_json" name="schema_json" rows="10" class="large-text code"
+                              placeholder='{"@context":"https://schema.org","@type":"Product","name":"..."}'><?php
+                                echo esc_textarea($schema_json_val);
+                            ?></textarea>
+                            <p class="description">
+                              Paste a valid JSON-LD <code>Product</code>. It will be injected as
+                              <code>&lt;script type="application/ld+json"&gt;</code> on the product page.
+                            </p>
+
+                            <label>
+                              <input type="checkbox" name="schema_json_clear" value="1">
+                              Clear schema on save (set NULL)
+                            </label>
+                          </td>
+                        </tr>
+                    </tbody></table>
+
                     <p class="submit" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
                         <?php submit_button('Save to TiDB', 'primary', 'do_save', false); ?>
                         <?php submit_button('Save & View', 'secondary', 'do_save_view', false); ?>
@@ -2441,6 +2516,9 @@ CSS;
         $cta_paypal_url = esc_url_raw($_POST['cta_paypal_url'] ?? '');
         $desc_html = wp_kses_post($_POST['desc_html'] ?? '');
         $is_published = !empty($_POST['is_published']) ? 1 : 0;
+        $schema_json_raw = isset($_POST['schema_json']) ? wp_unslash($_POST['schema_json']) : '';
+        $schema_json_raw = trim($schema_json_raw);
+        $clear_schema = !empty($_POST['schema_json_clear']);
 
         $err = null;
         $s = $this->get_settings();
@@ -2451,8 +2529,41 @@ CSS;
             wp_safe_redirect($redirect); exit;
         }
 
+        $this->ensure_schema_json_column($mysqli, $table);
         $this->ensure_cta_label_columns($mysqli, $table);
         $existing_cols = array_flip($this->get_table_columns($mysqli, $table));
+
+        $current_schema = null;
+        if (isset($existing_cols['schema_json'])) {
+            $schema_stmt = $mysqli->prepare("SELECT `schema_json` FROM `{$table}` WHERE id = ? LIMIT 1");
+            if ($schema_stmt) {
+                $schema_stmt->bind_param('i', $id);
+                if ($schema_stmt->execute()) {
+                    $schema_res = $schema_stmt->get_result();
+                    if ($schema_res) {
+                        $schema_row = $schema_res->fetch_assoc();
+                        if ($schema_row && array_key_exists('schema_json', $schema_row)) {
+                            $current_schema = $schema_row['schema_json'];
+                        }
+                        $schema_res->free();
+                    }
+                }
+                $schema_stmt->close();
+            }
+        }
+
+        if ($clear_schema) {
+            $schema_json = null;
+        } elseif ($schema_json_raw === '') {
+            $schema_json = $current_schema;
+        } else {
+            $decoded = json_decode($schema_json_raw, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $schema_json = wp_json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            } else {
+                $schema_json = $current_schema;
+            }
+        }
 
         $cols = [
             'title_h1' => $title_h1,
@@ -2462,6 +2573,7 @@ CSS;
             'short_summary' => $short_summary,
             'meta_description' => $meta_description,
             'images_json' => $images_json,
+            'schema_json' => $schema_json,
             'cta_lead_label' => $cta_lead_label,
             'cta_lead_url' => $cta_lead_url,
             'cta_stripe_label' => $cta_stripe_label,
@@ -3531,6 +3643,17 @@ CSS;
                 else { echo '<p>No description available yet.</p>'; }
               ?>
             </section>
+            <?php
+                if (!empty($p['schema_json'])) {
+                    $schema_decoded = json_decode($p['schema_json'], true);
+                    if (is_array($schema_decoded)) {
+                        echo "\n<!-- Product Schema.org JSON-LD -->\n";
+                        echo '<script type="application/ld+json">' .
+                             wp_json_encode($schema_decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) .
+                             '</script>' . "\n";
+                    }
+                }
+            ?>
           </article>
         </main>
         <?php
