@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.4.6
+ * Version: 1.4.7
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,9 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.4.6';
+    const SITEMAP_QUERY_VAR = 'vpp_sitemap';
+    const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
+    const VERSION = '1.4.7';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -166,12 +168,14 @@ CSS;
     private function __construct() {
         add_action('init', [$this, 'register_rewrite']);
         add_filter('query_vars', [$this, 'add_query_var']);
+        add_action('template_redirect', [$this, 'maybe_output_sitemap'], 0);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
         register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
         register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
 
         add_action('wp_head', [$this, 'inject_inline_css_head'], 0);
         add_action('wp_head', [$this, 'output_meta_tags'], 1);
+        add_filter('robots_txt', [$this, 'filter_robots_txt'], 10, 2);
 
         if (is_admin()) {
             add_action('admin_menu', [$this, 'admin_menu']);
@@ -218,11 +222,33 @@ CSS;
     public static function on_activate() { self::instance()->register_rewrite(); flush_rewrite_rules(); }
     public static function on_deactivate() { flush_rewrite_rules(); }
 
-    public function add_query_var($vars) { $vars[] = self::QUERY_VAR; return $vars; }
+    public function add_query_var($vars) {
+        $vars[] = self::QUERY_VAR;
+        $vars[] = self::SITEMAP_QUERY_VAR;
+        $vars[] = self::SITEMAP_FILE_QUERY_VAR;
+        return $vars;
+    }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
+        add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
+        add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
+    }
+
+    public function filter_robots_txt($output, $public) {
+        $sitemap = home_url('/sitemap_index.xml');
+        if (stripos($output, $sitemap) !== false) {
+            return $output;
+        }
+        $line = 'Sitemap: ' . esc_url_raw($sitemap);
+        if ($output !== '') {
+            $output = rtrim($output) . "\n";
+        }
+        return $output . $line . "\n";
     }
 
     public function enqueue_assets() {
@@ -795,12 +821,15 @@ CSS;
             return null;
         }
         $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps/';
-        $url = trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/';
+        $public_base = trailingslashit(home_url('/sitemaps'));
+        $public_index = home_url('/sitemap_index.xml');
         $legacy_dir = trailingslashit($uploads['basedir']) . 'vpp/';
         $legacy_url = trailingslashit($uploads['baseurl']) . 'vpp/';
         return [
             'dir' => $dir,
-            'url' => $url,
+            'url' => $public_base,
+            'index_url' => $public_index,
+            'upload_url' => trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/',
             'legacy_dir' => $legacy_dir,
             'legacy_url' => $legacy_url,
         ];
@@ -812,7 +841,7 @@ CSS;
             return [];
         }
         $urls = [
-            'primary' => $storage['url'] . 'sitemap_index.xml',
+            'primary' => $storage['index_url'],
         ];
         if (!empty($storage['legacy_url'])) {
             $urls['legacy'] = $storage['legacy_url'] . 'sitemap_index.xml';
@@ -1845,7 +1874,7 @@ CSS;
                 @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $xml);
             }
         }
-        return $base_url . 'sitemap_index.xml';
+        return $storage['index_url'];
     }
 
     private function update_sitemaps_with_products(array $items, $ping_google, &$notes, &$err = null) {
@@ -1863,7 +1892,6 @@ CSS;
             $err = 'Failed to create sitemap directory.';
             return false;
         }
-        $base_url = $storage['url'];
         $existing_files = glob($dir . '*.xml') ?: [];
         $meta = $this->get_sitemap_meta();
         $locks = isset($meta['locks']) && is_array($meta['locks']) ? $meta['locks'] : [];
@@ -3490,6 +3518,57 @@ CSS;
     }
 
     /* ========= FRONT RENDER ========= */
+
+    public function maybe_output_sitemap() {
+        $mode = get_query_var(self::SITEMAP_QUERY_VAR);
+        if (!$mode) {
+            return;
+        }
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            status_header(404);
+            exit;
+        }
+        $path = '';
+        if ($mode === 'index') {
+            $candidates = [
+                $storage['dir'] . 'sitemap_index.xml',
+                $storage['dir'] . 'sitemap-index.xml',
+            ];
+            foreach ($candidates as $candidate) {
+                if (@is_readable($candidate)) {
+                    $path = $candidate;
+                    break;
+                }
+            }
+        } elseif ($mode === 'file') {
+            $requested = get_query_var(self::SITEMAP_FILE_QUERY_VAR);
+            if (!is_string($requested) || $requested === '') {
+                status_header(404);
+                exit;
+            }
+            if (!preg_match('/^[a-z0-9\-]+\.xml$/i', $requested)) {
+                status_header(404);
+                exit;
+            }
+            $path = $storage['dir'] . $requested;
+            if (!@is_readable($path)) {
+                status_header(404);
+                exit;
+            }
+        } else {
+            return;
+        }
+        if ($path === '') {
+            status_header(404);
+            exit;
+        }
+        header('Content-Type: application/xml; charset=UTF-8');
+        header('X-Robots-Tag: noindex, follow', true);
+        header('Cache-Control: public, max-age=300');
+        readfile($path);
+        exit;
+    }
 
     public function maybe_render_vpp() {
         $slug = $this->current_vpp_slug();
