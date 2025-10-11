@@ -177,6 +177,10 @@ CSS;
         add_action('wp_head', [$this, 'output_meta_tags'], 1);
         add_filter('robots_txt', [$this, 'filter_robots_txt'], 10, 2);
 
+        if ($this->uses_wpseo_sitemaps()) {
+            add_filter('wpseo_sitemap_index', [$this, 'filter_wpseo_sitemap_index']);
+        }
+
         if (is_admin()) {
             add_action('admin_menu', [$this, 'admin_menu']);
             add_action('admin_init', [$this, 'register_settings']);
@@ -232,16 +236,30 @@ CSS;
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
-        add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
-        add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
+        if (!$this->uses_wpseo_sitemaps()) {
+            add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
+            add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
+        }
         add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
         add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
     }
 
+    private function uses_wpseo_sitemaps() {
+        static $cache = null;
+        if ($cache === null) {
+            $cache = defined('WPSEO_VERSION') || class_exists('WPSEO_Sitemaps_Router');
+        }
+        return $cache;
+    }
+
     public function filter_robots_txt($output, $public) {
-        $sitemap = home_url('/sitemap_index.xml');
-        if (stripos($output, $sitemap) !== false) {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage || empty($storage['index_url'])) {
+            return $output;
+        }
+        $sitemap = $storage['index_url'];
+        if ($sitemap && stripos($output, $sitemap) !== false) {
             return $output;
         }
         $line = 'Sitemap: ' . esc_url_raw($sitemap);
@@ -249,6 +267,31 @@ CSS;
             $output = rtrim($output) . "\n";
         }
         return $output . $line . "\n";
+    }
+
+    public function filter_wpseo_sitemap_index($content) {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage || empty($storage['index_url'])) {
+            return $content;
+        }
+        $loc = $storage['index_url'];
+        if (!$loc || strpos($content, $loc) !== false) {
+            return $content;
+        }
+        $path = $storage['dir'] . 'sitemap_index.xml';
+        if (!@is_readable($path)) {
+            $err = null;
+            $this->refresh_sitemap_index($storage, $err);
+        }
+        $lastmod_ts = @filemtime($path) ?: time();
+        $entry  = "  <sitemap>\n";
+        $entry .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
+        $entry .= '    <lastmod>' . htmlspecialchars(gmdate('c', $lastmod_ts), ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</lastmod>' . "\n";
+        $entry .= "  </sitemap>\n";
+        if (strpos($content, '</sitemapindex>') !== false) {
+            return str_replace('</sitemapindex>', $entry . '</sitemapindex>', $content);
+        }
+        return $content . $entry;
     }
 
     public function enqueue_assets() {
@@ -558,6 +601,14 @@ CSS;
                             <code><?php echo esc_html($sitemap_urls['primary']); ?></code>
                         </a>
                     </p>
+                    <?php if (!empty($sitemap_urls['yoast'])): ?>
+                        <p class="description" style="margin-top:4px;">
+                            Listed in Yoast index:
+                            <a href="<?php echo esc_url($sitemap_urls['yoast']); ?>" target="_blank" rel="noopener noreferrer">
+                                <code><?php echo esc_html($sitemap_urls['yoast']); ?></code>
+                            </a>
+                        </p>
+                    <?php endif; ?>
                     <?php if (!empty($sitemap_urls['legacy']) && $sitemap_urls['legacy'] !== $sitemap_urls['primary']): ?>
                         <p class="description" style="margin-top:4px;">
                             Legacy alias:
@@ -822,13 +873,19 @@ CSS;
         }
         $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps/';
         $public_base = trailingslashit(home_url('/sitemaps'));
-        $public_index = home_url('/sitemap_index.xml');
+        $yoast_active = $this->uses_wpseo_sitemaps();
+        $root_index = home_url('/sitemap_index.xml');
+        $alias_index = home_url('/sitemaps/vpp-index.xml');
+        $public_index = $yoast_active ? $alias_index : $root_index;
         $legacy_dir = trailingslashit($uploads['basedir']) . 'vpp/';
         $legacy_url = trailingslashit($uploads['baseurl']) . 'vpp/';
         return [
             'dir' => $dir,
             'url' => $public_base,
             'index_url' => $public_index,
+            'alias_index_url' => $alias_index,
+            'yoast_index_url' => $yoast_active ? $root_index : null,
+            'root_index_url' => $root_index,
             'upload_url' => trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/',
             'legacy_dir' => $legacy_dir,
             'legacy_url' => $legacy_url,
@@ -843,6 +900,9 @@ CSS;
         $urls = [
             'primary' => $storage['index_url'],
         ];
+        if (!empty($storage['yoast_index_url']) && $storage['yoast_index_url'] !== $storage['index_url']) {
+            $urls['yoast'] = $storage['yoast_index_url'];
+        }
         if (!empty($storage['legacy_url'])) {
             $urls['legacy'] = $storage['legacy_url'] . 'sitemap_index.xml';
         }
@@ -1842,7 +1902,7 @@ CSS;
         $entries = [];
         foreach ($files as $file) {
             $name = basename($file);
-            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml' || $name === 'vpp-index.xml') {
                 continue;
             }
             $entries[] = [
@@ -1868,10 +1928,12 @@ CSS;
             return false;
         }
         @file_put_contents($dir . 'sitemap-index.xml', $xml);
+        @file_put_contents($dir . 'vpp-index.xml', $xml);
         if (!empty($storage['legacy_dir'])) {
             if (wp_mkdir_p($storage['legacy_dir'])) {
                 @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $xml);
                 @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $xml);
+                @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $xml);
             }
         }
         return $storage['index_url'];
@@ -1914,7 +1976,7 @@ CSS;
         $filtered_files = [];
         foreach ($existing_files as $file) {
             $name = basename($file);
-            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml' || $name === 'vpp-index.xml') {
                 continue;
             }
             $filtered_files[] = $file;
@@ -3307,6 +3369,7 @@ CSS;
 
         foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
         @unlink($dir . 'sitemap-index.xml');
+        @unlink($dir . 'vpp-index.xml');
 
         $write_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err) {
             if (empty($entries)) { return true; }
@@ -3371,9 +3434,11 @@ CSS;
         $index_xml .= '</sitemapindex>';
         if (@file_put_contents($index_path, $index_xml) === false) { $err = 'Failed to write sitemap-index.xml'; return false; }
         @file_put_contents($dir . 'sitemap_index.xml', $index_xml);
+        @file_put_contents($dir . 'vpp-index.xml', $index_xml);
         if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
             @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $index_xml);
             @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $index_xml);
+            @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $index_xml);
         }
 
         $summary = sprintf('Generated %d sitemap file(s) covering %d product(s).', count($files), $total);
