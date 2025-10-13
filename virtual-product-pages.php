@@ -1109,8 +1109,12 @@ CSS;
         ];
     }
 
-    private function count_products_in_range($mysqli, $table, $from_sql, $to_sql, &$err = null) {
-        $sql = "SELECT COUNT(*) AS cnt FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ?";
+    private function count_products_in_range($mysqli, $table, $from_sql, $to_sql, &$err = null, $only_unpublished = false, $has_mark_column = false) {
+        $where = '`updated_at` >= ? AND `updated_at` < ?';
+        if ($only_unpublished && $has_mark_column) {
+            $where .= ' AND (`is_published` = 0 OR `is_published` IS NULL)';
+        }
+        $sql = "SELECT COUNT(*) AS cnt FROM `{$table}` WHERE {$where}";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) {
             $err = 'DB prepare failed: ' . $mysqli->error;
@@ -1160,8 +1164,12 @@ CSS;
         return implode(', ', $select);
     }
 
-    private function fetch_publish_batch($mysqli, $table, $select_clause, $from_sql, $to_sql, $limit, $offset, &$err = null) {
-        $sql = "SELECT {$select_clause} FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT ? OFFSET ?";
+    private function fetch_publish_batch($mysqli, $table, $select_clause, $from_sql, $to_sql, $limit, $offset, &$err = null, $only_unpublished = false, $has_mark_column = false) {
+        $where = '`updated_at` >= ? AND `updated_at` < ?';
+        if ($only_unpublished && $has_mark_column) {
+            $where .= ' AND (`is_published` = 0 OR `is_published` IS NULL)';
+        }
+        $sql = "SELECT {$select_clause} FROM `{$table}` WHERE {$where} ORDER BY `updated_at` ASC, `id` ASC LIMIT ? OFFSET ?";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) {
             $err = 'DB prepare failed: ' . $mysqli->error;
@@ -1218,13 +1226,19 @@ CSS;
             @$mysqli->close();
             return false;
         }
-        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = !empty($inputs['mark_published']) && $has_mark_column;
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total === null) {
             @$mysqli->close();
             return false;
         }
         $samples = [];
-        $sql = "SELECT `slug` FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT 20";
+        $where = '`updated_at` >= ? AND `updated_at` < ?';
+        if ($only_unpublished && $has_mark_column) {
+            $where .= ' AND (`is_published` = 0 OR `is_published` IS NULL)';
+        }
+        $sql = "SELECT `slug` FROM `{$table}` WHERE {$where} ORDER BY `updated_at` ASC, `id` ASC LIMIT 20";
         $stmt = $mysqli->prepare($sql);
         if ($stmt) {
             $stmt->bind_param('ss', $inputs['from_sql'], $inputs['to_sql']);
@@ -1301,7 +1315,9 @@ CSS;
         }
 
         $select_clause = $this->build_publish_select_clause($mysqli, $table);
-        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = !empty($inputs['mark_published']) && $has_mark_column;
+        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total_in_range === null) {
             @$mysqli->close();
             return [
@@ -1346,12 +1362,19 @@ CSS;
             $resume['notes'] = isset($resume['notes']) && is_array($resume['notes']) ? $resume['notes'] : [];
         }
 
+        if (!empty($inputs['mark_published']) && !$has_mark_column) {
+            $notice = 'TiDB table missing is_published column; sitemap batches cannot skip previously published rows.';
+        }
+
         $processed_rows = $resume ? max(0, (int)($resume['processed'] ?? 0)) : 0;
         $processed_valid = $resume ? max(0, (int)($resume['processed_valid'] ?? 0)) : 0;
         $failed_rows = $resume ? max(0, (int)($resume['failed'] ?? 0)) : 0;
         $next_offset = $resume ? max(0, (int)($resume['next_offset'] ?? $processed_rows)) : $processed_rows;
         $batches_done = $resume ? max(0, (int)($resume['batches_done'] ?? 0)) : 0;
         $notes_parts = $resume ? $resume['notes'] : [];
+        if (isset($notice) && !in_array($notice, $notes_parts, true)) {
+            $notes_parts[] = $notice;
+        }
 
         if ($processed_rows >= $limit) {
             @$mysqli->close();
@@ -1382,13 +1405,12 @@ CSS;
         ];
         $this->set_publish_resume_entry('sitemap', $resume_payload);
 
-        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
         $completed = true;
         $last_error = '';
 
         while ($processed_rows < $limit) {
             $chunk = min(200, $limit - $processed_rows);
-            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err, $only_unpublished, $has_mark_column);
             if ($batch === false) {
                 $completed = false;
                 $last_error = $err ?: 'Failed to fetch batch.';
@@ -1561,7 +1583,9 @@ CSS;
         }
 
         $select_clause = $this->build_publish_select_clause($mysqli, $table);
-        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = !empty($inputs['mark_published']) && $has_mark_column;
+        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total_in_range === null) {
             @$mysqli->close();
             return [
@@ -1646,7 +1670,7 @@ CSS;
 
         while ($processed_rows < $limit) {
             $chunk = min(200, $limit - $processed_rows);
-            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err, $only_unpublished, $has_mark_column);
             if ($batch === false) {
                 $completed = false;
                 $last_error = $err ?: 'Failed to fetch batch.';
@@ -1786,7 +1810,9 @@ CSS;
             return false;
         }
         $select_clause = $this->build_publish_select_clause($mysqli, $table);
-        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = $mark_published && $has_mark_column;
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total === null) {
             @$mysqli->close();
             return false;
@@ -1797,7 +1823,7 @@ CSS;
         $batches = 0;
         while ($limit > 0) {
             $chunk = min(200, $limit);
-            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $offset, $err);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $offset, $err, $only_unpublished, $has_mark_column);
             if ($batch === false) {
                 @$mysqli->close();
                 return false;
@@ -1813,7 +1839,7 @@ CSS;
                 break;
             }
         }
-        if ($mark_published && !empty($rows) && $this->column_exists($mysqli, $table, 'is_published')) {
+        if ($mark_published && $has_mark_column && !empty($rows)) {
             $this->mark_products_as_published($mysqli, $table, array_column($rows, 'id'));
         }
         @$mysqli->close();
