@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.4.7
+ * Version: 1.4.8
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -15,7 +15,7 @@ class VPP_Plugin {
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const VERSION = '1.4.7';
+    const VERSION = '1.4.8';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -3071,6 +3071,26 @@ CSS;
             wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
             exit;
         }
+        $published_err = null;
+        $published_count = $this->count_published_products($published_err);
+        if ($published_err) {
+            $state['message'] = $published_err;
+            $state['message_type'] = 'error';
+            $state['validation'] = [];
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        if ((int)$published_count === 0) {
+            foreach (glob($dir . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+            foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+            if (!empty($storage['legacy_dir']) && is_dir($storage['legacy_dir'])) {
+                foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+                foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+            }
+        }
+
         $files = glob($dir . 'products-*.xml') ?: [];
         $err = null;
         $this->refresh_sitemap_index($storage, $err);
@@ -3078,7 +3098,11 @@ CSS;
             $state['message'] = $err;
             $state['message_type'] = 'error';
         } else {
-            $state['message'] = sprintf('Rebuilt sitemap_index.xml with %d file(s).', count($files));
+            $state['message'] = sprintf(
+                'Rebuilt sitemap_index.xml with %d file(s) (published count: %d).',
+                count($files),
+                (int)$published_count
+            );
             $state['message_type'] = 'success';
         }
         $this->save_publish_state($state);
@@ -3161,8 +3185,8 @@ CSS;
         }
 
         if (empty($rows)) {
-            $state['message'] = 'No sitemap files found to validate.';
-            $state['message_type'] = 'warning';
+            $state['message'] = 'Validated 0 sitemap file(s) totaling 0 URL(s).';
+            $state['message_type'] = 'success';
         } else {
             $state['message'] = sprintf('Validated %d sitemap file(s) totaling %d URL(s).', count($rows), $total_urls);
             $state['message_type'] = 'success';
@@ -3394,8 +3418,16 @@ CSS;
         $base_url = $storage['url'];
 
         foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+        foreach (glob($dir . 'products-*.xml') ?: [] as $old) { @unlink($old); }
         @unlink($dir . 'sitemap-index.xml');
         @unlink($dir . 'vpp-index.xml');
+        if (!empty($storage['legacy_dir']) && is_dir($storage['legacy_dir'])) {
+            foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+            foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+            @unlink($storage['legacy_dir'] . 'sitemap-index.xml');
+            @unlink($storage['legacy_dir'] . 'sitemap_index.xml');
+            @unlink($storage['legacy_dir'] . 'vpp-index.xml');
+        }
 
         $write_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err) {
             if (empty($entries)) { return true; }
