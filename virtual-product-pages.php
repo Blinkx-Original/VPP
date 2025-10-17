@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.5.2
+ * Version: 1.5.3
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 48;
     const CATEGORY_CACHE_TTL = 1800; // 30 minutes
     const CATEGORY_RESERVED_SLUGS = ['page', 'feed', 'tag', 'category', 'amp', 'index'];
-    const VERSION = '1.5.2';
+    const VERSION = '1.5.3';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -4555,17 +4555,34 @@ CSS;
 
     public function maybe_render_vpp() {
         $slug = $this->current_vpp_slug();
-        if (!$slug) return;
-        $err = null;
-        $product = $this->get_current_product($err);
-        if (!$product || empty($product['is_published'])) {
-            status_header(404);
-            nocache_headers();
-            echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
+        if ($slug) {
+            $err = null;
+            $product = $this->get_current_product($err);
+            if (!$product || empty($product['is_published'])) {
+                status_header(404);
+                nocache_headers();
+                echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
+                exit;
+            }
+            $this->render_product($product);
             exit;
         }
-        $this->render_product($product);
-        exit;
+
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if (!$context) {
+                $this->render_category_not_found();
+                exit;
+            }
+
+            if (($context['type'] ?? '') === 'archive') {
+                $this->render_category_archive($context);
+            } else {
+                $this->render_category_index($context);
+            }
+            exit;
+        }
     }
 
     private function build_category_page_url($base, $page) {
