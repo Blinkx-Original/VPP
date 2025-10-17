@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.5.0
+ * Version: 1.5.1
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -16,7 +16,7 @@ class VPP_Plugin {
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const VERSION = '1.5.0';
+    const VERSION = '1.5.1';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -265,9 +265,64 @@ CSS;
         if (version_compare($current_version, '1.4.9', '>=')) {
             $this->register_rewrite();
             flush_rewrite_rules();
+            $this->refresh_sitemaps_after_upgrade();
         }
 
         update_option(self::VERSION_OPTION, $current_version);
+    }
+
+    private function refresh_sitemaps_after_upgrade() {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            return;
+        }
+
+        $meta = $this->get_sitemap_meta();
+        $stored_base = isset($meta['base_url']) ? (string)$meta['base_url'] : '';
+        $target_base = isset($storage['url']) ? (string)$storage['url'] : '';
+        if ($target_base === '') {
+            return;
+        }
+
+        if ($stored_base !== '' && $stored_base === $target_base) {
+            return;
+        }
+
+        $directories = [];
+        if (wp_mkdir_p($storage['dir'])) {
+            $directories[] = trailingslashit($storage['dir']);
+        }
+        if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
+            $directories[] = trailingslashit($storage['legacy_dir']);
+        }
+
+        $skip_names = ['sitemap_index.xml', 'sitemap-index.xml', 'vpp-index.xml', 'sitemap-categories.xml'];
+        foreach ($directories as $dir) {
+            foreach (glob($dir . '*.xml') ?: [] as $file) {
+                $name = basename($file);
+                if (in_array($name, $skip_names, true)) {
+                    continue;
+                }
+                $entries = $this->read_sitemap_entries($file);
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    error_log('VPP sitemap rewrite after upgrade failed for ' . $name);
+                }
+            }
+        }
+
+        $cat_err = null;
+        $category_entry = $this->write_category_sitemap($cat_err);
+        if ($category_entry === false && !empty($cat_err)) {
+            error_log('VPP category sitemap rewrite after upgrade failed: ' . $cat_err);
+        }
+
+        $meta['base_url'] = $target_base;
+        $this->save_sitemap_meta($meta);
+
+        $index_err = null;
+        if ($this->refresh_sitemap_index($storage, $index_err) === false && !empty($index_err)) {
+            error_log('VPP sitemap index refresh after upgrade failed: ' . $index_err);
+        }
     }
 
     private function uses_wpseo_sitemaps() {
