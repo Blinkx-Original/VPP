@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.4.9
+ * Version: 1.5.0
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -15,16 +15,7 @@ class VPP_Plugin {
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const CATEGORY_INDEX_QUERY_VAR = 'vpp_cat_index';
-    const CATEGORY_SLUG_QUERY_VAR = 'vpp_cat_slug';
-    const CATEGORY_PAGE_QUERY_VAR = 'vpp_cat_page';
-    const CATEGORY_CACHE_TTL = 600; // 10 minutes
-    const CATEGORY_PER_PAGE_DEFAULT = 24;
-    const CATEGORY_PER_PAGE_MAX = 60;
-    const CATEGORY_RESERVED_SLUGS = [
-        'page', 'feed', 'amp', 'category', 'tag', 'author', 'attachment', 'search', 'index', 'home'
-    ];
-    const VERSION = '1.4.9';
+    const VERSION = '1.5.0';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -181,7 +172,6 @@ CSS;
         add_action('init', [$this, 'register_rewrite']);
         add_filter('query_vars', [$this, 'add_query_var']);
         add_action('template_redirect', [$this, 'maybe_output_sitemap'], 0);
-        add_action('template_redirect', [$this, 'maybe_render_category'], 5);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
         register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
         register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
@@ -243,22 +233,12 @@ CSS;
         $vars[] = self::QUERY_VAR;
         $vars[] = self::SITEMAP_QUERY_VAR;
         $vars[] = self::SITEMAP_FILE_QUERY_VAR;
-        $vars[] = self::CATEGORY_INDEX_QUERY_VAR;
-        $vars[] = self::CATEGORY_SLUG_QUERY_VAR;
-        $vars[] = self::CATEGORY_PAGE_QUERY_VAR;
         return $vars;
     }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
-        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
-        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
-        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
-        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
-        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([^&]+)');
-        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
-        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([^&]+)');
         if (!$this->uses_wpseo_sitemaps()) {
             add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
             add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
@@ -889,12 +869,22 @@ CSS;
         if (!isset($meta['locks']) || !is_array($meta['locks'])) {
             $meta['locks'] = [];
         }
+        if (!isset($meta['base_url'])) {
+            $meta['base_url'] = '';
+        } else {
+            $meta['base_url'] = (string)$meta['base_url'];
+        }
         return $meta;
     }
 
     private function save_sitemap_meta(array $meta) {
         if (!isset($meta['locks']) || !is_array($meta['locks'])) {
             $meta['locks'] = [];
+        }
+        if (!isset($meta['base_url'])) {
+            $meta['base_url'] = '';
+        } else {
+            $meta['base_url'] = (string)$meta['base_url'];
         }
         update_option(self::SITEMAP_META_OPTION, $meta, false);
     }
@@ -2015,6 +2005,24 @@ CSS;
         $dir = $storage['dir'];
         $base_url = $storage['url'];
         $files = glob($dir . '*.xml') ?: [];
+        $meta = $this->get_sitemap_meta();
+        $needs_rewrite = isset($meta['base_url']) ? ($meta['base_url'] !== $base_url) : true;
+        if ($needs_rewrite) {
+            foreach ($files as $file) {
+                $name = basename($file);
+                if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml' || $name === 'vpp-index.xml') {
+                    continue;
+                }
+                $entries = $this->read_sitemap_entries($file);
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    $err = 'Failed to rewrite ' . basename($file);
+                    return false;
+                }
+            }
+            $meta['base_url'] = $base_url;
+            $this->save_sitemap_meta($meta);
+            $files = glob($dir . '*.xml') ?: [];
+        }
         $entries = [];
         foreach ($files as $file) {
             $name = basename($file);
@@ -2051,6 +2059,10 @@ CSS;
                 @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $xml);
                 @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $xml);
             }
+        }
+        if (!$needs_rewrite && $meta['base_url'] !== $base_url) {
+            $meta['base_url'] = $base_url;
+            $this->save_sitemap_meta($meta);
         }
         return $storage['index_url'];
     }
@@ -4165,12 +4177,11 @@ CSS;
             @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $index_xml);
         }
 
-        $product_file_count = count($files) - (is_array($category_entry) ? 1 : 0);
-        if ($product_file_count < 0) { $product_file_count = 0; }
-        $summary = sprintf('Generated %d product sitemap file(s) covering %d product(s).', $product_file_count, $total);
-        if (is_array($category_entry)) {
-            $summary .= ' Categories sitemap refreshed.';
-        }
+        $meta = $this->get_sitemap_meta();
+        $meta['base_url'] = $base_url;
+        $this->save_sitemap_meta($meta);
+
+        $summary = sprintf('Generated %d sitemap file(s) covering %d product(s).', count($files), $total);
         return true;
     }
 
@@ -4397,6 +4408,10 @@ CSS;
         }
         $path = '';
         if ($mode === 'index') {
+            $refresh_err = null;
+            if ($this->refresh_sitemap_index($storage, $refresh_err) === false && $refresh_err) {
+                error_log('VPP sitemap refresh failed: ' . $refresh_err);
+            }
             $candidates = [
                 $storage['dir'] . 'sitemap_index.xml',
                 $storage['dir'] . 'sitemap-index.xml',
@@ -4417,6 +4432,12 @@ CSS;
                 status_header(404);
                 exit;
             }
+            if (strcasecmp($requested, 'vpp-index.xml') === 0) {
+                $refresh_err = null;
+                if ($this->refresh_sitemap_index($storage, $refresh_err) === false && $refresh_err) {
+                    error_log('VPP sitemap refresh failed: ' . $refresh_err);
+                }
+            }
             $path = $storage['dir'] . $requested;
             if (!@is_readable($path)) {
                 status_header(404);
@@ -4431,28 +4452,10 @@ CSS;
         }
         header('Content-Type: application/xml; charset=UTF-8');
         header('X-Robots-Tag: noindex, follow', true);
-        header('Cache-Control: public, max-age=300');
+        header('Cache-Control: no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
         readfile($path);
-        exit;
-    }
-
-    public function maybe_render_category() {
-        if (is_admin() || !$this->is_category_request()) {
-            return;
-        }
-        $err = null;
-        $context = $this->ensure_category_context($err);
-        if (!$context) {
-            $this->render_category_not_found();
-            exit;
-        }
-        $inline_css = $this->load_css_contents();
-        $this->current_inline_css = $inline_css;
-        if ($context['type'] === 'archive') {
-            $this->render_category_archive($context);
-        } else {
-            $this->render_category_index($context);
-        }
         exit;
     }
 
