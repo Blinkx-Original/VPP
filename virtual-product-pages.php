@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.5.0
+ * Version: 1.5.3
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -12,10 +12,18 @@ if (!defined('ABSPATH')) { exit; }
 class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
+    const VERSION_OPTION = 'vpp_version';
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const VERSION = '1.5.0';
+    const CATEGORY_INDEX_QUERY_VAR = 'vpp_cat_index';
+    const CATEGORY_SLUG_QUERY_VAR = 'vpp_cat_slug';
+    const CATEGORY_PAGE_QUERY_VAR = 'vpp_cat_page';
+    const CATEGORY_PER_PAGE_DEFAULT = 12;
+    const CATEGORY_PER_PAGE_MAX = 48;
+    const CATEGORY_CACHE_TTL = 1800; // 30 minutes
+    const CATEGORY_RESERVED_SLUGS = ['page', 'feed', 'tag', 'category', 'amp', 'index'];
+    const VERSION = '1.5.3';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -170,6 +178,7 @@ CSS;
 
     private function __construct() {
         add_action('init', [$this, 'register_rewrite']);
+        add_action('init', [$this, 'maybe_flush_rewrite_on_update'], 20);
         add_filter('query_vars', [$this, 'add_query_var']);
         add_action('template_redirect', [$this, 'maybe_output_sitemap'], 0);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
@@ -226,19 +235,33 @@ CSS;
         }
     }
 
-    public static function on_activate() { self::instance()->register_rewrite(); flush_rewrite_rules(); }
+    public static function on_activate() {
+        self::instance()->register_rewrite();
+        flush_rewrite_rules();
+        update_option(self::VERSION_OPTION, self::VERSION);
+    }
     public static function on_deactivate() { flush_rewrite_rules(); }
 
     public function add_query_var($vars) {
         $vars[] = self::QUERY_VAR;
         $vars[] = self::SITEMAP_QUERY_VAR;
         $vars[] = self::SITEMAP_FILE_QUERY_VAR;
+        $vars[] = self::CATEGORY_INDEX_QUERY_VAR;
+        $vars[] = self::CATEGORY_SLUG_QUERY_VAR;
+        $vars[] = self::CATEGORY_PAGE_QUERY_VAR;
         return $vars;
     }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
+        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
+        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
         if (!$this->uses_wpseo_sitemaps()) {
             add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
             add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
@@ -246,6 +269,77 @@ CSS;
         add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
         add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
+    }
+
+    public function maybe_flush_rewrite_on_update() {
+        $stored_version = get_option(self::VERSION_OPTION);
+        $current_version = self::VERSION;
+
+        if ($stored_version === $current_version) {
+            return;
+        }
+
+        if (version_compare($current_version, '1.4.9', '>=')) {
+            $this->register_rewrite();
+            flush_rewrite_rules();
+            $this->refresh_sitemaps_after_upgrade();
+        }
+
+        update_option(self::VERSION_OPTION, $current_version);
+    }
+
+    private function refresh_sitemaps_after_upgrade() {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            return;
+        }
+
+        $meta = $this->get_sitemap_meta();
+        $stored_base = isset($meta['base_url']) ? (string)$meta['base_url'] : '';
+        $target_base = isset($storage['url']) ? (string)$storage['url'] : '';
+        if ($target_base === '') {
+            return;
+        }
+
+        if ($stored_base !== '' && $stored_base === $target_base) {
+            return;
+        }
+
+        $directories = [];
+        if (wp_mkdir_p($storage['dir'])) {
+            $directories[] = trailingslashit($storage['dir']);
+        }
+        if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
+            $directories[] = trailingslashit($storage['legacy_dir']);
+        }
+
+        $skip_names = ['sitemap_index.xml', 'sitemap-index.xml', 'vpp-index.xml', 'sitemap-categories.xml'];
+        foreach ($directories as $dir) {
+            foreach (glob($dir . '*.xml') ?: [] as $file) {
+                $name = basename($file);
+                if (in_array($name, $skip_names, true)) {
+                    continue;
+                }
+                $entries = $this->read_sitemap_entries($file);
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    error_log('VPP sitemap rewrite after upgrade failed for ' . $name);
+                }
+            }
+        }
+
+        $cat_err = null;
+        $category_entry = $this->write_category_sitemap($cat_err);
+        if ($category_entry === false && !empty($cat_err)) {
+            error_log('VPP category sitemap rewrite after upgrade failed: ' . $cat_err);
+        }
+
+        $meta['base_url'] = $target_base;
+        $this->save_sitemap_meta($meta);
+
+        $index_err = null;
+        if ($this->refresh_sitemap_index($storage, $index_err) === false && !empty($index_err)) {
+            error_log('VPP sitemap index refresh after upgrade failed: ' . $index_err);
+        }
     }
 
     private function uses_wpseo_sitemaps() {
@@ -4461,17 +4555,34 @@ CSS;
 
     public function maybe_render_vpp() {
         $slug = $this->current_vpp_slug();
-        if (!$slug) return;
-        $err = null;
-        $product = $this->get_current_product($err);
-        if (!$product || empty($product['is_published'])) {
-            status_header(404);
-            nocache_headers();
-            echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
+        if ($slug) {
+            $err = null;
+            $product = $this->get_current_product($err);
+            if (!$product || empty($product['is_published'])) {
+                status_header(404);
+                nocache_headers();
+                echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
+                exit;
+            }
+            $this->render_product($product);
             exit;
         }
-        $this->render_product($product);
-        exit;
+
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if (!$context) {
+                $this->render_category_not_found();
+                exit;
+            }
+
+            if (($context['type'] ?? '') === 'archive') {
+                $this->render_category_archive($context);
+            } else {
+                $this->render_category_index($context);
+            }
+            exit;
+        }
     }
 
     private function build_category_page_url($base, $page) {
