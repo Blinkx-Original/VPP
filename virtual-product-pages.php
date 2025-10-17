@@ -12,6 +12,7 @@ if (!defined('ABSPATH')) { exit; }
 class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
+    const VERSION_OPTION = 'vpp_version';
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
@@ -170,6 +171,7 @@ CSS;
 
     private function __construct() {
         add_action('init', [$this, 'register_rewrite']);
+        add_action('init', [$this, 'maybe_flush_rewrite_on_update'], 20);
         add_filter('query_vars', [$this, 'add_query_var']);
         add_action('template_redirect', [$this, 'maybe_output_sitemap'], 0);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
@@ -226,7 +228,11 @@ CSS;
         }
     }
 
-    public static function on_activate() { self::instance()->register_rewrite(); flush_rewrite_rules(); }
+    public static function on_activate() {
+        self::instance()->register_rewrite();
+        flush_rewrite_rules();
+        update_option(self::VERSION_OPTION, self::VERSION);
+    }
     public static function on_deactivate() { flush_rewrite_rules(); }
 
     public function add_query_var($vars) {
@@ -246,6 +252,22 @@ CSS;
         add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
         add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
+    }
+
+    public function maybe_flush_rewrite_on_update() {
+        $stored_version = get_option(self::VERSION_OPTION);
+        $current_version = self::VERSION;
+
+        if ($stored_version === $current_version) {
+            return;
+        }
+
+        if (version_compare($current_version, '1.4.9', '>=')) {
+            $this->register_rewrite();
+            flush_rewrite_rules();
+        }
+
+        update_option(self::VERSION_OPTION, $current_version);
     }
 
     private function uses_wpseo_sitemaps() {
