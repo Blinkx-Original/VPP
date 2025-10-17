@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.5.1
+ * Version: 1.5.2
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -16,7 +16,14 @@ class VPP_Plugin {
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const VERSION = '1.5.1';
+    const CATEGORY_INDEX_QUERY_VAR = 'vpp_cat_index';
+    const CATEGORY_SLUG_QUERY_VAR = 'vpp_cat_slug';
+    const CATEGORY_PAGE_QUERY_VAR = 'vpp_cat_page';
+    const CATEGORY_PER_PAGE_DEFAULT = 12;
+    const CATEGORY_PER_PAGE_MAX = 48;
+    const CATEGORY_CACHE_TTL = 1800; // 30 minutes
+    const CATEGORY_RESERVED_SLUGS = ['page', 'feed', 'tag', 'category', 'amp', 'index'];
+    const VERSION = '1.5.2';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -239,12 +246,22 @@ CSS;
         $vars[] = self::QUERY_VAR;
         $vars[] = self::SITEMAP_QUERY_VAR;
         $vars[] = self::SITEMAP_FILE_QUERY_VAR;
+        $vars[] = self::CATEGORY_INDEX_QUERY_VAR;
+        $vars[] = self::CATEGORY_SLUG_QUERY_VAR;
+        $vars[] = self::CATEGORY_PAGE_QUERY_VAR;
         return $vars;
     }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
+        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
+        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
         if (!$this->uses_wpseo_sitemaps()) {
             add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
             add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
