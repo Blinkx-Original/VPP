@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.4.6
+ * Version: 1.4.9
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -13,7 +13,9 @@ class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
     const QUERY_VAR = 'vpp_slug';
-    const VERSION = '1.4.6';
+    const SITEMAP_QUERY_VAR = 'vpp_sitemap';
+    const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
+    const VERSION = '1.4.9';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -166,12 +168,18 @@ CSS;
     private function __construct() {
         add_action('init', [$this, 'register_rewrite']);
         add_filter('query_vars', [$this, 'add_query_var']);
+        add_action('template_redirect', [$this, 'maybe_output_sitemap'], 0);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
         register_activation_hook(__FILE__, ['VPP_Plugin', 'on_activate']);
         register_deactivation_hook(__FILE__, ['VPP_Plugin', 'on_deactivate']);
 
         add_action('wp_head', [$this, 'inject_inline_css_head'], 0);
         add_action('wp_head', [$this, 'output_meta_tags'], 1);
+        add_filter('robots_txt', [$this, 'filter_robots_txt'], 10, 2);
+
+        if ($this->uses_wpseo_sitemaps()) {
+            add_filter('wpseo_sitemap_index', [$this, 'filter_wpseo_sitemap_index']);
+        }
 
         if (is_admin()) {
             add_action('admin_menu', [$this, 'admin_menu']);
@@ -218,11 +226,72 @@ CSS;
     public static function on_activate() { self::instance()->register_rewrite(); flush_rewrite_rules(); }
     public static function on_deactivate() { flush_rewrite_rules(); }
 
-    public function add_query_var($vars) { $vars[] = self::QUERY_VAR; return $vars; }
+    public function add_query_var($vars) {
+        $vars[] = self::QUERY_VAR;
+        $vars[] = self::SITEMAP_QUERY_VAR;
+        $vars[] = self::SITEMAP_FILE_QUERY_VAR;
+        return $vars;
+    }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+        if (!$this->uses_wpseo_sitemaps()) {
+            add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
+            add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
+        }
+        add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
+    }
+
+    private function uses_wpseo_sitemaps() {
+        static $cache = null;
+        if ($cache === null) {
+            $cache = defined('WPSEO_VERSION') || class_exists('WPSEO_Sitemaps_Router');
+        }
+        return $cache;
+    }
+
+    public function filter_robots_txt($output, $public) {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage || empty($storage['index_url'])) {
+            return $output;
+        }
+        $sitemap = $storage['index_url'];
+        if ($sitemap && stripos($output, $sitemap) !== false) {
+            return $output;
+        }
+        $line = 'Sitemap: ' . esc_url_raw($sitemap);
+        if ($output !== '') {
+            $output = rtrim($output) . "\n";
+        }
+        return $output . $line . "\n";
+    }
+
+    public function filter_wpseo_sitemap_index($content) {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage || empty($storage['index_url'])) {
+            return $content;
+        }
+        $loc = $storage['index_url'];
+        if (!$loc || strpos($content, $loc) !== false) {
+            return $content;
+        }
+        $path = $storage['dir'] . 'sitemap_index.xml';
+        if (!@is_readable($path)) {
+            $err = null;
+            $this->refresh_sitemap_index($storage, $err);
+        }
+        $lastmod_ts = @filemtime($path) ?: time();
+        $entry  = "  <sitemap>\n";
+        $entry .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
+        $entry .= '    <lastmod>' . htmlspecialchars(gmdate('c', $lastmod_ts), ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</lastmod>' . "\n";
+        $entry .= "  </sitemap>\n";
+        if (strpos($content, '</sitemapindex>') !== false) {
+            return str_replace('</sitemapindex>', $entry . '</sitemapindex>', $content);
+        }
+        return $content . $entry;
     }
 
     public function enqueue_assets() {
@@ -532,6 +601,14 @@ CSS;
                             <code><?php echo esc_html($sitemap_urls['primary']); ?></code>
                         </a>
                     </p>
+                    <?php if (!empty($sitemap_urls['yoast'])): ?>
+                        <p class="description" style="margin-top:4px;">
+                            Listed in Yoast index:
+                            <a href="<?php echo esc_url($sitemap_urls['yoast']); ?>" target="_blank" rel="noopener noreferrer">
+                                <code><?php echo esc_html($sitemap_urls['yoast']); ?></code>
+                            </a>
+                        </p>
+                    <?php endif; ?>
                     <?php if (!empty($sitemap_urls['legacy']) && $sitemap_urls['legacy'] !== $sitemap_urls['primary']): ?>
                         <p class="description" style="margin-top:4px;">
                             Legacy alias:
@@ -779,12 +856,22 @@ CSS;
         if (!isset($meta['locks']) || !is_array($meta['locks'])) {
             $meta['locks'] = [];
         }
+        if (!isset($meta['base_url'])) {
+            $meta['base_url'] = '';
+        } else {
+            $meta['base_url'] = (string)$meta['base_url'];
+        }
         return $meta;
     }
 
     private function save_sitemap_meta(array $meta) {
         if (!isset($meta['locks']) || !is_array($meta['locks'])) {
             $meta['locks'] = [];
+        }
+        if (!isset($meta['base_url'])) {
+            $meta['base_url'] = '';
+        } else {
+            $meta['base_url'] = (string)$meta['base_url'];
         }
         update_option(self::SITEMAP_META_OPTION, $meta, false);
     }
@@ -795,12 +882,21 @@ CSS;
             return null;
         }
         $dir = trailingslashit($uploads['basedir']) . 'vpp-sitemaps/';
-        $url = trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/';
+        $public_base = trailingslashit(home_url('/sitemaps'));
+        $yoast_active = $this->uses_wpseo_sitemaps();
+        $root_index = home_url('/sitemap_index.xml');
+        $alias_index = home_url('/sitemaps/vpp-index.xml');
+        $public_index = $yoast_active ? $alias_index : $root_index;
         $legacy_dir = trailingslashit($uploads['basedir']) . 'vpp/';
         $legacy_url = trailingslashit($uploads['baseurl']) . 'vpp/';
         return [
             'dir' => $dir,
-            'url' => $url,
+            'url' => $public_base,
+            'index_url' => $public_index,
+            'alias_index_url' => $alias_index,
+            'yoast_index_url' => $yoast_active ? $root_index : null,
+            'root_index_url' => $root_index,
+            'upload_url' => trailingslashit($uploads['baseurl']) . 'vpp-sitemaps/',
             'legacy_dir' => $legacy_dir,
             'legacy_url' => $legacy_url,
         ];
@@ -812,8 +908,11 @@ CSS;
             return [];
         }
         $urls = [
-            'primary' => $storage['url'] . 'sitemap_index.xml',
+            'primary' => $storage['index_url'],
         ];
+        if (!empty($storage['yoast_index_url']) && $storage['yoast_index_url'] !== $storage['index_url']) {
+            $urls['yoast'] = $storage['yoast_index_url'];
+        }
         if (!empty($storage['legacy_url'])) {
             $urls['legacy'] = $storage['legacy_url'] . 'sitemap_index.xml';
         }
@@ -1020,8 +1119,12 @@ CSS;
         ];
     }
 
-    private function count_products_in_range($mysqli, $table, $from_sql, $to_sql, &$err = null) {
-        $sql = "SELECT COUNT(*) AS cnt FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ?";
+    private function count_products_in_range($mysqli, $table, $from_sql, $to_sql, &$err = null, $only_unpublished = false, $has_mark_column = false) {
+        $where = '`updated_at` >= ? AND `updated_at` < ?';
+        if ($only_unpublished && $has_mark_column) {
+            $where .= ' AND (`is_published` = 0 OR `is_published` IS NULL)';
+        }
+        $sql = "SELECT COUNT(*) AS cnt FROM `{$table}` WHERE {$where}";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) {
             $err = 'DB prepare failed: ' . $mysqli->error;
@@ -1071,8 +1174,12 @@ CSS;
         return implode(', ', $select);
     }
 
-    private function fetch_publish_batch($mysqli, $table, $select_clause, $from_sql, $to_sql, $limit, $offset, &$err = null) {
-        $sql = "SELECT {$select_clause} FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT ? OFFSET ?";
+    private function fetch_publish_batch($mysqli, $table, $select_clause, $from_sql, $to_sql, $limit, $offset, &$err = null, $only_unpublished = false, $has_mark_column = false) {
+        $where = '`updated_at` >= ? AND `updated_at` < ?';
+        if ($only_unpublished && $has_mark_column) {
+            $where .= ' AND (`is_published` = 0 OR `is_published` IS NULL)';
+        }
+        $sql = "SELECT {$select_clause} FROM `{$table}` WHERE {$where} ORDER BY `updated_at` ASC, `id` ASC LIMIT ? OFFSET ?";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) {
             $err = 'DB prepare failed: ' . $mysqli->error;
@@ -1129,13 +1236,19 @@ CSS;
             @$mysqli->close();
             return false;
         }
-        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = !empty($inputs['mark_published']) && $has_mark_column;
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total === null) {
             @$mysqli->close();
             return false;
         }
         $samples = [];
-        $sql = "SELECT `slug` FROM `{$table}` WHERE `updated_at` >= ? AND `updated_at` < ? ORDER BY `updated_at` ASC, `id` ASC LIMIT 20";
+        $where = '`updated_at` >= ? AND `updated_at` < ?';
+        if ($only_unpublished && $has_mark_column) {
+            $where .= ' AND (`is_published` = 0 OR `is_published` IS NULL)';
+        }
+        $sql = "SELECT `slug` FROM `{$table}` WHERE {$where} ORDER BY `updated_at` ASC, `id` ASC LIMIT 20";
         $stmt = $mysqli->prepare($sql);
         if ($stmt) {
             $stmt->bind_param('ss', $inputs['from_sql'], $inputs['to_sql']);
@@ -1212,7 +1325,9 @@ CSS;
         }
 
         $select_clause = $this->build_publish_select_clause($mysqli, $table);
-        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = !empty($inputs['mark_published']) && $has_mark_column;
+        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total_in_range === null) {
             @$mysqli->close();
             return [
@@ -1257,12 +1372,19 @@ CSS;
             $resume['notes'] = isset($resume['notes']) && is_array($resume['notes']) ? $resume['notes'] : [];
         }
 
+        if (!empty($inputs['mark_published']) && !$has_mark_column) {
+            $notice = 'TiDB table missing is_published column; sitemap batches cannot skip previously published rows.';
+        }
+
         $processed_rows = $resume ? max(0, (int)($resume['processed'] ?? 0)) : 0;
         $processed_valid = $resume ? max(0, (int)($resume['processed_valid'] ?? 0)) : 0;
         $failed_rows = $resume ? max(0, (int)($resume['failed'] ?? 0)) : 0;
         $next_offset = $resume ? max(0, (int)($resume['next_offset'] ?? $processed_rows)) : $processed_rows;
         $batches_done = $resume ? max(0, (int)($resume['batches_done'] ?? 0)) : 0;
         $notes_parts = $resume ? $resume['notes'] : [];
+        if (isset($notice) && !in_array($notice, $notes_parts, true)) {
+            $notes_parts[] = $notice;
+        }
 
         if ($processed_rows >= $limit) {
             @$mysqli->close();
@@ -1293,13 +1415,12 @@ CSS;
         ];
         $this->set_publish_resume_entry('sitemap', $resume_payload);
 
-        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
         $completed = true;
         $last_error = '';
 
         while ($processed_rows < $limit) {
             $chunk = min(200, $limit - $processed_rows);
-            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err, $only_unpublished, $has_mark_column);
             if ($batch === false) {
                 $completed = false;
                 $last_error = $err ?: 'Failed to fetch batch.';
@@ -1472,7 +1593,9 @@ CSS;
         }
 
         $select_clause = $this->build_publish_select_clause($mysqli, $table);
-        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = !empty($inputs['mark_published']) && $has_mark_column;
+        $total_in_range = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total_in_range === null) {
             @$mysqli->close();
             return [
@@ -1557,7 +1680,7 @@ CSS;
 
         while ($processed_rows < $limit) {
             $chunk = min(200, $limit - $processed_rows);
-            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $next_offset, $err, $only_unpublished, $has_mark_column);
             if ($batch === false) {
                 $completed = false;
                 $last_error = $err ?: 'Failed to fetch batch.';
@@ -1697,7 +1820,9 @@ CSS;
             return false;
         }
         $select_clause = $this->build_publish_select_clause($mysqli, $table);
-        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err);
+        $has_mark_column = $this->column_exists($mysqli, $table, 'is_published');
+        $only_unpublished = $mark_published && $has_mark_column;
+        $total = $this->count_products_in_range($mysqli, $table, $inputs['from_sql'], $inputs['to_sql'], $err, $only_unpublished, $has_mark_column);
         if ($total === null) {
             @$mysqli->close();
             return false;
@@ -1708,7 +1833,7 @@ CSS;
         $batches = 0;
         while ($limit > 0) {
             $chunk = min(200, $limit);
-            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $offset, $err);
+            $batch = $this->fetch_publish_batch($mysqli, $table, $select_clause, $inputs['from_sql'], $inputs['to_sql'], $chunk, $offset, $err, $only_unpublished, $has_mark_column);
             if ($batch === false) {
                 @$mysqli->close();
                 return false;
@@ -1724,7 +1849,7 @@ CSS;
                 break;
             }
         }
-        if ($mark_published && !empty($rows) && $this->column_exists($mysqli, $table, 'is_published')) {
+        if ($mark_published && $has_mark_column && !empty($rows)) {
             $this->mark_products_as_published($mysqli, $table, array_column($rows, 'id'));
         }
         @$mysqli->close();
@@ -1810,10 +1935,28 @@ CSS;
         $dir = $storage['dir'];
         $base_url = $storage['url'];
         $files = glob($dir . '*.xml') ?: [];
+        $meta = $this->get_sitemap_meta();
+        $needs_rewrite = isset($meta['base_url']) ? ($meta['base_url'] !== $base_url) : true;
+        if ($needs_rewrite) {
+            foreach ($files as $file) {
+                $name = basename($file);
+                if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml' || $name === 'vpp-index.xml') {
+                    continue;
+                }
+                $entries = $this->read_sitemap_entries($file);
+                if (!$this->write_sitemap_file($file, $entries)) {
+                    $err = 'Failed to rewrite ' . basename($file);
+                    return false;
+                }
+            }
+            $meta['base_url'] = $base_url;
+            $this->save_sitemap_meta($meta);
+            $files = glob($dir . '*.xml') ?: [];
+        }
         $entries = [];
         foreach ($files as $file) {
             $name = basename($file);
-            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml' || $name === 'vpp-index.xml') {
                 continue;
             }
             $entries[] = [
@@ -1839,13 +1982,19 @@ CSS;
             return false;
         }
         @file_put_contents($dir . 'sitemap-index.xml', $xml);
+        @file_put_contents($dir . 'vpp-index.xml', $xml);
         if (!empty($storage['legacy_dir'])) {
             if (wp_mkdir_p($storage['legacy_dir'])) {
                 @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $xml);
                 @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $xml);
+                @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $xml);
             }
         }
-        return $base_url . 'sitemap_index.xml';
+        if (!$needs_rewrite && $meta['base_url'] !== $base_url) {
+            $meta['base_url'] = $base_url;
+            $this->save_sitemap_meta($meta);
+        }
+        return $storage['index_url'];
     }
 
     private function update_sitemaps_with_products(array $items, $ping_google, &$notes, &$err = null) {
@@ -1863,7 +2012,6 @@ CSS;
             $err = 'Failed to create sitemap directory.';
             return false;
         }
-        $base_url = $storage['url'];
         $existing_files = glob($dir . '*.xml') ?: [];
         $meta = $this->get_sitemap_meta();
         $locks = isset($meta['locks']) && is_array($meta['locks']) ? $meta['locks'] : [];
@@ -1886,7 +2034,7 @@ CSS;
         $filtered_files = [];
         foreach ($existing_files as $file) {
             $name = basename($file);
-            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml') {
+            if ($name === 'sitemap_index.xml' || $name === 'sitemap-index.xml' || $name === 'vpp-index.xml') {
                 continue;
             }
             $filtered_files[] = $file;
@@ -2955,6 +3103,26 @@ CSS;
             wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
             exit;
         }
+        $published_err = null;
+        $published_count = $this->count_published_products($published_err);
+        if ($published_err) {
+            $state['message'] = $published_err;
+            $state['message_type'] = 'error';
+            $state['validation'] = [];
+            $this->save_publish_state($state);
+            wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
+            exit;
+        }
+
+        if ((int)$published_count === 0) {
+            foreach (glob($dir . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+            foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+            if (!empty($storage['legacy_dir']) && is_dir($storage['legacy_dir'])) {
+                foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+                foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+            }
+        }
+
         $files = glob($dir . 'products-*.xml') ?: [];
         $err = null;
         $this->refresh_sitemap_index($storage, $err);
@@ -2962,7 +3130,11 @@ CSS;
             $state['message'] = $err;
             $state['message_type'] = 'error';
         } else {
-            $state['message'] = sprintf('Rebuilt sitemap_index.xml with %d file(s).', count($files));
+            $state['message'] = sprintf(
+                'Rebuilt sitemap_index.xml with %d file(s) (published count: %d).',
+                count($files),
+                (int)$published_count
+            );
             $state['message_type'] = 'success';
         }
         $this->save_publish_state($state);
@@ -3045,8 +3217,8 @@ CSS;
         }
 
         if (empty($rows)) {
-            $state['message'] = 'No sitemap files found to validate.';
-            $state['message_type'] = 'warning';
+            $state['message'] = 'Validated 0 sitemap file(s) totaling 0 URL(s).';
+            $state['message_type'] = 'success';
         } else {
             $state['message'] = sprintf('Validated %d sitemap file(s) totaling %d URL(s).', count($rows), $total_urls);
             $state['message_type'] = 'success';
@@ -3278,7 +3450,16 @@ CSS;
         $base_url = $storage['url'];
 
         foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+        foreach (glob($dir . 'products-*.xml') ?: [] as $old) { @unlink($old); }
         @unlink($dir . 'sitemap-index.xml');
+        @unlink($dir . 'vpp-index.xml');
+        if (!empty($storage['legacy_dir']) && is_dir($storage['legacy_dir'])) {
+            foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+            foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+            @unlink($storage['legacy_dir'] . 'sitemap-index.xml');
+            @unlink($storage['legacy_dir'] . 'sitemap_index.xml');
+            @unlink($storage['legacy_dir'] . 'vpp-index.xml');
+        }
 
         $write_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err) {
             if (empty($entries)) { return true; }
@@ -3343,10 +3524,16 @@ CSS;
         $index_xml .= '</sitemapindex>';
         if (@file_put_contents($index_path, $index_xml) === false) { $err = 'Failed to write sitemap-index.xml'; return false; }
         @file_put_contents($dir . 'sitemap_index.xml', $index_xml);
+        @file_put_contents($dir . 'vpp-index.xml', $index_xml);
         if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
             @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $index_xml);
             @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $index_xml);
+            @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $index_xml);
         }
+
+        $meta = $this->get_sitemap_meta();
+        $meta['base_url'] = $base_url;
+        $this->save_sitemap_meta($meta);
 
         $summary = sprintf('Generated %d sitemap file(s) covering %d product(s).', count($files), $total);
         return true;
@@ -3490,6 +3677,69 @@ CSS;
     }
 
     /* ========= FRONT RENDER ========= */
+
+    public function maybe_output_sitemap() {
+        $mode = get_query_var(self::SITEMAP_QUERY_VAR);
+        if (!$mode) {
+            return;
+        }
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            status_header(404);
+            exit;
+        }
+        $path = '';
+        if ($mode === 'index') {
+            $refresh_err = null;
+            if ($this->refresh_sitemap_index($storage, $refresh_err) === false && $refresh_err) {
+                error_log('VPP sitemap refresh failed: ' . $refresh_err);
+            }
+            $candidates = [
+                $storage['dir'] . 'sitemap_index.xml',
+                $storage['dir'] . 'sitemap-index.xml',
+            ];
+            foreach ($candidates as $candidate) {
+                if (@is_readable($candidate)) {
+                    $path = $candidate;
+                    break;
+                }
+            }
+        } elseif ($mode === 'file') {
+            $requested = get_query_var(self::SITEMAP_FILE_QUERY_VAR);
+            if (!is_string($requested) || $requested === '') {
+                status_header(404);
+                exit;
+            }
+            if (!preg_match('/^[a-z0-9\-]+\.xml$/i', $requested)) {
+                status_header(404);
+                exit;
+            }
+            if (strcasecmp($requested, 'vpp-index.xml') === 0) {
+                $refresh_err = null;
+                if ($this->refresh_sitemap_index($storage, $refresh_err) === false && $refresh_err) {
+                    error_log('VPP sitemap refresh failed: ' . $refresh_err);
+                }
+            }
+            $path = $storage['dir'] . $requested;
+            if (!@is_readable($path)) {
+                status_header(404);
+                exit;
+            }
+        } else {
+            return;
+        }
+        if ($path === '') {
+            status_header(404);
+            exit;
+        }
+        header('Content-Type: application/xml; charset=UTF-8');
+        header('X-Robots-Tag: noindex, follow', true);
+        header('Cache-Control: no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
+        readfile($path);
+        exit;
+    }
 
     public function maybe_render_vpp() {
         $slug = $this->current_vpp_slug();
