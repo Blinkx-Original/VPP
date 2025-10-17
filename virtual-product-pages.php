@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.5.3
+ * Version: 1.5.4
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 48;
     const CATEGORY_CACHE_TTL = 1800; // 30 minutes
     const CATEGORY_RESERVED_SLUGS = ['page', 'feed', 'tag', 'category', 'amp', 'index'];
-    const VERSION = '1.5.3';
+    const VERSION = '1.5.4';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -4633,6 +4633,10 @@ CSS;
         $total_pages = isset($context['total_pages']) ? (int)$context['total_pages'] : 1;
         $count_label = $this->format_items_label($total);
         $inline_css = $this->current_inline_css;
+        if ($inline_css === '') {
+            $inline_css = $this->load_css_contents();
+            $this->current_inline_css = $inline_css;
+        }
 
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
@@ -4646,6 +4650,7 @@ CSS;
         $base_url = home_url('/p-cat/');
 
         echo '<main class="vpp-container vpp-categories">';
+        echo '<div class="vpp">';
         echo '<section class="vpp card-elevated vpp-cat-hero">';
         echo '<h1 class="vpp-cat-title">' . esc_html__('Categories', 'virtual-product-pages') . '</h1>';
         echo '<p class="vpp-cat-subtitle">' . esc_html($count_label) . '</p>';
@@ -4673,6 +4678,7 @@ CSS;
 
         $this->output_category_json_ld($context);
 
+        echo '</div>';
         echo '</main>';
 
         get_footer();
@@ -4687,6 +4693,10 @@ CSS;
         $slug = isset($context['slug']) ? $context['slug'] : '';
         $count_label = $this->format_items_label($count);
         $inline_css = $this->current_inline_css;
+        if ($inline_css === '') {
+            $inline_css = $this->load_css_contents();
+            $this->current_inline_css = $inline_css;
+        }
 
         @header('Content-Type: text/html; charset=utf-8');
         @header('Cache-Control: public, max-age=300');
@@ -4700,6 +4710,7 @@ CSS;
         $base_url = home_url('/p-cat/' . $slug . '/');
 
         echo '<main class="vpp-container vpp-category-archive">';
+        echo '<div class="vpp">';
         echo '<section class="vpp card-elevated vpp-archive-hero">';
         echo '<h1 class="vpp-archive-title">' . esc_html($name) . '</h1>';
         $subtitle = $count_label;
@@ -4758,6 +4769,7 @@ CSS;
 
         $this->output_category_json_ld($context);
 
+        echo '</div>';
         echo '</main>';
 
         get_footer();
