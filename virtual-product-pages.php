@@ -12,6 +12,7 @@ if (!defined('ABSPATH')) { exit; }
 class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
+    const VERSION_OPTION = 'vpp_version';
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
@@ -160,6 +161,9 @@ CSS;
     private $current_meta_description = '';
     private $current_canonical = '';
     private $table_columns_cache = [];
+    private $current_category_context = null;
+    private $category_slug_map = null;
+    private $category_cache = null;
 
     public static function instance() {
         if (self::$instance === null) { self::$instance = new self(); }
@@ -313,7 +317,7 @@ CSS;
 
     public function enqueue_assets() {
         wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
-        if ($this->current_vpp_slug()) {
+        if ($this->current_vpp_slug() || $this->is_category_request()) {
             wp_enqueue_style('vpp-styles');
             $inline = $this->load_css_contents();
             if ($inline !== '') {
@@ -325,6 +329,14 @@ CSS;
     public function filter_body_class($classes) {
         if ($this->current_vpp_slug()) {
             $classes[] = 'vpp-body';
+        } elseif ($this->is_category_request()) {
+            $classes[] = 'vpp-body';
+            $classes[] = 'vpp-category-page';
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context) {
+                $classes[] = $context['type'] === 'archive' ? 'vpp-category-archive' : 'vpp-category-index';
+            }
         }
         return $classes;
     }
@@ -336,6 +348,7 @@ CSS;
         add_submenu_page('vpp_settings', 'Connectivity', 'Connectivity', 'manage_options', 'vpp_settings', [$this, 'render_connectivity_page']);
         add_submenu_page('vpp_settings', 'Publishing', 'Publishing', 'manage_options', 'vpp_publishing', [$this, 'render_publishing_page']);
         add_submenu_page('vpp_settings', 'Edit Product', 'Edit Product', 'manage_options', 'vpp_edit', [$this, 'render_edit_page']);
+        add_submenu_page('vpp_settings', 'Categories', 'Categories', 'manage_options', 'vpp_categories', [$this, 'render_categories_page']);
         add_submenu_page('vpp_settings', 'VPP Status', 'VPP Status', 'manage_options', 'vpp_status', [$this, 'render_status_page']);
     }
 
@@ -414,6 +427,7 @@ CSS;
             <h2 class="title">Test Connections</h2>
             <p>Verify credentials without publishing anything.</p>
             <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                <?php $category_options = $this->get_all_category_names(); ?>
                 <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
                     <input type="hidden" name="action" value="vpp_test_tidb"/>
                     <?php wp_nonce_field(self::NONCE_KEY); ?>
@@ -1008,6 +1022,11 @@ CSS;
             $formatted = number_format_i18n($value, 2);
         }
         return $formatted . ' ' . $units[$power];
+    }
+
+    private function format_items_label($count) {
+        $count = (int)$count;
+        return sprintf(_n('%d item', '%d items', $count, 'virtual-product-pages'), $count);
     }
 
     public function maybe_admin_notice() {
@@ -2457,6 +2476,471 @@ CSS;
         return implode('', $parts);
     }
 
+    private function get_category_column($mysqli, $table) {
+        static $cache = [];
+        $table_clean = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
+        if ($table_clean === '') {
+            return '';
+        }
+        if (isset($cache[$table_clean])) {
+            return $cache[$table_clean];
+        }
+        $columns = $this->get_table_columns($mysqli, $table_clean);
+        foreach (['category', 'Category', 'CATEGORY'] as $candidate) {
+            if (in_array($candidate, $columns, true)) {
+                return $cache[$table_clean] = $candidate;
+            }
+        }
+        return $cache[$table_clean] = '';
+    }
+
+    private function build_category_select_clause($mysqli, $table) {
+        $col = $this->get_category_column($mysqli, $table);
+        if ($col === '') {
+            return ", '' AS category";
+        }
+        $col_esc = $mysqli->real_escape_string($col);
+        return ", `{$col_esc}` AS category";
+    }
+
+    private function slugify_category_value($value) {
+        $value = trim((string)$value);
+        if ($value === '') {
+            return 'category';
+        }
+        if (function_exists('remove_accents')) {
+            $value = remove_accents($value);
+        } elseif (class_exists('Transliterator')) {
+            $trans = @Transliterator::create('Any-Latin; Latin-ASCII');
+            if ($trans instanceof Transliterator) {
+                $value = $trans->transliterate($value);
+            }
+        } else {
+            $converted = @iconv('UTF-8', 'ASCII//TRANSLIT', $value);
+            if ($converted !== false) {
+                $value = $converted;
+            }
+        }
+        $value = strtolower((string)$value);
+        $value = preg_replace('/[_\s]+/', '-', $value);
+        $value = preg_replace('/[^a-z0-9\-]/', '', $value);
+        $value = preg_replace('/-+/', '-', $value);
+        $value = trim($value, '-');
+        if ($value === '') {
+            $value = 'category';
+        }
+        if (in_array($value, self::CATEGORY_RESERVED_SLUGS, true)) {
+            $value .= '-cat';
+        }
+        return $value;
+    }
+
+    private function assign_category_slugs(array $rows) {
+        $groups = [];
+        foreach ($rows as $row) {
+            $name = $row['name'];
+            $base = $this->slugify_category_value($name);
+            if (!isset($groups[$base])) {
+                $groups[$base] = [];
+            }
+            $groups[$base][] = $row;
+        }
+
+        $entries = [];
+        $map = [];
+        foreach ($groups as $base => $items) {
+            usort($items, function($a, $b) {
+                $lenA = function_exists('mb_strlen') ? mb_strlen($a['name']) : strlen($a['name']);
+                $lenB = function_exists('mb_strlen') ? mb_strlen($b['name']) : strlen($b['name']);
+                if ($lenA === $lenB) {
+                    return strcasecmp($a['name'], $b['name']);
+                }
+                return $lenB <=> $lenA;
+            });
+            $suffix = 2;
+            foreach ($items as $index => $item) {
+                $slug = $base;
+                if ($index > 0) {
+                    $slug = $base . '-' . $suffix++;
+                    $this->log_error('category_slug', sprintf('Category slug collision for "%s" (base %s); assigned %s.', $item['name'], $base, $slug));
+                }
+                $entries[] = [
+                    'slug' => $slug,
+                    'name' => $item['name'],
+                    'count' => (int)($item['count'] ?? 0),
+                    'last_updated' => $item['last_updated'] ?? '',
+                ];
+                $map[$slug] = $item['name'];
+            }
+        }
+
+        usort($entries, function($a, $b) {
+            return strcasecmp($a['name'], $b['name']);
+        });
+
+        return ['list' => $entries, 'map' => $map];
+    }
+
+    private function get_category_transient_key($type, $slug = '', $per_page = 0) {
+        if ($type === 'index') {
+            return 'vpp_cat_index';
+        }
+        if ($type === 'archive') {
+            $slug = sanitize_title($slug);
+            $per_page = (int)$per_page;
+            return 'vpp_cat_archive_' . md5($slug . '|' . $per_page);
+        }
+        return '';
+    }
+
+    private function get_category_per_page() {
+        $per_page = (int)apply_filters('vpp_category_per_page', self::CATEGORY_PER_PAGE_DEFAULT);
+        if ($per_page < 1) {
+            $per_page = self::CATEGORY_PER_PAGE_DEFAULT;
+        }
+        if ($per_page > self::CATEGORY_PER_PAGE_MAX) {
+            $per_page = self::CATEGORY_PER_PAGE_MAX;
+        }
+        return $per_page;
+    }
+
+    private function get_category_cache($force_refresh = false, &$err = null) {
+        if ($force_refresh) {
+            delete_transient($this->get_category_transient_key('index'));
+            $this->category_cache = null;
+            $this->category_slug_map = null;
+        }
+        if (is_array($this->category_cache)) {
+            return $this->category_cache;
+        }
+        $cache = get_transient($this->get_category_transient_key('index'));
+        if (is_array($cache) && isset($cache['categories'], $cache['map'])) {
+            $this->category_cache = $cache;
+            $this->category_slug_map = $cache['map'];
+            return $cache;
+        }
+
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return null;
+        }
+
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            @$mysqli->close();
+            $empty = ['categories' => [], 'map' => [], 'column' => '', 'generated' => time()];
+            $this->category_cache = $empty;
+            $this->category_slug_map = [];
+            set_transient($this->get_category_transient_key('index'), $empty, self::CATEGORY_CACHE_TTL);
+            return $empty;
+        }
+
+        $column = $this->get_category_column($mysqli, $table);
+        if ($column === '') {
+            @$mysqli->close();
+            $empty = ['categories' => [], 'map' => [], 'column' => '', 'generated' => time()];
+            $this->category_cache = $empty;
+            $this->category_slug_map = [];
+            set_transient($this->get_category_transient_key('index'), $empty, self::CATEGORY_CACHE_TTL);
+            return $empty;
+        }
+
+        $table_esc = $mysqli->real_escape_string($table);
+        $col_esc = $mysqli->real_escape_string($column);
+        $sql = "SELECT `{$col_esc}` AS category_name, COUNT(*) AS items, MAX(last_tidb_update_at) AS last_updated FROM `{$table_esc}` WHERE is_published = 1 AND `{$col_esc}` IS NOT NULL AND TRIM(`{$col_esc}`) <> '' GROUP BY `{$col_esc}`";
+        $res = @$mysqli->query($sql);
+        if (!$res) {
+            $err = 'Failed to load categories: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            @$mysqli->close();
+            return null;
+        }
+
+        $rows = [];
+        while ($row = $res->fetch_assoc()) {
+            $name = isset($row['category_name']) ? trim((string)$row['category_name']) : '';
+            if ($name === '') {
+                continue;
+            }
+            $rows[] = [
+                'name' => $name,
+                'count' => isset($row['items']) ? (int)$row['items'] : 0,
+                'last_updated' => $row['last_updated'] ?? '',
+            ];
+        }
+        $res->free();
+        @$mysqli->close();
+
+        $assigned = $this->assign_category_slugs($rows);
+        $cache = [
+            'categories' => $assigned['list'],
+            'map' => $assigned['map'],
+            'column' => $column,
+            'generated' => time(),
+        ];
+        $this->category_cache = $cache;
+        $this->category_slug_map = $assigned['map'];
+        set_transient($this->get_category_transient_key('index'), $cache, self::CATEGORY_CACHE_TTL);
+        return $cache;
+    }
+
+    private function get_category_index_data($page, $per_page, $force_refresh = false, &$err = null) {
+        $cache = $this->get_category_cache($force_refresh, $err);
+        if ($cache === null) {
+            return null;
+        }
+        $categories = isset($cache['categories']) && is_array($cache['categories']) ? $cache['categories'] : [];
+        $total = count($categories);
+        $per_page = max(1, (int)$per_page);
+        $total_pages = max(1, (int)ceil($total / $per_page));
+        if (($total > 0 && $page > $total_pages) || ($total === 0 && $page > 1)) {
+            return null;
+        }
+        $offset = max(0, ($page - 1) * $per_page);
+        $items = array_slice($categories, $offset, $per_page);
+        $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+        $canonical = $page > 1 ? trailingslashit(home_url('/p-cat/page/' . $page)) : trailingslashit(home_url('/p-cat/'));
+        $meta_description = $total > 0
+            ? sprintf(__('Explore %d product categories.', 'virtual-product-pages'), $total)
+            : __('No categories are available yet.', 'virtual-product-pages');
+        $title = sprintf(__('Categories | %s', 'virtual-product-pages'), $site);
+
+        return [
+            'type' => 'index',
+            'items' => $items,
+            'total' => $total,
+            'page' => max(1, (int)$page),
+            'per_page' => $per_page,
+            'total_pages' => $total_pages,
+            'offset' => $offset,
+            'canonical' => $canonical,
+            'meta_description' => $meta_description,
+            'title' => $title,
+        ];
+    }
+
+    private function get_category_archive_data($slug, $page, $per_page, &$err = null, $force_refresh = false) {
+        $slug = sanitize_title($slug);
+        if ($slug === '') {
+            return null;
+        }
+        $cache = $this->get_category_cache($force_refresh, $err);
+        if ($cache === null) {
+            return null;
+        }
+        $map = isset($cache['map']) && is_array($cache['map']) ? $cache['map'] : [];
+        if (!isset($map[$slug])) {
+            return null;
+        }
+        $category_name = $map[$slug];
+
+        $per_page = max(1, (int)$per_page);
+        $transient_key = $this->get_category_transient_key('archive', $slug, $per_page);
+        if ($force_refresh) {
+            delete_transient($transient_key);
+        }
+        $cached = get_transient($transient_key);
+        if (is_array($cached) && isset($cached['pages'][$page])) {
+            return $cached['pages'][$page];
+        }
+
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return null;
+        }
+
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            @$mysqli->close();
+            return null;
+        }
+
+        $column = $this->get_category_column($mysqli, $table);
+        if ($column === '') {
+            @$mysqli->close();
+            return null;
+        }
+
+        $table_esc = $mysqli->real_escape_string($table);
+        $col_esc = $mysqli->real_escape_string($column);
+        $count_sql = "SELECT COUNT(*) AS total, MAX(last_tidb_update_at) AS last_updated FROM `{$table_esc}` WHERE is_published = 1 AND `{$col_esc}` = ?";
+        $stmt = $mysqli->prepare($count_sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            @$mysqli->close();
+            return null;
+        }
+        $stmt->bind_param('s', $category_name);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $total_row = $res ? $res->fetch_assoc() : null;
+        $res && $res->free();
+        $stmt->close();
+        $total = $total_row && isset($total_row['total']) ? (int)$total_row['total'] : 0;
+        $last_updated = $total_row['last_updated'] ?? '';
+        $total_pages = max(1, (int)ceil($total / $per_page));
+        if ($total > 0 && $page > $total_pages) {
+            @$mysqli->close();
+            return null;
+        }
+        if ($total === 0 && $page > 1) {
+            @$mysqli->close();
+            return null;
+        }
+
+        $offset = max(0, ($page - 1) * $per_page);
+        $item_sql = "SELECT slug, title_h1, brand, model, short_summary, images_json, last_tidb_update_at FROM `{$table_esc}` WHERE is_published = 1 AND `{$col_esc}` = ? ORDER BY last_tidb_update_at DESC, id DESC LIMIT ? OFFSET ?";
+        $stmt = $mysqli->prepare($item_sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            @$mysqli->close();
+            return null;
+        }
+        $stmt->bind_param('sii', $category_name, $per_page, $offset);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $items = [];
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                $items[] = $row;
+            }
+            $res->free();
+        }
+        $stmt->close();
+        @$mysqli->close();
+
+        $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+        $canonical = $page > 1 ? trailingslashit(home_url('/p-cat/' . $slug . '/page/' . $page)) : trailingslashit(home_url('/p-cat/' . $slug));
+        $meta_description = $total > 0
+            ? sprintf(_n('%1$d item in %2$s.', '%1$d items in %2$s.', $total, 'virtual-product-pages'), $total, $category_name)
+            : sprintf(__('No products in %s yet.', 'virtual-product-pages'), $category_name);
+        if ($page > 1) {
+            $meta_description .= ' ' . sprintf(__('Page %d of %d.', 'virtual-product-pages'), $page, $total_pages);
+        }
+        $title = sprintf(__('%1$s — %2$d items | %3$s', 'virtual-product-pages'), $category_name, $total, $site);
+        if ($page > 1) {
+            $title = sprintf(__('%1$s — Page %2$d | %3$s', 'virtual-product-pages'), $category_name, $page, $site);
+        }
+
+        $data = [
+            'type' => 'archive',
+            'slug' => $slug,
+            'name' => $category_name,
+            'items' => $items,
+            'count' => $total,
+            'page' => max(1, (int)$page),
+            'per_page' => $per_page,
+            'total_pages' => $total_pages,
+            'offset' => $offset,
+            'canonical' => $canonical,
+            'meta_description' => $meta_description,
+            'title' => $title,
+            'last_updated' => $last_updated,
+        ];
+
+        if (!is_array($cached)) {
+            $cached = ['pages' => []];
+        }
+        if (!isset($cached['pages']) || !is_array($cached['pages'])) {
+            $cached['pages'] = [];
+        }
+        $cached['pages'][$page] = $data;
+        $cached['generated'] = time();
+        set_transient($transient_key, $cached, self::CATEGORY_CACHE_TTL);
+
+        return $data;
+    }
+
+    private function clear_category_caches(array $slugs = []) {
+        delete_transient($this->get_category_transient_key('index'));
+        $this->category_cache = null;
+        $this->category_slug_map = null;
+        if (empty($slugs)) {
+            return;
+        }
+        $per_page = $this->get_category_per_page();
+        foreach ($slugs as $slug) {
+            $slug = sanitize_title($slug);
+            if ($slug === '') {
+                continue;
+            }
+            delete_transient($this->get_category_transient_key('archive', $slug, $per_page));
+        }
+    }
+
+    private function get_category_slug_map() {
+        if (is_array($this->category_slug_map)) {
+            return $this->category_slug_map;
+        }
+        $err = null;
+        $cache = $this->get_category_cache(false, $err);
+        if (is_array($cache) && isset($cache['map']) && is_array($cache['map'])) {
+            return $this->category_slug_map = $cache['map'];
+        }
+        return [];
+    }
+
+    private function get_all_category_names() {
+        $err = null;
+        $cache = $this->get_category_cache(false, $err);
+        if (!is_array($cache) || empty($cache['categories']) || !is_array($cache['categories'])) {
+            return [];
+        }
+        $names = [];
+        foreach ($cache['categories'] as $item) {
+            if (!empty($item['name'])) {
+                $names[] = $item['name'];
+            }
+        }
+        $names = array_values(array_unique($names));
+        natcasesort($names);
+        return array_values($names);
+    }
+
+    private function purge_category_urls_by_names(array $names) {
+        $filtered = [];
+        foreach ($names as $name) {
+            $name = trim((string)$name);
+            if ($name !== '') {
+                $filtered[] = $name;
+            }
+        }
+        $filtered = array_values(array_unique($filtered));
+
+        $site = $this->get_settings()['cloudflare']['site_base'];
+        $index_url = $site ? rtrim($site, '/') . '/p-cat/' : home_url('/p-cat/');
+        $this->purge_cloudflare_url($index_url);
+
+        if (empty($filtered)) {
+            return;
+        }
+
+        $err = null;
+        $cache = $this->get_category_cache(true, $err);
+        $map = is_array($cache) && isset($cache['map']) && is_array($cache['map']) ? $cache['map'] : [];
+        $slugs = [];
+        foreach ($map as $slug => $label) {
+            if (in_array($label, $filtered, true)) {
+                $slugs[] = $slug;
+            }
+        }
+        foreach ($filtered as $name) {
+            $slug = array_search($name, $map, true);
+            if ($slug === false) {
+                $slugs[] = $this->slugify_category_value($name);
+            }
+        }
+        $slugs = array_values(array_unique(array_filter($slugs)));
+        foreach ($slugs as $slug) {
+            $url = $site ? rtrim($site, '/') . '/p-cat/' . $slug . '/' : home_url('/p-cat/' . $slug . '/');
+            $this->purge_cloudflare_url($url);
+        }
+    }
+
     private function sanitize_cta_label($value) {
         $value = sanitize_text_field($value ?? '');
         if (function_exists('mb_substr')) {
@@ -2485,7 +2969,8 @@ CSS;
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
+        $category_sql = $this->build_category_select_clause($mysqli, $table);
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -2509,7 +2994,8 @@ CSS;
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
+        $category_sql = $this->build_category_select_clause($mysqli, $table);
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -2582,6 +3068,17 @@ CSS;
                     <table class="form-table"><tbody>
                         <tr><th scope="row">Title (H1)</th><td><input type="text" name="title_h1" value="<?php echo esc_attr($row['title_h1']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Brand</th><td><input type="text" name="brand" value="<?php echo esc_attr($row['brand']); ?>" class="regular-text"></td></tr>
+                        <tr><th scope="row">Category</th><td>
+                            <input type="text" name="category" value="<?php echo esc_attr($row['category'] ?? ''); ?>" class="regular-text" list="vpp-category-options" placeholder="e.g. Air Compressors">
+                            <?php if (!empty($category_options)): ?>
+                                <datalist id="vpp-category-options">
+                                    <?php foreach ($category_options as $option): ?>
+                                        <option value="<?php echo esc_attr($option); ?>"></option>
+                                    <?php endforeach; ?>
+                                </datalist>
+                            <?php endif; ?>
+                            <p class="description">Leave blank to remove the category.</p>
+                        </td></tr>
                         <tr><th scope="row">Model</th><td><input type="text" name="model" value="<?php echo esc_attr($row['model']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">SKU</th><td><input type="text" name="sku" value="<?php echo esc_attr($row['sku']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Short summary (max 150 chars)</th><td><input type="text" maxlength="150" name="short_summary" value="<?php echo esc_attr($row['short_summary'] ?? ''); ?>" class="regular-text"></td></tr>
@@ -2662,6 +3159,68 @@ CSS;
         <?php
     }
 
+    public function render_categories_page() {
+        if (!current_user_can('manage_options')) return;
+        $search = isset($_GET['s']) ? sanitize_text_field(wp_unslash($_GET['s'])) : '';
+        $err = null;
+        $cache = $this->get_category_cache(false, $err);
+        $categories = [];
+        if (is_array($cache) && isset($cache['categories']) && is_array($cache['categories'])) {
+            $categories = $cache['categories'];
+        }
+        if ($search !== '') {
+            $categories = array_values(array_filter($categories, function($item) use ($search) {
+                return isset($item['name']) && stripos($item['name'], $search) !== false;
+            }));
+        }
+        ?>
+        <div class="wrap">
+            <h1><?php esc_html_e('Categories', 'virtual-product-pages'); ?></h1>
+
+            <form method="get" class="vpp-cat-search" style="margin:1rem 0;">
+                <input type="hidden" name="page" value="vpp_categories"/>
+                <label class="screen-reader-text" for="vpp-cat-search"><?php esc_html_e('Search categories', 'virtual-product-pages'); ?></label>
+                <input type="search" id="vpp-cat-search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="<?php esc_attr_e('Search categories…', 'virtual-product-pages'); ?>"/>
+                <?php submit_button(__('Search', 'virtual-product-pages'), 'secondary', '', false); ?>
+            </form>
+
+            <?php if ($err): ?>
+                <div class="notice notice-error"><p><?php echo esc_html($err); ?></p></div>
+            <?php endif; ?>
+
+            <table class="widefat striped" style="max-width:720px;">
+                <thead>
+                    <tr>
+                        <th><?php esc_html_e('Category', 'virtual-product-pages'); ?></th>
+                        <th><?php esc_html_e('Count', 'virtual-product-pages'); ?></th>
+                        <th><?php esc_html_e('Link', 'virtual-product-pages'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($categories)): ?>
+                        <tr><td colspan="3"><?php esc_html_e('No categories found.', 'virtual-product-pages'); ?></td></tr>
+                    <?php else: ?>
+                        <?php foreach ($categories as $item): ?>
+                            <tr>
+                                <td><?php echo esc_html($item['name']); ?></td>
+                                <td><?php echo esc_html(number_format_i18n((int)($item['count'] ?? 0))); ?></td>
+                                <td>
+                                    <?php if (!empty($item['slug'])): ?>
+                                        <?php $url = home_url('/p-cat/' . $item['slug'] . '/'); ?>
+                                        <a href="<?php echo esc_url($url); ?>" target="_blank" rel="noopener noreferrer"><?php echo esc_html($url); ?></a>
+                                    <?php else: ?>
+                                        —
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php
+    }
+
     public function handle_edit_load() {
         if (!current_user_can('manage_options')) wp_die('Forbidden');
         check_admin_referer(self::NONCE_KEY);
@@ -2685,6 +3244,10 @@ CSS;
         $brand = sanitize_text_field($_POST['brand'] ?? '');
         $model = sanitize_text_field($_POST['model'] ?? '');
         $sku = sanitize_text_field($_POST['sku'] ?? '');
+        $category_input = sanitize_text_field($_POST['category'] ?? '');
+        if (function_exists('mb_substr')) { $category_input = mb_substr($category_input, 0, 120); }
+        else { $category_input = substr($category_input, 0, 120); }
+        $category_input = trim($category_input);
         $short_summary = sanitize_text_field($_POST['short_summary'] ?? '');
         if (strlen($short_summary) > 150) $short_summary = substr($short_summary, 0, 150);
         $meta_description = sanitize_text_field($_POST['meta_description'] ?? '');
@@ -2704,6 +3267,15 @@ CSS;
         $schema_json_raw = trim($schema_json_raw);
         $clear_schema = !empty($_POST['schema_json_clear']);
 
+        $previous_category = '';
+        if ($id > 0) {
+            $prev_err = null;
+            $prev_row = $this->fetch_product_by_id($id, $prev_err);
+            if (is_array($prev_row) && isset($prev_row['category'])) {
+                $previous_category = trim((string)$prev_row['category']);
+            }
+        }
+
         $err = null;
         $s = $this->get_settings();
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
@@ -2716,6 +3288,7 @@ CSS;
         $this->ensure_schema_json_column($mysqli, $table);
         $this->ensure_cta_label_columns($mysqli, $table);
         $existing_cols = array_flip($this->get_table_columns($mysqli, $table));
+        $category_col = $this->get_category_column($mysqli, $table);
 
         $current_schema = null;
         if (isset($existing_cols['schema_json'])) {
@@ -2769,6 +3342,9 @@ CSS;
             'desc_html' => $desc_html,
             'is_published' => $is_published,
         ];
+        if ($category_col !== '' && isset($existing_cols[$category_col])) {
+            $cols[$category_col] = $category_input;
+        }
         $set_parts = [];
         $bind_types = '';
         $bind_values = [];
@@ -2825,7 +3401,11 @@ CSS;
             $site = $this->get_settings()['cloudflare']['site_base'];
             $url = $site ? rtrim($site,'/') . '/p/' . $slug : home_url('/p/' . $slug);
             $this->purge_cloudflare_url($url);
+            $this->purge_category_urls_by_names([$previous_category, $category_input]);
             $inline = 'ok'; $inline_msg = 'Saved & purged'; $top_msg = 'Saved and purged Cloudflare.';
+        }
+        if ($ok) {
+            $this->clear_category_caches();
         }
         if ($ok && isset($_POST['do_push_algolia'])) {
             $p = $this->fetch_product_by_id($id, $tmp);
@@ -3651,6 +4231,14 @@ CSS;
 
         @$mysqli->close();
 
+        $cat_err = null;
+        $category_entry = $this->write_category_sitemap($cat_err);
+        if (is_array($category_entry)) {
+            $files[] = ['loc' => $category_entry['url'], 'lastmod' => $category_entry['lastmod']];
+        } elseif (!empty($cat_err)) {
+            $this->log_error('sitemap', $cat_err);
+        }
+
         $index_path = $dir . 'sitemap-index.xml';
         $index_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
         $index_xml .= '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
@@ -3683,6 +4271,10 @@ CSS;
         if (!empty($purge_files)) {
             $this->purge_sitemap_cache($storage, $purge_files);
         }
+
+        $meta = $this->get_sitemap_meta();
+        $meta['base_url'] = $base_url;
+        $this->save_sitemap_meta($meta);
 
         $summary = sprintf('Generated %d sitemap file(s) covering %d product(s).', count($files), $total);
         return true;
@@ -3752,6 +4344,49 @@ CSS;
         return null;
     }
 
+    private function current_category_slug() {
+        $slug = get_query_var(self::CATEGORY_SLUG_QUERY_VAR);
+        if (!$slug) {
+            return null;
+        }
+        $slug = sanitize_title($slug);
+        return $slug === '' ? null : $slug;
+    }
+
+    private function current_category_page() {
+        $page = get_query_var(self::CATEGORY_PAGE_QUERY_VAR);
+        if (!$page) {
+            return 1;
+        }
+        $page = (int)$page;
+        return $page > 0 ? $page : 1;
+    }
+
+    private function is_category_request() {
+        $index = get_query_var(self::CATEGORY_INDEX_QUERY_VAR);
+        $slug = get_query_var(self::CATEGORY_SLUG_QUERY_VAR);
+        return !empty($index) || !empty($slug);
+    }
+
+    private function ensure_category_context(&$err = null) {
+        if (is_array($this->current_category_context)) {
+            return $this->current_category_context;
+        }
+        if (!$this->is_category_request()) {
+            return null;
+        }
+        $per_page = $this->get_category_per_page();
+        $page = $this->current_category_page();
+        $slug = $this->current_category_slug();
+        $context = $slug
+            ? $this->get_category_archive_data($slug, $page, $per_page, $err)
+            : $this->get_category_index_data($page, $per_page, false, $err);
+        if ($context) {
+            $this->current_category_context = $context;
+        }
+        return $this->current_category_context;
+    }
+
     private function get_current_product(&$err = null) {
         $slug = $this->current_vpp_slug();
         if (!$slug) {
@@ -3773,33 +4408,62 @@ CSS;
 
     public function filter_canonical($url) {
         $slug = $this->current_vpp_slug();
-        if (!$slug) return $url;
-        return home_url('/p/' . $slug);
+        if ($slug) {
+            return home_url('/p/' . $slug);
+        }
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context && !empty($context['canonical'])) {
+                return $context['canonical'];
+            }
+        }
+        return $url;
     }
 
     public function filter_document_title($title) {
-        if (!$this->current_vpp_slug()) return $title;
-        $err = null;
-        $p = $this->get_current_product($err);
-        if (!$p) return $title;
-        $base = $p['title_h1'] ?: $p['slug'];
-        $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
-        return $base . ' | ' . $site;
+        if ($this->current_vpp_slug()) {
+            $err = null;
+            $p = $this->get_current_product($err);
+            if (!$p) return $title;
+            $base = $p['title_h1'] ?: $p['slug'];
+            $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+            return $base . ' | ' . $site;
+        }
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context && !empty($context['title'])) {
+                return $context['title'];
+            }
+        }
+        return $title;
     }
 
     public function filter_yoast_metadesc($value) {
-        if (!$this->current_vpp_slug()) return $value;
-        $err = null;
-        $p = $this->get_current_product($err);
-        if (!$p) return $value;
-        $meta = $this->build_meta_description($p);
-        $this->last_meta_source = 'Yoast filter';
-        $this->last_meta_value = $meta;
-        return $meta;
+        if ($this->current_vpp_slug()) {
+            $err = null;
+            $p = $this->get_current_product($err);
+            if (!$p) return $value;
+            $meta = $this->build_meta_description($p);
+            $this->last_meta_source = 'Yoast filter';
+            $this->last_meta_value = $meta;
+            return $meta;
+        }
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context && !empty($context['meta_description'])) {
+                $this->last_meta_source = 'Category';
+                $this->last_meta_value = $context['meta_description'];
+                return $context['meta_description'];
+            }
+        }
+        return $value;
     }
 
     public function filter_yoast_presenters($presenters) {
-        if (!$this->current_vpp_slug()) {
+        if (!$this->current_vpp_slug() && !$this->is_category_request()) {
             return $presenters;
         }
         if (!is_array($presenters)) {
@@ -3899,12 +4563,381 @@ CSS;
         $product = $this->get_current_product($err);
         if (!$product || empty($product['is_published'])) {
             status_header(404);
-            nocache_headers();
-            echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
             exit;
         }
-        $this->render_product($product);
+        $path = '';
+        if ($mode === 'index') {
+            $refresh_err = null;
+            if ($this->refresh_sitemap_index($storage, $refresh_err) === false && $refresh_err) {
+                error_log('VPP sitemap refresh failed: ' . $refresh_err);
+            }
+            $candidates = [
+                $storage['dir'] . 'sitemap_index.xml',
+                $storage['dir'] . 'sitemap-index.xml',
+            ];
+            foreach ($candidates as $candidate) {
+                if (@is_readable($candidate)) {
+                    $path = $candidate;
+                    break;
+                }
+            }
+        } elseif ($mode === 'file') {
+            $requested = get_query_var(self::SITEMAP_FILE_QUERY_VAR);
+            if (!is_string($requested) || $requested === '') {
+                status_header(404);
+                exit;
+            }
+            if (!preg_match('/^[a-z0-9\-]+\.xml$/i', $requested)) {
+                status_header(404);
+                exit;
+            }
+            if (strcasecmp($requested, 'vpp-index.xml') === 0) {
+                $refresh_err = null;
+                if ($this->refresh_sitemap_index($storage, $refresh_err) === false && $refresh_err) {
+                    error_log('VPP sitemap refresh failed: ' . $refresh_err);
+                }
+            }
+            $path = $storage['dir'] . $requested;
+            if (!@is_readable($path)) {
+                status_header(404);
+                exit;
+            }
+        } else {
+            return;
+        }
+        if ($path === '') {
+            status_header(404);
+            exit;
+        }
+        header('Content-Type: application/xml; charset=UTF-8');
+        header('X-Robots-Tag: noindex, follow', true);
+        header('Cache-Control: no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
+        readfile($path);
         exit;
+    }
+
+    public function maybe_render_vpp() {
+        $slug = $this->current_vpp_slug();
+        if ($slug) {
+            $err = null;
+            $product = $this->get_current_product($err);
+            if (!$product || empty($product['is_published'])) {
+                status_header(404);
+                nocache_headers();
+                echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
+                exit;
+            }
+            $this->render_product($product);
+            exit;
+        }
+
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if (!$context) {
+                $this->render_category_not_found();
+                exit;
+            }
+
+            if (($context['type'] ?? '') === 'archive') {
+                $this->render_category_archive($context);
+            } else {
+                $this->render_category_index($context);
+            }
+            exit;
+        }
+    }
+
+    private function build_category_page_url($base, $page) {
+        $base = trailingslashit($base);
+        if ($page <= 1) {
+            return $base;
+        }
+        return trailingslashit($base . 'page/' . (int)$page);
+    }
+
+    private function render_category_pagination($current, $total, $base_url) {
+        $current = (int)$current;
+        $total = (int)$total;
+        if ($total <= 1) {
+            return;
+        }
+        $base_url = trailingslashit($base_url);
+        $start = max(1, $current - 2);
+        $end = min($total, $current + 2);
+        echo '<nav class="vpp-pagination" aria-label="Pagination"><ul class="vpp-pagination-list">';
+        if ($current > 1) {
+            $prev = $this->build_category_page_url($base_url, $current - 1);
+            echo '<li class="vpp-page-item"><a class="vpp-page-link" href="' . esc_url($prev) . '">' . esc_html__('Prev', 'virtual-product-pages') . '</a></li>';
+        } else {
+            echo '<li class="vpp-page-item disabled"><span class="vpp-page-link">' . esc_html__('Prev', 'virtual-product-pages') . '</span></li>';
+        }
+        for ($i = $start; $i <= $end; $i++) {
+            $url = $this->build_category_page_url($base_url, $i);
+            if ($i === $current) {
+                echo '<li class="vpp-page-item active"><span class="vpp-page-link" aria-current="page">' . esc_html($i) . '</span></li>';
+            } else {
+                echo '<li class="vpp-page-item"><a class="vpp-page-link" href="' . esc_url($url) . '">' . esc_html($i) . '</a></li>';
+            }
+        }
+        if ($current < $total) {
+            $next = $this->build_category_page_url($base_url, $current + 1);
+            echo '<li class="vpp-page-item"><a class="vpp-page-link" href="' . esc_url($next) . '">' . esc_html__('Next', 'virtual-product-pages') . '</a></li>';
+        } else {
+            echo '<li class="vpp-page-item disabled"><span class="vpp-page-link">' . esc_html__('Next', 'virtual-product-pages') . '</span></li>';
+        }
+        echo '</ul></nav>';
+    }
+
+    private function render_category_index($context) {
+        $items = isset($context['items']) ? $context['items'] : [];
+        $total = isset($context['total']) ? (int)$context['total'] : 0;
+        $page = isset($context['page']) ? (int)$context['page'] : 1;
+        $total_pages = isset($context['total_pages']) ? (int)$context['total_pages'] : 1;
+        $count_label = $this->format_items_label($total);
+        $inline_css = $this->current_inline_css;
+        if ($inline_css === '') {
+            $inline_css = $this->load_css_contents();
+            $this->current_inline_css = $inline_css;
+        }
+
+        @header('Content-Type: text/html; charset=utf-8');
+        @header('Cache-Control: public, max-age=300');
+
+        get_header();
+
+        if ($inline_css !== '') {
+            echo '<style id="vpp-inline-css-fallback">' . $inline_css . '</style>';
+        }
+
+        $base_url = home_url('/p-cat/');
+
+        echo '<main class="vpp-container vpp-categories">';
+        echo '<div class="vpp">';
+        echo '<section class="vpp card-elevated vpp-cat-hero">';
+        echo '<h1 class="vpp-cat-title">' . esc_html__('Categories', 'virtual-product-pages') . '</h1>';
+        echo '<p class="vpp-cat-subtitle">' . esc_html($count_label) . '</p>';
+        echo '</section>';
+
+        if (empty($items)) {
+            echo '<section class="vpp card vpp-cat-empty"><p>' . esc_html__('No categories yet.', 'virtual-product-pages') . '</p></section>';
+        } else {
+            echo '<section class="vpp card vpp-cat-grid-wrap">';
+            echo '<div class="vpp-cat-grid">';
+            foreach ($items as $item) {
+                $slug = $item['slug'];
+                $name = $item['name'];
+                $count = isset($item['count']) ? (int)$item['count'] : 0;
+                $href = $this->build_category_page_url(home_url('/p-cat/' . $slug . '/'), 1);
+                echo '<a class="vpp-cat-card" href="' . esc_url($href) . '" aria-label="' . esc_attr(sprintf(__('View category: %s', 'virtual-product-pages'), $name)) . '">';
+                echo '<span class="vpp-cat-name">' . esc_html($name) . '</span>';
+                echo '<span class="vpp-cat-count">' . esc_html($this->format_items_label($count)) . '</span>';
+                echo '</a>';
+            }
+            echo '</div>';
+            echo '</section>';
+            $this->render_category_pagination($page, $total_pages, $base_url);
+        }
+
+        $this->output_category_json_ld($context);
+
+        echo '</div>';
+        echo '</main>';
+
+        get_footer();
+    }
+
+    private function render_category_archive($context) {
+        $items = isset($context['items']) ? $context['items'] : [];
+        $count = isset($context['count']) ? (int)$context['count'] : 0;
+        $page = isset($context['page']) ? (int)$context['page'] : 1;
+        $total_pages = isset($context['total_pages']) ? (int)$context['total_pages'] : 1;
+        $name = isset($context['name']) ? $context['name'] : '';
+        $slug = isset($context['slug']) ? $context['slug'] : '';
+        $count_label = $this->format_items_label($count);
+        $inline_css = $this->current_inline_css;
+        if ($inline_css === '') {
+            $inline_css = $this->load_css_contents();
+            $this->current_inline_css = $inline_css;
+        }
+
+        @header('Content-Type: text/html; charset=utf-8');
+        @header('Cache-Control: public, max-age=300');
+
+        get_header();
+
+        if ($inline_css !== '') {
+            echo '<style id="vpp-inline-css-fallback">' . $inline_css . '</style>';
+        }
+
+        $base_url = home_url('/p-cat/' . $slug . '/');
+
+        echo '<main class="vpp-container vpp-category-archive">';
+        echo '<div class="vpp">';
+        echo '<section class="vpp card-elevated vpp-archive-hero">';
+        echo '<h1 class="vpp-archive-title">' . esc_html($name) . '</h1>';
+        $subtitle = $count_label;
+        if ($total_pages > 1) {
+            $subtitle .= ' • ' . sprintf(__('Page %d of %d', 'virtual-product-pages'), $page, $total_pages);
+        }
+        echo '<p class="vpp-archive-subtitle">' . esc_html($subtitle) . '</p>';
+        echo '</section>';
+
+        if (empty($items)) {
+            echo '<section class="vpp card vpp-archive-empty"><p>' . esc_html__('No products in this category yet.', 'virtual-product-pages') . '</p></section>';
+        } else {
+            echo '<section class="vpp card vpp-archive-grid">';
+            foreach ($items as $item) {
+                $product_slug = $item['slug'];
+                if (!$product_slug) { continue; }
+                $title = $item['title_h1'] ?: $product_slug;
+                $brand = $item['brand'] ?? '';
+                $model = $item['model'] ?? '';
+                $summary = isset($item['short_summary']) ? trim((string)$item['short_summary']) : '';
+                if ($summary !== '' && function_exists('mb_substr')) {
+                    $summary = mb_substr($summary, 0, 160);
+                } elseif ($summary !== '') {
+                    $summary = substr($summary, 0, 160);
+                }
+                $parts = array_filter([$brand, $model]);
+                $meta = implode(' • ', $parts);
+                $images = [];
+                if (!empty($item['images_json'])) {
+                    $decoded = json_decode($item['images_json'], true);
+                    if (is_array($decoded)) {
+                        $images = $decoded;
+                    }
+                }
+                $href = home_url('/p/' . $product_slug . '/');
+                echo '<a class="vpp-archive-card" href="' . esc_url($href) . '">';
+                if (!empty($images) && !empty($images[0])) {
+                    echo '<div class="vpp-archive-thumb"><img src="' . esc_url($images[0]) . '" alt="' . esc_attr($title) . '" loading="lazy" decoding="async"></div>';
+                } else {
+                    echo '<div class="vpp-archive-thumb placeholder" aria-hidden="true"></div>';
+                }
+                echo '<div class="vpp-archive-body">';
+                echo '<h2 class="vpp-archive-card-title">' . esc_html($title) . '</h2>';
+                if ($meta !== '') {
+                    echo '<p class="vpp-archive-card-meta">' . esc_html($meta) . '</p>';
+                }
+                if ($summary !== '') {
+                    echo '<p class="vpp-archive-card-summary">' . esc_html($summary) . '</p>';
+                }
+                echo '</div>';
+                echo '</a>';
+            }
+            echo '</section>';
+            $this->render_category_pagination($page, $total_pages, $base_url);
+        }
+
+        $this->output_category_json_ld($context);
+
+        echo '</div>';
+        echo '</main>';
+
+        get_footer();
+    }
+
+    private function render_category_not_found() {
+        status_header(404);
+        nocache_headers();
+        echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>' . esc_html__('Category not found.', 'virtual-product-pages') . '</p></body></html>';
+    }
+
+    private function output_category_json_ld($context) {
+        if (!is_array($context) || empty($context['canonical'])) {
+            return;
+        }
+        $canonical = $context['canonical'];
+        $offset = isset($context['offset']) ? (int)$context['offset'] : 0;
+        $items = isset($context['items']) && is_array($context['items']) ? $context['items'] : [];
+        $breadcrumb = [
+            '@context' => 'https://schema.org',
+            '@type' => 'BreadcrumbList',
+            'itemListElement' => [
+                [
+                    '@type' => 'ListItem',
+                    'position' => 1,
+                    'name' => get_bloginfo('name'),
+                    'item' => home_url('/'),
+                ],
+                [
+                    '@type' => 'ListItem',
+                    'position' => 2,
+                    'name' => __('Categories', 'virtual-product-pages'),
+                    'item' => trailingslashit(home_url('/p-cat/')),
+                ],
+            ],
+        ];
+
+        if ($context['type'] === 'archive') {
+            $breadcrumb['itemListElement'][] = [
+                '@type' => 'ListItem',
+                'position' => 3,
+                'name' => $context['name'],
+                'item' => $context['canonical'],
+            ];
+            if ($context['page'] > 1) {
+                $breadcrumb['itemListElement'][] = [
+                    '@type' => 'ListItem',
+                    'position' => 4,
+                    'name' => sprintf(__('Page %d', 'virtual-product-pages'), $context['page']),
+                    'item' => $context['canonical'],
+                ];
+            }
+            $item_list = [];
+            $position = $offset + 1;
+            foreach ($items as $item) {
+                if (empty($item['slug'])) {
+                    continue;
+                }
+                $item_list[] = [
+                    '@type' => 'ListItem',
+                    'position' => $position++,
+                    'name' => $item['title_h1'] ?: $item['slug'],
+                    'url' => home_url('/p/' . $item['slug'] . '/'),
+                ];
+            }
+            $collection = [
+                '@context' => 'https://schema.org',
+                '@type' => 'CollectionPage',
+                'name' => $context['name'],
+                'url' => $canonical,
+                'mainEntity' => [
+                    '@type' => 'ItemList',
+                    'itemListOrder' => 'http://schema.org/ItemListOrderDescending',
+                    'itemListElement' => $item_list,
+                ],
+            ];
+        } else {
+            $breadcrumb['itemListElement'][1]['item'] = $canonical;
+            $item_list = [];
+            $position = $offset + 1;
+            foreach ($items as $item) {
+                $item_list[] = [
+                    '@type' => 'ListItem',
+                    'position' => $position++,
+                    'name' => $item['name'],
+                    'url' => $this->build_category_page_url(home_url('/p-cat/' . $item['slug'] . '/'), 1),
+                ];
+            }
+            $collection = [
+                '@context' => 'https://schema.org',
+                '@type' => 'CollectionPage',
+                'name' => __('Categories', 'virtual-product-pages'),
+                'url' => $canonical,
+                'mainEntity' => [
+                    '@type' => 'ItemList',
+                    'itemListOrder' => 'http://schema.org/ItemListOrderAscending',
+                    'itemListElement' => $item_list,
+                ],
+            ];
+        }
+
+        $payload = [$collection, $breadcrumb];
+        echo '<script type="application/ld+json">' . wp_json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . '</script>';
     }
 
     private function allowed_html() {
@@ -4063,43 +5096,66 @@ CSS;
     }
 
     public function output_meta_tags() {
-        if (!$this->current_vpp_slug()) {
-            return;
-        }
-
-        $err = null;
-        $product = $this->get_current_product($err);
-        if (!$product || empty($product['is_published'])) {
-            return;
-        }
-
-        $meta_description = $this->current_meta_description !== ''
-            ? $this->current_meta_description
-            : $this->build_meta_description($product);
-        $canonical = $this->current_canonical !== ''
-            ? $this->current_canonical
-            : home_url('/p/' . $product['slug']);
-
         $css_href = add_query_arg('ver', self::VERSION, plugins_url('assets/vpp.css', __FILE__));
+        if ($this->current_vpp_slug()) {
+            $err = null;
+            $product = $this->get_current_product($err);
+            if (!$product || empty($product['is_published'])) {
+                return;
+            }
 
-        if (!defined('WPSEO_VERSION')) {
-            echo '<link rel="canonical" href="' . esc_url($canonical) . '" />' . "\n";
+            $meta_description = $this->current_meta_description !== ''
+                ? $this->current_meta_description
+                : $this->build_meta_description($product);
+            $canonical = $this->current_canonical !== ''
+                ? $this->current_canonical
+                : home_url('/p/' . $product['slug']);
+
+            if (!defined('WPSEO_VERSION')) {
+                echo '<link rel="canonical" href="' . esc_url($canonical) . '" />' . "\n";
+            }
+
+            echo '<link rel="preload" href="' . esc_url($css_href) . '" as="style" />' . "\n";
+            echo '<meta name="description" content="' . esc_attr($meta_description) . '" data-vpp-meta="description" />' . "\n";
+            echo '<meta property="og:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="og-description" />' . "\n";
+            echo '<meta name="twitter:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="twitter-description" />' . "\n";
+
+            if ($this->last_meta_source === '') {
+                $this->last_meta_source = 'Manual tag';
+            }
+            $this->last_meta_value = $meta_description;
+            return;
         }
 
-        echo '<link rel="preload" href="' . esc_url($css_href) . '" as="style" />' . "\n";
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if (!$context) {
+                return;
+            }
+            $meta_description = $context['meta_description'] ?? '';
+            $canonical = $context['canonical'] ?? trailingslashit(home_url('/p-cat/'));
 
-        echo '<meta name="description" content="' . esc_attr($meta_description) . '" data-vpp-meta="description" />' . "\n";
-        echo '<meta property="og:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="og-description" />' . "\n";
-        echo '<meta name="twitter:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="twitter-description" />' . "\n";
+            if (!defined('WPSEO_VERSION')) {
+                echo '<link rel="canonical" href="' . esc_url($canonical) . '" />' . "\n";
+            }
 
-        if ($this->last_meta_source === '') {
-            $this->last_meta_source = 'Manual tag';
+            echo '<link rel="preload" href="' . esc_url($css_href) . '" as="style" />' . "\n";
+
+            if ($meta_description !== '') {
+                echo '<meta name="description" content="' . esc_attr($meta_description) . '" data-vpp-meta="description" />' . "\n";
+                echo '<meta property="og:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="og-description" />' . "\n";
+                echo '<meta name="twitter:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="twitter-description" />' . "\n";
+                if ($this->last_meta_source === '') {
+                    $this->last_meta_source = 'Category page';
+                }
+                $this->last_meta_value = $meta_description;
+            }
         }
-        $this->last_meta_value = $meta_description;
     }
 
     public function inject_inline_css_head() {
-        if (!$this->current_vpp_slug()) {
+        if (!$this->current_vpp_slug() && !$this->is_category_request()) {
             return;
         }
         $inline = $this->current_inline_css;
