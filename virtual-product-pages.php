@@ -12,6 +12,7 @@ if (!defined('ABSPATH')) { exit; }
 class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
+    const VERSION_OPTION = 'vpp_version';
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
@@ -146,6 +147,7 @@ CSS;
     const PUBLISH_STATE_OPTION = 'vpp_publish_state';
     const PUBLISH_HISTORY_OPTION = 'vpp_publish_history';
     const PUBLISH_RESUME_OPTION = 'vpp_publish_resume';
+    const CF_LAST_BATCH_OPTION = 'vpp_cf_last_batch';
 
     private static $instance = null;
 
@@ -160,6 +162,12 @@ CSS;
     private $current_meta_description = '';
     private $current_canonical = '';
     private $table_columns_cache = [];
+    private $current_category_context = null;
+    private $category_slug_map = null;
+    private $category_cache = null;
+    private $cf_recent_sitemaps = [];
+    private $cf_recent_sitemap_files = [];
+    private $cf_recent_product_slugs = [];
 
     public static function instance() {
         if (self::$instance === null) { self::$instance = new self(); }
@@ -189,6 +197,11 @@ CSS;
             add_action('admin_post_vpp_save_settings', [$this, 'handle_save_settings']);
             add_action('admin_post_vpp_test_tidb', [$this, 'handle_test_tidb']);
             add_action('admin_post_vpp_test_algolia', [$this, 'handle_test_algolia']);
+            add_action('admin_post_vpp_cf_test_connection', [$this, 'handle_cf_test_connection']);
+            add_action('admin_post_vpp_cf_test_purge', [$this, 'handle_cf_test_purge']);
+            add_action('admin_post_vpp_cf_purge_sitemaps', [$this, 'handle_cf_purge_sitemaps']);
+            add_action('admin_post_vpp_cf_purge_last_batch', [$this, 'handle_cf_purge_last_batch']);
+            add_action('admin_post_vpp_cf_purge_everything', [$this, 'handle_cf_purge_everything']);
             add_action('admin_post_vpp_push_publish', [$this, 'handle_push_publish']);
             add_action('admin_post_vpp_push_algolia', [$this, 'handle_push_algolia']);
             add_action('admin_post_vpp_publish_preview', [$this, 'handle_publish_preview']);
@@ -210,6 +223,9 @@ CSS;
         // Front assets
         add_action('wp_enqueue_scripts', [$this, 'enqueue_assets']);
         add_filter('body_class', [$this, 'filter_body_class']);
+
+        add_action('vpp_publish_completed', [$this, 'cf_on_publish_completed'], 10, 2);
+        add_action('vpp_rebuild_completed', [$this, 'cf_on_publish_completed'], 10, 2);
 
         // Canonical filters (Yoast/core)
         add_filter('wpseo_canonical', [$this, 'filter_canonical'], 99);
@@ -313,7 +329,7 @@ CSS;
 
     public function enqueue_assets() {
         wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
-        if ($this->current_vpp_slug()) {
+        if ($this->current_vpp_slug() || $this->is_category_request()) {
             wp_enqueue_style('vpp-styles');
             $inline = $this->load_css_contents();
             if ($inline !== '') {
@@ -325,6 +341,14 @@ CSS;
     public function filter_body_class($classes) {
         if ($this->current_vpp_slug()) {
             $classes[] = 'vpp-body';
+        } elseif ($this->is_category_request()) {
+            $classes[] = 'vpp-body';
+            $classes[] = 'vpp-category-page';
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context) {
+                $classes[] = $context['type'] === 'archive' ? 'vpp-category-archive' : 'vpp-category-index';
+            }
         }
         return $classes;
     }
@@ -336,6 +360,7 @@ CSS;
         add_submenu_page('vpp_settings', 'Connectivity', 'Connectivity', 'manage_options', 'vpp_settings', [$this, 'render_connectivity_page']);
         add_submenu_page('vpp_settings', 'Publishing', 'Publishing', 'manage_options', 'vpp_publishing', [$this, 'render_publishing_page']);
         add_submenu_page('vpp_settings', 'Edit Product', 'Edit Product', 'manage_options', 'vpp_edit', [$this, 'render_edit_page']);
+        add_submenu_page('vpp_settings', 'Categories', 'Categories', 'manage_options', 'vpp_categories', [$this, 'render_categories_page']);
         add_submenu_page('vpp_settings', 'VPP Status', 'VPP Status', 'manage_options', 'vpp_status', [$this, 'render_status_page']);
     }
 
@@ -347,7 +372,13 @@ CSS;
         $defaults = [
             'tidb' => ['host'=>'','port'=>'4000','database'=>'','user'=>'','pass'=>'','table'=>'products','ssl_ca'=>'/etc/ssl/certs/ca-certificates.crt'],
             'algolia' => ['app_id'=>'','admin_key'=>'','index'=>''],
-            'cloudflare' => ['api_token'=>'','zone_id'=>'','site_base'=>''],
+            'cloudflare' => [
+                'api_token' => '',
+                'zone_id' => '',
+                'site_base' => '',
+                'enable_purge_on_publish' => 1,
+                'include_product_urls' => 0,
+            ],
         ];
         $opt = get_option(self::OPT_KEY);
         if (!is_array($opt)) $opt = [];
@@ -378,6 +409,8 @@ CSS;
             $out['cloudflare']['api_token'] = sanitize_text_field($input['cloudflare']['api_token'] ?? '');
             $out['cloudflare']['zone_id'] = sanitize_text_field($input['cloudflare']['zone_id'] ?? '');
             $out['cloudflare']['site_base'] = esc_url_raw($input['cloudflare']['site_base'] ?? '');
+            $out['cloudflare']['enable_purge_on_publish'] = !empty($input['cloudflare']['enable_purge_on_publish']) ? 1 : 0;
+            $out['cloudflare']['include_product_urls'] = !empty($input['cloudflare']['include_product_urls']) ? 1 : 0;
         }
         return $out;
     }
@@ -385,76 +418,226 @@ CSS;
     public function render_connectivity_page() {
         if (!current_user_can('manage_options')) return;
         $s = $this->get_settings();
+        $admin_post = admin_url('admin-post.php');
+        $cf_zone = trim($s['cloudflare']['zone_id']);
+        $cf_token = trim($s['cloudflare']['api_token']);
+        $cf_ready = ($cf_zone !== '' && $cf_token !== '');
+        $cf_status_class = $cf_ready ? 'vpp-status-ok' : 'vpp-status-missing';
+        $cf_status_label = $cf_ready ? 'Configured' : 'Not configured';
+        $cf_auto = !empty($s['cloudflare']['enable_purge_on_publish']);
+        $cf_include = !empty($s['cloudflare']['include_product_urls']);
+        $last_batch = $this->get_cf_last_batch();
+        $last_batch_sitemaps = is_array($last_batch) && !empty($last_batch['sitemap_files']) ? count($last_batch['sitemap_files']) : 0;
+        $last_batch_products = is_array($last_batch) && !empty($last_batch['product_slugs']) ? count($last_batch['product_slugs']) : 0;
+        $last_batch_time = is_array($last_batch) && !empty($last_batch['timestamp']) ? (int)$last_batch['timestamp'] : 0;
+        $last_batch_label = $last_batch_time ? sprintf('%s (UTC)', gmdate('Y-m-d H:i', $last_batch_time)) : '—';
+        $cf_disabled_attr = $cf_ready ? '' : ' disabled="disabled"';
         ?>
-        <div class="wrap">
+        <div class="wrap vpp-connectivity-wrap">
             <h1>Connectivity</h1>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                <input type="hidden" name="action" value="vpp_save_settings"/>
-                <?php wp_nonce_field(self::NONCE_KEY); ?>
-                <h2 class="title">Connections</h2>
-                <table class="form-table"><tbody>
-                    <tr><th scope="row">TiDB Host</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][host]" value="<?php echo esc_attr($s['tidb']['host']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">TiDB Port</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][port]" value="<?php echo esc_attr($s['tidb']['port']); ?>" class="small-text"></td></tr>
-                    <tr><th scope="row">TiDB Database</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][database]" value="<?php echo esc_attr($s['tidb']['database']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">TiDB User</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][user]" value="<?php echo esc_attr($s['tidb']['user']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">TiDB Password</th><td><input type="password" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][pass]" value="<?php echo esc_attr($s['tidb']['pass']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">TiDB Table</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][table]" value="<?php echo esc_attr($s['tidb']['table']); ?>" class="regular-text"><p class="description">Expected columns: id, slug, title_h1, brand, model, sku, images_json, schema_json, desc_html, short_summary, meta_description, cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url, is_published, last_tidb_update_at</p></td></tr>
-                    <tr><th scope="row">SSL CA Path</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][ssl_ca]" value="<?php echo esc_attr($s['tidb']['ssl_ca']); ?>" class="regular-text"></td></tr>
-                </tbody></table>
+            <p class="description">Configure Virtual Product Pages integrations for database sync, search indexing, and cache control.</p>
+            <style>
+                .vpp-connectivity-wrap .vpp-connectivity-groups { display:flex; flex-direction:column; gap:24px; max-width:980px; }
+                .vpp-connectivity-wrap .vpp-connection-group { border-radius:14px; border:1px solid #dcdcde; padding:24px 28px; box-shadow:inset 0 1px 0 rgba(255,255,255,0.6); display:flex; flex-direction:column; gap:16px; }
+                .vpp-connectivity-wrap .vpp-connection-group--tidb { background:#f6f7f7; }
+                .vpp-connectivity-wrap .vpp-connection-group--algolia { background:#f3f5f6; }
+                .vpp-connectivity-wrap .vpp-connection-group--cloudflare { background:#eef2f7; }
+                .vpp-connectivity-wrap .vpp-connection-group h2 { margin:0; font-size:1.35rem; }
+                .vpp-connectivity-wrap .vpp-connection-description { margin:0; color:#50575e; max-width:720px; }
+                .vpp-connectivity-wrap .vpp-connection-form .form-table { margin:0; }
+                .vpp-connectivity-wrap .vpp-connection-form .form-table th { width:220px; }
+                .vpp-connectivity-wrap .vpp-connection-actions { display:flex; flex-wrap:wrap; gap:8px; }
+                .vpp-connectivity-wrap .vpp-status-badge { display:inline-flex; align-items:center; gap:6px; border-radius:999px; padding:4px 12px; font-size:13px; font-weight:600; }
+                .vpp-connectivity-wrap .vpp-status-ok { background:rgba(16,185,129,0.12); color:#047857; border:1px solid rgba(5,150,105,0.2); }
+                .vpp-connectivity-wrap .vpp-status-missing { background:rgba(244,114,182,0.12); color:#be123c; border:1px solid rgba(190,18,60,0.2); }
+                .vpp-connectivity-wrap .vpp-cloudflare-meta { font-size:13px; color:#3c434a; margin:0; }
+                .vpp-connectivity-wrap details.vpp-advanced-toggle { margin-top:4px; }
+                .vpp-connectivity-wrap details.vpp-advanced-toggle summary { cursor:pointer; font-weight:600; }
+                .vpp-connectivity-wrap .vpp-advanced-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+                .vpp-connectivity-wrap .vpp-last-batch { font-size:12px; color:#50575e; margin:4px 0 0; }
+                .vpp-connectivity-wrap .vpp-cloudflare-note { font-size:12px; color:#8c8f94; margin:0; }
+                .vpp-connectivity-wrap .vpp-cloudflare-fields .regular-text { width:100%; max-width:340px; }
+                .vpp-connectivity-wrap .vpp-cloudflare-checkboxes label { display:block; margin-bottom:6px; }
+                .vpp-connectivity-wrap .vpp-cloudflare-buttons form { margin:0; }
+                .vpp-connectivity-wrap .vpp-cloudflare-buttons .button-secondary[disabled],
+                .vpp-connectivity-wrap .vpp-cloudflare-buttons .button[disabled] { opacity:0.6; cursor:not-allowed; }
+                @media (max-width:782px) {
+                    .vpp-connectivity-wrap .vpp-connection-group { padding:20px; }
+                    .vpp-connectivity-wrap .vpp-connection-form .form-table th { width:auto; }
+                }
+            </style>
+            <div class="vpp-connectivity-groups">
+                <section class="vpp-connection-group vpp-connection-group--tidb">
+                    <div>
+                        <h2>TiDB (Database)</h2>
+                        <p class="vpp-connection-description">Primary source of product data used to render the Virtual Product Pages.</p>
+                    </div>
+                    <form class="vpp-connection-form" method="post" action="<?php echo esc_url($admin_post); ?>">
+                        <input type="hidden" name="action" value="vpp_save_settings" />
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <table class="form-table"><tbody>
+                            <tr><th scope="row">TiDB Host</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][host]" value="<?php echo esc_attr($s['tidb']['host']); ?>" class="regular-text" autocomplete="off"></td></tr>
+                            <tr><th scope="row">TiDB Port</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][port]" value="<?php echo esc_attr($s['tidb']['port']); ?>" class="small-text" autocomplete="off"></td></tr>
+                            <tr><th scope="row">TiDB Database</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][database]" value="<?php echo esc_attr($s['tidb']['database']); ?>" class="regular-text" autocomplete="off"></td></tr>
+                            <tr><th scope="row">TiDB User</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][user]" value="<?php echo esc_attr($s['tidb']['user']); ?>" class="regular-text" autocomplete="off"></td></tr>
+                            <tr><th scope="row">TiDB Password</th><td><input type="password" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][pass]" value="<?php echo esc_attr($s['tidb']['pass']); ?>" class="regular-text" autocomplete="new-password"></td></tr>
+                            <tr><th scope="row">TiDB Table</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][table]" value="<?php echo esc_attr($s['tidb']['table']); ?>" class="regular-text"><p class="description">Expected columns: id, slug, title_h1, brand, model, sku, images_json, schema_json, desc_html, short_summary, meta_description, cta_lead_url, cta_stripe_url, cta_affiliate_url, cta_paypal_url, is_published, last_tidb_update_at</p></td></tr>
+                            <tr><th scope="row">SSL CA Path</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[tidb][ssl_ca]" value="<?php echo esc_attr($s['tidb']['ssl_ca']); ?>" class="regular-text"></td></tr>
+                        </tbody></table>
+                        <div class="vpp-connection-actions">
+                            <?php submit_button('Save TiDB Settings', 'primary', 'submit', false); ?>
+                        </div>
+                    </form>
+                    <div class="vpp-connection-actions">
+                        <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                            <input type="hidden" name="action" value="vpp_test_tidb" />
+                            <?php wp_nonce_field(self::NONCE_KEY); ?>
+                            <?php submit_button('Test TiDB Connection', 'secondary', 'submit', false); ?>
+                        </form>
+                    </div>
+                </section>
 
-                <table class="form-table"><tbody>
-                    <tr><th scope="row">Algolia App ID</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][app_id]" value="<?php echo esc_attr($s['algolia']['app_id']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">Algolia Admin API Key</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][admin_key]" value="<?php echo esc_attr($s['algolia']['admin_key']); ?>" class="regular-text"></td></tr>
-                    <tr><th scope="row">Algolia Index Name</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][index]" value="<?php echo esc_attr($s['algolia']['index']); ?>" class="regular-text"></td></tr>
-                </tbody></table>
+                <section class="vpp-connection-group vpp-connection-group--algolia">
+                    <div>
+                        <h2>Algolia (Search)</h2>
+                        <p class="vpp-connection-description">Send indexed product snapshots to Algolia for instant search results.</p>
+                    </div>
+                    <form class="vpp-connection-form" method="post" action="<?php echo esc_url($admin_post); ?>">
+                        <input type="hidden" name="action" value="vpp_save_settings" />
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <table class="form-table"><tbody>
+                            <tr><th scope="row">Algolia App ID</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][app_id]" value="<?php echo esc_attr($s['algolia']['app_id']); ?>" class="regular-text" autocomplete="off"></td></tr>
+                            <tr><th scope="row">Algolia Admin API Key</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][admin_key]" value="<?php echo esc_attr($s['algolia']['admin_key']); ?>" class="regular-text" autocomplete="off"></td></tr>
+                            <tr><th scope="row">Algolia Index Name</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[algolia][index]" value="<?php echo esc_attr($s['algolia']['index']); ?>" class="regular-text" autocomplete="off"></td></tr>
+                        </tbody></table>
+                        <div class="vpp-connection-actions">
+                            <?php submit_button('Save Algolia Settings', 'primary', 'submit', false); ?>
+                        </div>
+                    </form>
+                    <div class="vpp-connection-actions">
+                        <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                            <input type="hidden" name="action" value="vpp_test_algolia" />
+                            <?php wp_nonce_field(self::NONCE_KEY); ?>
+                            <?php submit_button('Test Algolia Connection', 'secondary', 'submit', false); ?>
+                        </form>
+                    </div>
+                </section>
 
-                <?php submit_button('Save Changes'); ?>
-            </form>
+                <section class="vpp-connection-group vpp-connection-group--cloudflare">
+                    <div>
+                        <h2>Cloudflare (CDN &amp; Cache)</h2>
+                        <p class="vpp-connection-description">Purge cached sitemaps and newly published product URLs directly from Cloudflare.</p>
+                    </div>
+                    <p class="vpp-cloudflare-meta">Status: <span class="vpp-status-badge <?php echo esc_attr($cf_status_class); ?>"><?php echo esc_html($cf_status_label); ?></span></p>
+                    <?php if (!$cf_ready): ?>
+                        <p class="vpp-cloudflare-note">Enter a Zone ID and API token (with <code>Zone &rarr; Cache Purge</code> scope) to enable Cloudflare actions.</p>
+                    <?php endif; ?>
+                    <form class="vpp-connection-form" method="post" action="<?php echo esc_url($admin_post); ?>">
+                        <input type="hidden" name="action" value="vpp_save_settings" />
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <div class="vpp-cloudflare-fields">
+                            <table class="form-table"><tbody>
+                                <tr><th scope="row">Zone ID</th><td><input type="text" name="<?php echo esc_attr(self::OPT_KEY); ?>[cloudflare][zone_id]" value="<?php echo esc_attr($s['cloudflare']['zone_id']); ?>" class="regular-text" autocomplete="off"></td></tr>
+                                <tr><th scope="row">API Token</th><td><div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;"><input type="password" id="vpp-cf-api-token" name="<?php echo esc_attr(self::OPT_KEY); ?>[cloudflare][api_token]" value="<?php echo esc_attr($s['cloudflare']['api_token']); ?>" class="regular-text" autocomplete="new-password"><button type="button" class="button button-secondary vpp-toggle-token" data-target="vpp-cf-api-token">Reveal</button></div><p class="description">Token scope: <strong>Zone &rarr; Cache Purge</strong> for the selected zone.</p></td></tr>
+                                <tr><th scope="row">Automation</th><td class="vpp-cloudflare-checkboxes"><label><input type="checkbox" name="<?php echo esc_attr(self::OPT_KEY); ?>[cloudflare][enable_purge_on_publish]" value="1" <?php checked($cf_auto); ?> /> Purge on publish / rebuild completion</label><label><input type="checkbox" name="<?php echo esc_attr(self::OPT_KEY); ?>[cloudflare][include_product_urls]" value="1" <?php checked($cf_include); ?> /> Include product URLs from the last batch</label></td></tr>
+                            </tbody></table>
+                        </div>
+                        <div class="vpp-connection-actions">
+                            <?php submit_button('Save Cloudflare Settings', 'primary', 'submit', false); ?>
+                        </div>
+                    </form>
+                    <div class="vpp-cloudflare-buttons">
+                        <div class="vpp-connection-actions">
+                            <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                                <input type="hidden" name="action" value="vpp_cf_test_connection" />
+                                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                                <button type="submit" class="button button-secondary"<?php echo $cf_disabled_attr; ?>>Test Cloudflare Connection</button>
+                            </form>
+                            <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                                <input type="hidden" name="action" value="vpp_cf_test_purge" />
+                                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                                <button type="submit" class="button button-secondary"<?php echo $cf_disabled_attr; ?>>Test CF Purge (Sitemaps)</button>
+                            </form>
+                            <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                                <input type="hidden" name="action" value="vpp_cf_purge_sitemaps" />
+                                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                                <button type="submit" class="button"<?php echo $cf_disabled_attr; ?>>Purge Sitemaps Now</button>
+                            </form>
+                            <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                                <input type="hidden" name="action" value="vpp_cf_purge_last_batch" />
+                                <?php wp_nonce_field(self::NONCE_KEY); ?>
+                                <button type="submit" class="button"<?php echo $cf_disabled_attr . ($last_batch_sitemaps === 0 && $last_batch_products === 0 ? ' disabled="disabled"' : ''); ?>>Purge Last Batch URLs</button>
+                            </form>
+                        </div>
+                        <p class="vpp-last-batch">Last batch: <?php echo esc_html($last_batch_label); ?> — <?php echo esc_html($last_batch_sitemaps); ?> sitemap file(s), <?php echo esc_html($last_batch_products); ?> product URL(s).</p>
+                        <details class="vpp-advanced-toggle">
+                            <summary>Advanced</summary>
+                            <div class="vpp-advanced-actions">
+                                <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                                    <input type="hidden" name="action" value="vpp_cf_purge_everything" />
+                                    <?php wp_nonce_field(self::NONCE_KEY); ?>
+                                    <label style="display:flex; align-items:center; gap:8px;">
+                                        <input type="text" name="vpp_cf_confirm" placeholder="Type PURGE" style="max-width:120px;"<?php echo $cf_disabled_attr; ?> />
+                                        <button type="submit" class="button button-secondary"<?php echo $cf_disabled_attr; ?> onclick="return (this.previousElementSibling && this.previousElementSibling.value === 'PURGE') ? confirm('This will purge everything from Cloudflare cache. Continue?') : (alert('Enter PURGE to confirm.'), false);">Purge Everything</button>
+                                    </label>
+                                </form>
+                            </div>
+                        </details>
+                    </div>
+                </section>
 
-            <h2 class="title">Test Connections</h2>
-            <p>Verify credentials without publishing anything.</p>
-            <div style="display:flex; gap:12px; flex-wrap:wrap;">
-                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                    <input type="hidden" name="action" value="vpp_test_tidb"/>
-                    <?php wp_nonce_field(self::NONCE_KEY); ?>
-                    <?php submit_button('Test TiDB Connection', 'secondary', 'submit', false); ?>
-                </form>
-                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                    <input type="hidden" name="action" value="vpp_test_algolia"/>
-                    <?php wp_nonce_field(self::NONCE_KEY); ?>
-                    <?php submit_button('Test Algolia Connection', 'secondary', 'submit', false); ?>
-                </form>
+                <section class="vpp-connection-group" style="background:#fff;">
+                    <div>
+                        <h2>Push Actions</h2>
+                        <p class="vpp-connection-description">Manually publish products to VPP or Algolia by ID or slug.</p>
+                    </div>
+                    <form method="post" action="<?php echo esc_url($admin_post); ?>" style="margin-bottom:1rem;">
+                        <input type="hidden" name="action" value="vpp_push_publish" />
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
+                        <?php submit_button('Push to VPP (Publish)'); ?>
+                    </form>
+                    <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                        <input type="hidden" name="action" value="vpp_push_algolia" />
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
+                        <?php submit_button('Push to Algolia'); ?>
+                    </form>
+                </section>
+
+                <section class="vpp-connection-group" style="background:#fff;">
+                    <div>
+                        <h2>SEO Tools</h2>
+                        <p class="vpp-connection-description">Regenerate XML sitemap files for published products.</p>
+                    </div>
+                    <form method="post" action="<?php echo esc_url($admin_post); ?>">
+                        <input type="hidden" name="action" value="vpp_rebuild_sitemaps" />
+                        <?php wp_nonce_field(self::NONCE_KEY); ?>
+                        <?php submit_button('Rebuild Sitemap'); ?>
+                    </form>
+                </section>
             </div>
-
-            <h2 class="title" style="margin-top:24px;">Push Actions</h2>
-            <p>Enter IDs or slugs (comma-separated).</p>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-bottom:1rem;">
-                <input type="hidden" name="action" value="vpp_push_publish"/>
-                <?php wp_nonce_field(self::NONCE_KEY); ?>
-                <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
-                <?php submit_button('Push to VPP (Publish)'); ?>
-            </form>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                <input type="hidden" name="action" value="vpp_push_algolia"/>
-                <?php wp_nonce_field(self::NONCE_KEY); ?>
-                <textarea name="vpp_ids" rows="2" style="width:100%;" placeholder="e.g. 60001, siemens-s7-1200-60001"></textarea>
-                <?php submit_button('Push to Algolia'); ?>
-            </form>
-
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>" style="margin-top:1rem;">
-                <input type="hidden" name="action" value="vpp_purge_cache"/>
-                <?php wp_nonce_field(self::NONCE_KEY); ?>
-                <?php submit_button('Purge Cache'); ?>
-            </form>
-
-            <h2 class="title" style="margin-top:24px;">SEO Tools</h2>
-            <p>Rebuild sitemap files for published products.</p>
-            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                <input type="hidden" name="action" value="vpp_rebuild_sitemaps"/>
-                <?php wp_nonce_field(self::NONCE_KEY); ?>
-                <?php submit_button('Rebuild Sitemap'); ?>
-            </form>
         </div>
+        <script>
+        (function(){
+            document.addEventListener('DOMContentLoaded', function(){
+                document.querySelectorAll('.vpp-toggle-token').forEach(function(btn){
+                    btn.addEventListener('click', function(){
+                        var targetId = btn.getAttribute('data-target');
+                        var field = targetId ? document.getElementById(targetId) : null;
+                        if (!field) { return; }
+                        if (field.type === 'password') {
+                            field.type = 'text';
+                            btn.textContent = 'Hide';
+                        } else {
+                            field.type = 'password';
+                            btn.textContent = 'Reveal';
+                        }
+                    });
+                });
+            });
+        })();
+        </script>
         <?php
     }
 
@@ -1010,6 +1193,11 @@ CSS;
         return $formatted . ' ' . $units[$power];
     }
 
+    private function format_items_label($count) {
+        $count = (int)$count;
+        return sprintf(_n('%d item', '%d items', $count, 'virtual-product-pages'), $count);
+    }
+
     public function maybe_admin_notice() {
         if (!empty($_GET['vpp_msg'])) {
             $msg = sanitize_text_field(wp_unslash($_GET['vpp_msg']));
@@ -1287,6 +1475,7 @@ CSS;
 
     private function perform_publish_sitemap(array $inputs, $resume_entry = null) {
         $start = microtime(true);
+        $this->cf_reset_recent();
         $err = null;
         $mysqli = $this->db_connect($err);
         if (!$mysqli) {
@@ -1473,6 +1662,9 @@ CSS;
 
             $should_ping = !empty($inputs['ping_google']) && ($processed_rows + $batch_count >= $limit);
             $batch_notes = '';
+            if (!empty($prepared)) {
+                $this->cf_record_recent_products(array_column($prepared, 'slug'));
+            }
             $ok = empty($prepared) ? true : $this->update_sitemaps_with_products($prepared, $should_ping, $batch_notes, $err);
             if (!$ok) {
                 $completed = false;
@@ -1536,6 +1728,7 @@ CSS;
             $message .= sprintf(' %d product(s) skipped due to missing data.', $failed_rows);
         }
 
+        $cf_context = $this->cf_get_recent_context();
         return [
             'message' => $message,
             'message_type' => 'success',
@@ -1550,6 +1743,7 @@ CSS;
                 'duration' => $result['duration'],
                 'batch_limit' => $inputs['batch_limit'],
             ],
+            'cf_context' => $cf_context,
         ];
     }
 
@@ -2457,6 +2651,470 @@ CSS;
         return implode('', $parts);
     }
 
+    private function get_category_column($mysqli, $table) {
+        static $cache = [];
+        $table_clean = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$table);
+        if ($table_clean === '') {
+            return '';
+        }
+        if (isset($cache[$table_clean])) {
+            return $cache[$table_clean];
+        }
+        $columns = $this->get_table_columns($mysqli, $table_clean);
+        foreach (['category', 'Category', 'CATEGORY'] as $candidate) {
+            if (in_array($candidate, $columns, true)) {
+                return $cache[$table_clean] = $candidate;
+            }
+        }
+        return $cache[$table_clean] = '';
+    }
+
+    private function build_category_select_clause($mysqli, $table) {
+        $col = $this->get_category_column($mysqli, $table);
+        if ($col === '') {
+            return ", '' AS category";
+        }
+        $col_esc = $mysqli->real_escape_string($col);
+        return ", `{$col_esc}` AS category";
+    }
+
+    private function slugify_category_value($value) {
+        $value = trim((string)$value);
+        if ($value === '') {
+            return 'category';
+        }
+        if (function_exists('remove_accents')) {
+            $value = remove_accents($value);
+        } elseif (class_exists('Transliterator')) {
+            $trans = @Transliterator::create('Any-Latin; Latin-ASCII');
+            if ($trans instanceof Transliterator) {
+                $value = $trans->transliterate($value);
+            }
+        } else {
+            $converted = @iconv('UTF-8', 'ASCII//TRANSLIT', $value);
+            if ($converted !== false) {
+                $value = $converted;
+            }
+        }
+        $value = strtolower((string)$value);
+        $value = preg_replace('/[_\s]+/', '-', $value);
+        $value = preg_replace('/[^a-z0-9\-]/', '', $value);
+        $value = preg_replace('/-+/', '-', $value);
+        $value = trim($value, '-');
+        if ($value === '') {
+            $value = 'category';
+        }
+        if (in_array($value, self::CATEGORY_RESERVED_SLUGS, true)) {
+            $value .= '-cat';
+        }
+        return $value;
+    }
+
+    private function assign_category_slugs(array $rows) {
+        $groups = [];
+        foreach ($rows as $row) {
+            $name = $row['name'];
+            $base = $this->slugify_category_value($name);
+            if (!isset($groups[$base])) {
+                $groups[$base] = [];
+            }
+            $groups[$base][] = $row;
+        }
+
+        $entries = [];
+        $map = [];
+        foreach ($groups as $base => $items) {
+            usort($items, function($a, $b) {
+                $lenA = function_exists('mb_strlen') ? mb_strlen($a['name']) : strlen($a['name']);
+                $lenB = function_exists('mb_strlen') ? mb_strlen($b['name']) : strlen($b['name']);
+                if ($lenA === $lenB) {
+                    return strcasecmp($a['name'], $b['name']);
+                }
+                return $lenB <=> $lenA;
+            });
+            $suffix = 2;
+            foreach ($items as $index => $item) {
+                $slug = $base;
+                if ($index > 0) {
+                    $slug = $base . '-' . $suffix++;
+                    $this->log_error('category_slug', sprintf('Category slug collision for "%s" (base %s); assigned %s.', $item['name'], $base, $slug));
+                }
+                $entries[] = [
+                    'slug' => $slug,
+                    'name' => $item['name'],
+                    'count' => (int)($item['count'] ?? 0),
+                    'last_updated' => $item['last_updated'] ?? '',
+                ];
+                $map[$slug] = $item['name'];
+            }
+        }
+
+        usort($entries, function($a, $b) {
+            return strcasecmp($a['name'], $b['name']);
+        });
+
+        return ['list' => $entries, 'map' => $map];
+    }
+
+    private function get_category_transient_key($type, $slug = '', $per_page = 0) {
+        if ($type === 'index') {
+            return 'vpp_cat_index';
+        }
+        if ($type === 'archive') {
+            $slug = sanitize_title($slug);
+            $per_page = (int)$per_page;
+            return 'vpp_cat_archive_' . md5($slug . '|' . $per_page);
+        }
+        return '';
+    }
+
+    private function get_category_per_page() {
+        $per_page = (int)apply_filters('vpp_category_per_page', self::CATEGORY_PER_PAGE_DEFAULT);
+        if ($per_page < 1) {
+            $per_page = self::CATEGORY_PER_PAGE_DEFAULT;
+        }
+        if ($per_page > self::CATEGORY_PER_PAGE_MAX) {
+            $per_page = self::CATEGORY_PER_PAGE_MAX;
+        }
+        return $per_page;
+    }
+
+    private function get_category_cache($force_refresh = false, &$err = null) {
+        if ($force_refresh) {
+            delete_transient($this->get_category_transient_key('index'));
+            $this->category_cache = null;
+            $this->category_slug_map = null;
+        }
+        if (is_array($this->category_cache)) {
+            return $this->category_cache;
+        }
+        $cache = get_transient($this->get_category_transient_key('index'));
+        if (is_array($cache) && isset($cache['categories'], $cache['map'])) {
+            $this->category_cache = $cache;
+            $this->category_slug_map = $cache['map'];
+            return $cache;
+        }
+
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return null;
+        }
+
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            @$mysqli->close();
+            $empty = ['categories' => [], 'map' => [], 'column' => '', 'generated' => time()];
+            $this->category_cache = $empty;
+            $this->category_slug_map = [];
+            set_transient($this->get_category_transient_key('index'), $empty, self::CATEGORY_CACHE_TTL);
+            return $empty;
+        }
+
+        $column = $this->get_category_column($mysqli, $table);
+        if ($column === '') {
+            @$mysqli->close();
+            $empty = ['categories' => [], 'map' => [], 'column' => '', 'generated' => time()];
+            $this->category_cache = $empty;
+            $this->category_slug_map = [];
+            set_transient($this->get_category_transient_key('index'), $empty, self::CATEGORY_CACHE_TTL);
+            return $empty;
+        }
+
+        $table_esc = $mysqli->real_escape_string($table);
+        $col_esc = $mysqli->real_escape_string($column);
+        $sql = "SELECT `{$col_esc}` AS category_name, COUNT(*) AS items, MAX(last_tidb_update_at) AS last_updated FROM `{$table_esc}` WHERE is_published = 1 AND `{$col_esc}` IS NOT NULL AND TRIM(`{$col_esc}`) <> '' GROUP BY `{$col_esc}`";
+        $res = @$mysqli->query($sql);
+        if (!$res) {
+            $err = 'Failed to load categories: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            @$mysqli->close();
+            return null;
+        }
+
+        $rows = [];
+        while ($row = $res->fetch_assoc()) {
+            $name = isset($row['category_name']) ? trim((string)$row['category_name']) : '';
+            if ($name === '') {
+                continue;
+            }
+            $rows[] = [
+                'name' => $name,
+                'count' => isset($row['items']) ? (int)$row['items'] : 0,
+                'last_updated' => $row['last_updated'] ?? '',
+            ];
+        }
+        $res->free();
+        @$mysqli->close();
+
+        $assigned = $this->assign_category_slugs($rows);
+        $cache = [
+            'categories' => $assigned['list'],
+            'map' => $assigned['map'],
+            'column' => $column,
+            'generated' => time(),
+        ];
+        $this->category_cache = $cache;
+        $this->category_slug_map = $assigned['map'];
+        set_transient($this->get_category_transient_key('index'), $cache, self::CATEGORY_CACHE_TTL);
+        return $cache;
+    }
+
+    private function get_category_index_data($page, $per_page, $force_refresh = false, &$err = null) {
+        $cache = $this->get_category_cache($force_refresh, $err);
+        if ($cache === null) {
+            return null;
+        }
+        $categories = isset($cache['categories']) && is_array($cache['categories']) ? $cache['categories'] : [];
+        $total = count($categories);
+        $per_page = max(1, (int)$per_page);
+        $total_pages = max(1, (int)ceil($total / $per_page));
+        if (($total > 0 && $page > $total_pages) || ($total === 0 && $page > 1)) {
+            return null;
+        }
+        $offset = max(0, ($page - 1) * $per_page);
+        $items = array_slice($categories, $offset, $per_page);
+        $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+        $canonical = $page > 1 ? trailingslashit(home_url('/p-cat/page/' . $page)) : trailingslashit(home_url('/p-cat/'));
+        $meta_description = $total > 0
+            ? sprintf(__('Explore %d product categories.', 'virtual-product-pages'), $total)
+            : __('No categories are available yet.', 'virtual-product-pages');
+        $title = sprintf(__('Categories | %s', 'virtual-product-pages'), $site);
+
+        return [
+            'type' => 'index',
+            'items' => $items,
+            'total' => $total,
+            'page' => max(1, (int)$page),
+            'per_page' => $per_page,
+            'total_pages' => $total_pages,
+            'offset' => $offset,
+            'canonical' => $canonical,
+            'meta_description' => $meta_description,
+            'title' => $title,
+        ];
+    }
+
+    private function get_category_archive_data($slug, $page, $per_page, &$err = null, $force_refresh = false) {
+        $slug = sanitize_title($slug);
+        if ($slug === '') {
+            return null;
+        }
+        $cache = $this->get_category_cache($force_refresh, $err);
+        if ($cache === null) {
+            return null;
+        }
+        $map = isset($cache['map']) && is_array($cache['map']) ? $cache['map'] : [];
+        if (!isset($map[$slug])) {
+            return null;
+        }
+        $category_name = $map[$slug];
+
+        $per_page = max(1, (int)$per_page);
+        $transient_key = $this->get_category_transient_key('archive', $slug, $per_page);
+        if ($force_refresh) {
+            delete_transient($transient_key);
+        }
+        $cached = get_transient($transient_key);
+        if (is_array($cached) && isset($cached['pages'][$page])) {
+            return $cached['pages'][$page];
+        }
+
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) {
+            return null;
+        }
+
+        $settings = $this->get_settings();
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', $settings['tidb']['table']);
+        if ($table === '') {
+            @$mysqli->close();
+            return null;
+        }
+
+        $column = $this->get_category_column($mysqli, $table);
+        if ($column === '') {
+            @$mysqli->close();
+            return null;
+        }
+
+        $table_esc = $mysqli->real_escape_string($table);
+        $col_esc = $mysqli->real_escape_string($column);
+        $count_sql = "SELECT COUNT(*) AS total, MAX(last_tidb_update_at) AS last_updated FROM `{$table_esc}` WHERE is_published = 1 AND `{$col_esc}` = ?";
+        $stmt = $mysqli->prepare($count_sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            @$mysqli->close();
+            return null;
+        }
+        $stmt->bind_param('s', $category_name);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $total_row = $res ? $res->fetch_assoc() : null;
+        $res && $res->free();
+        $stmt->close();
+        $total = $total_row && isset($total_row['total']) ? (int)$total_row['total'] : 0;
+        $last_updated = $total_row['last_updated'] ?? '';
+        $total_pages = max(1, (int)ceil($total / $per_page));
+        if ($total > 0 && $page > $total_pages) {
+            @$mysqli->close();
+            return null;
+        }
+        if ($total === 0 && $page > 1) {
+            @$mysqli->close();
+            return null;
+        }
+
+        $offset = max(0, ($page - 1) * $per_page);
+        $item_sql = "SELECT slug, title_h1, brand, model, short_summary, images_json, last_tidb_update_at FROM `{$table_esc}` WHERE is_published = 1 AND `{$col_esc}` = ? ORDER BY last_tidb_update_at DESC, id DESC LIMIT ? OFFSET ?";
+        $stmt = $mysqli->prepare($item_sql);
+        if (!$stmt) {
+            $err = 'DB prepare failed: ' . $mysqli->error;
+            $this->log_error('db_query', $err);
+            @$mysqli->close();
+            return null;
+        }
+        $stmt->bind_param('sii', $category_name, $per_page, $offset);
+        $stmt->execute();
+        $res = $stmt->get_result();
+        $items = [];
+        if ($res) {
+            while ($row = $res->fetch_assoc()) {
+                $items[] = $row;
+            }
+            $res->free();
+        }
+        $stmt->close();
+        @$mysqli->close();
+
+        $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+        $canonical = $page > 1 ? trailingslashit(home_url('/p-cat/' . $slug . '/page/' . $page)) : trailingslashit(home_url('/p-cat/' . $slug));
+        $meta_description = $total > 0
+            ? sprintf(_n('%1$d item in %2$s.', '%1$d items in %2$s.', $total, 'virtual-product-pages'), $total, $category_name)
+            : sprintf(__('No products in %s yet.', 'virtual-product-pages'), $category_name);
+        if ($page > 1) {
+            $meta_description .= ' ' . sprintf(__('Page %d of %d.', 'virtual-product-pages'), $page, $total_pages);
+        }
+        $title = sprintf(__('%1$s — %2$d items | %3$s', 'virtual-product-pages'), $category_name, $total, $site);
+        if ($page > 1) {
+            $title = sprintf(__('%1$s — Page %2$d | %3$s', 'virtual-product-pages'), $category_name, $page, $site);
+        }
+
+        $data = [
+            'type' => 'archive',
+            'slug' => $slug,
+            'name' => $category_name,
+            'items' => $items,
+            'count' => $total,
+            'page' => max(1, (int)$page),
+            'per_page' => $per_page,
+            'total_pages' => $total_pages,
+            'offset' => $offset,
+            'canonical' => $canonical,
+            'meta_description' => $meta_description,
+            'title' => $title,
+            'last_updated' => $last_updated,
+        ];
+
+        if (!is_array($cached)) {
+            $cached = ['pages' => []];
+        }
+        if (!isset($cached['pages']) || !is_array($cached['pages'])) {
+            $cached['pages'] = [];
+        }
+        $cached['pages'][$page] = $data;
+        $cached['generated'] = time();
+        set_transient($transient_key, $cached, self::CATEGORY_CACHE_TTL);
+
+        return $data;
+    }
+
+    private function clear_category_caches(array $slugs = []) {
+        delete_transient($this->get_category_transient_key('index'));
+        $this->category_cache = null;
+        $this->category_slug_map = null;
+        if (empty($slugs)) {
+            return;
+        }
+        $per_page = $this->get_category_per_page();
+        foreach ($slugs as $slug) {
+            $slug = sanitize_title($slug);
+            if ($slug === '') {
+                continue;
+            }
+            delete_transient($this->get_category_transient_key('archive', $slug, $per_page));
+        }
+    }
+
+    private function get_category_slug_map() {
+        if (is_array($this->category_slug_map)) {
+            return $this->category_slug_map;
+        }
+        $err = null;
+        $cache = $this->get_category_cache(false, $err);
+        if (is_array($cache) && isset($cache['map']) && is_array($cache['map'])) {
+            return $this->category_slug_map = $cache['map'];
+        }
+        return [];
+    }
+
+    private function get_all_category_names() {
+        $err = null;
+        $cache = $this->get_category_cache(false, $err);
+        if (!is_array($cache) || empty($cache['categories']) || !is_array($cache['categories'])) {
+            return [];
+        }
+        $names = [];
+        foreach ($cache['categories'] as $item) {
+            if (!empty($item['name'])) {
+                $names[] = $item['name'];
+            }
+        }
+        $names = array_values(array_unique($names));
+        natcasesort($names);
+        return array_values($names);
+    }
+
+    private function purge_category_urls_by_names(array $names) {
+        $filtered = [];
+        foreach ($names as $name) {
+            $name = trim((string)$name);
+            if ($name !== '') {
+                $filtered[] = $name;
+            }
+        }
+        $filtered = array_values(array_unique($filtered));
+
+        $relative_urls = ['/p-cat/'];
+
+        $err = null;
+        $cache = $this->get_category_cache(true, $err);
+        $map = is_array($cache) && isset($cache['map']) && is_array($cache['map']) ? $cache['map'] : [];
+        $slugs = [];
+        foreach ($map as $slug => $label) {
+            if (in_array($label, $filtered, true)) {
+                $slugs[] = $slug;
+            }
+        }
+        foreach ($filtered as $name) {
+            $slug = array_search($name, $map, true);
+            if ($slug === false) {
+                $slugs[] = $this->slugify_category_value($name);
+            }
+        }
+        $slugs = array_values(array_unique(array_filter($slugs)));
+        foreach ($slugs as $slug) {
+            $relative_urls[] = '/p-cat/' . $slug . '/';
+        }
+
+        $urls = $this->cf_normalize_urls($relative_urls);
+        if (!empty($urls)) {
+            $result = $this->cf_purge_files($urls);
+            $this->cf_log_result('category_purge', $result);
+        }
+    }
+
     private function sanitize_cta_label($value) {
         $value = sanitize_text_field($value ?? '');
         if (function_exists('mb_substr')) {
@@ -2485,7 +3143,8 @@ CSS;
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
+        $category_sql = $this->build_category_select_clause($mysqli, $table);
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -2509,7 +3168,8 @@ CSS;
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}
+        $category_sql = $this->build_category_select_clause($mysqli, $table);
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -2582,6 +3242,17 @@ CSS;
                     <table class="form-table"><tbody>
                         <tr><th scope="row">Title (H1)</th><td><input type="text" name="title_h1" value="<?php echo esc_attr($row['title_h1']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Brand</th><td><input type="text" name="brand" value="<?php echo esc_attr($row['brand']); ?>" class="regular-text"></td></tr>
+                        <tr><th scope="row">Category</th><td>
+                            <input type="text" name="category" value="<?php echo esc_attr($row['category'] ?? ''); ?>" class="regular-text" list="vpp-category-options" placeholder="e.g. Air Compressors">
+                            <?php if (!empty($category_options)): ?>
+                                <datalist id="vpp-category-options">
+                                    <?php foreach ($category_options as $option): ?>
+                                        <option value="<?php echo esc_attr($option); ?>"></option>
+                                    <?php endforeach; ?>
+                                </datalist>
+                            <?php endif; ?>
+                            <p class="description">Leave blank to remove the category.</p>
+                        </td></tr>
                         <tr><th scope="row">Model</th><td><input type="text" name="model" value="<?php echo esc_attr($row['model']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">SKU</th><td><input type="text" name="sku" value="<?php echo esc_attr($row['sku']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Short summary (max 150 chars)</th><td><input type="text" maxlength="150" name="short_summary" value="<?php echo esc_attr($row['short_summary'] ?? ''); ?>" class="regular-text"></td></tr>
@@ -2662,6 +3333,68 @@ CSS;
         <?php
     }
 
+    public function render_categories_page() {
+        if (!current_user_can('manage_options')) return;
+        $search = isset($_GET['s']) ? sanitize_text_field(wp_unslash($_GET['s'])) : '';
+        $err = null;
+        $cache = $this->get_category_cache(false, $err);
+        $categories = [];
+        if (is_array($cache) && isset($cache['categories']) && is_array($cache['categories'])) {
+            $categories = $cache['categories'];
+        }
+        if ($search !== '') {
+            $categories = array_values(array_filter($categories, function($item) use ($search) {
+                return isset($item['name']) && stripos($item['name'], $search) !== false;
+            }));
+        }
+        ?>
+        <div class="wrap">
+            <h1><?php esc_html_e('Categories', 'virtual-product-pages'); ?></h1>
+
+            <form method="get" class="vpp-cat-search" style="margin:1rem 0;">
+                <input type="hidden" name="page" value="vpp_categories"/>
+                <label class="screen-reader-text" for="vpp-cat-search"><?php esc_html_e('Search categories', 'virtual-product-pages'); ?></label>
+                <input type="search" id="vpp-cat-search" name="s" value="<?php echo esc_attr($search); ?>" placeholder="<?php esc_attr_e('Search categories…', 'virtual-product-pages'); ?>"/>
+                <?php submit_button(__('Search', 'virtual-product-pages'), 'secondary', '', false); ?>
+            </form>
+
+            <?php if ($err): ?>
+                <div class="notice notice-error"><p><?php echo esc_html($err); ?></p></div>
+            <?php endif; ?>
+
+            <table class="widefat striped" style="max-width:720px;">
+                <thead>
+                    <tr>
+                        <th><?php esc_html_e('Category', 'virtual-product-pages'); ?></th>
+                        <th><?php esc_html_e('Count', 'virtual-product-pages'); ?></th>
+                        <th><?php esc_html_e('Link', 'virtual-product-pages'); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($categories)): ?>
+                        <tr><td colspan="3"><?php esc_html_e('No categories found.', 'virtual-product-pages'); ?></td></tr>
+                    <?php else: ?>
+                        <?php foreach ($categories as $item): ?>
+                            <tr>
+                                <td><?php echo esc_html($item['name']); ?></td>
+                                <td><?php echo esc_html(number_format_i18n((int)($item['count'] ?? 0))); ?></td>
+                                <td>
+                                    <?php if (!empty($item['slug'])): ?>
+                                        <?php $url = home_url('/p-cat/' . $item['slug'] . '/'); ?>
+                                        <a href="<?php echo esc_url($url); ?>" target="_blank" rel="noopener noreferrer"><?php echo esc_html($url); ?></a>
+                                    <?php else: ?>
+                                        —
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </tbody>
+            </table>
+        </div>
+        <?php
+    }
+
     public function handle_edit_load() {
         if (!current_user_can('manage_options')) wp_die('Forbidden');
         check_admin_referer(self::NONCE_KEY);
@@ -2685,6 +3418,10 @@ CSS;
         $brand = sanitize_text_field($_POST['brand'] ?? '');
         $model = sanitize_text_field($_POST['model'] ?? '');
         $sku = sanitize_text_field($_POST['sku'] ?? '');
+        $category_input = sanitize_text_field($_POST['category'] ?? '');
+        if (function_exists('mb_substr')) { $category_input = mb_substr($category_input, 0, 120); }
+        else { $category_input = substr($category_input, 0, 120); }
+        $category_input = trim($category_input);
         $short_summary = sanitize_text_field($_POST['short_summary'] ?? '');
         if (strlen($short_summary) > 150) $short_summary = substr($short_summary, 0, 150);
         $meta_description = sanitize_text_field($_POST['meta_description'] ?? '');
@@ -2704,6 +3441,15 @@ CSS;
         $schema_json_raw = trim($schema_json_raw);
         $clear_schema = !empty($_POST['schema_json_clear']);
 
+        $previous_category = '';
+        if ($id > 0) {
+            $prev_err = null;
+            $prev_row = $this->fetch_product_by_id($id, $prev_err);
+            if (is_array($prev_row) && isset($prev_row['category'])) {
+                $previous_category = trim((string)$prev_row['category']);
+            }
+        }
+
         $err = null;
         $s = $this->get_settings();
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
@@ -2716,6 +3462,7 @@ CSS;
         $this->ensure_schema_json_column($mysqli, $table);
         $this->ensure_cta_label_columns($mysqli, $table);
         $existing_cols = array_flip($this->get_table_columns($mysqli, $table));
+        $category_col = $this->get_category_column($mysqli, $table);
 
         $current_schema = null;
         if (isset($existing_cols['schema_json'])) {
@@ -2769,6 +3516,9 @@ CSS;
             'desc_html' => $desc_html,
             'is_published' => $is_published,
         ];
+        if ($category_col !== '' && isset($existing_cols[$category_col])) {
+            $cols[$category_col] = $category_input;
+        }
         $set_parts = [];
         $bind_types = '';
         $bind_values = [];
@@ -2822,10 +3572,13 @@ CSS;
         }
 
         if ($ok && isset($_POST['do_save_purge'])) {
-            $site = $this->get_settings()['cloudflare']['site_base'];
-            $url = $site ? rtrim($site,'/') . '/p/' . $slug : home_url('/p/' . $slug);
-            $this->purge_cloudflare_url($url);
+            $result = $this->cf_purge_products([$slug]);
+            $this->cf_log_result('edit_save_product', $result);
+            $this->purge_category_urls_by_names([$previous_category, $category_input]);
             $inline = 'ok'; $inline_msg = 'Saved & purged'; $top_msg = 'Saved and purged Cloudflare.';
+        }
+        if ($ok) {
+            $this->clear_category_caches();
         }
         if ($ok && isset($_POST['do_push_algolia'])) {
             $p = $this->fetch_product_by_id($id, $tmp);
@@ -2946,6 +3699,12 @@ CSS;
             $this->add_publish_history_entry($outcome['history']);
         }
         $this->save_publish_state($state);
+        if (!empty($outcome['message_type']) && $outcome['message_type'] === 'success' && !empty($outcome['cf_context'])) {
+            $context = $outcome['cf_context'];
+            $files = isset($context['sitemap_files']) && is_array($context['sitemap_files']) ? $context['sitemap_files'] : [];
+            $slugs = isset($context['product_slugs']) && is_array($context['product_slugs']) ? $context['product_slugs'] : [];
+            do_action('vpp_publish_completed', $files, $slugs);
+        }
         wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
         exit;
     }
@@ -2991,6 +3750,12 @@ CSS;
             $this->add_publish_history_entry($outcome['history']);
         }
         $this->save_publish_state($state);
+        if (!empty($outcome['message_type']) && $outcome['message_type'] === 'success' && !empty($outcome['cf_context'])) {
+            $context = $outcome['cf_context'];
+            $files = isset($context['sitemap_files']) && is_array($context['sitemap_files']) ? $context['sitemap_files'] : [];
+            $slugs = isset($context['product_slugs']) && is_array($context['product_slugs']) ? $context['product_slugs'] : [];
+            do_action('vpp_publish_completed', $files, $slugs);
+        }
         wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
         exit;
     }
@@ -3337,6 +4102,121 @@ CSS;
         wp_safe_redirect($redirect); exit;
     }
 
+    public function handle_cf_test_connection() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        if (!$this->cf_is_ready()) {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Configure Zone ID + API Token first.')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        $response = $this->cf_request('GET', $this->cf_build_endpoint(''));
+        if (!empty($response['success'])) {
+            $zone_name = '';
+            if (is_array($response['body']) && !empty($response['body']['result']['name'])) {
+                $zone_name = (string)$response['body']['result']['name'];
+            }
+            $message = $zone_name ? sprintf('Cloudflare connection OK (zone %s).', $zone_name) : 'Cloudflare connection OK.';
+            $this->cf_log_result('test_connection', [
+                'success' => true,
+                'count' => 0,
+                'duration' => 0,
+                'messages' => [$message],
+                'ray_ids' => !empty($response['ray']) ? [$response['ray']] : [],
+            ]);
+            $redirect = add_query_arg(['vpp_msg' => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
+        } else {
+            $message = $response['message'] ?: 'Cloudflare connection failed.';
+            $this->cf_log_result('test_connection', [
+                'success' => false,
+                'count' => 0,
+                'duration' => 0,
+                'messages' => [$message],
+                'ray_ids' => !empty($response['ray']) ? [$response['ray']] : [],
+            ]);
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Cloudflare connection failed: ' . $message)], admin_url('admin.php?page=vpp_settings'));
+        }
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_cf_test_purge() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        if (!$this->cf_is_ready()) {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Configure Zone ID + API Token first.')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        $files = $this->cf_collect_existing_sitemap_files();
+        $result = $this->cf_purge_sitemaps($files);
+        $this->cf_log_result('test_purge_sitemaps', $result);
+        $message = $result['messages'][0] ?? ($result['success'] ? 'Cloudflare purge successful.' : 'Cloudflare purge failed.');
+        $redirect = add_query_arg([!empty($result['success']) ? 'vpp_msg' : 'vpp_err' => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_cf_purge_sitemaps() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        if (!$this->cf_is_ready()) {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Configure Zone ID + API Token first.')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        $files = $this->cf_collect_existing_sitemap_files();
+        $result = $this->cf_purge_sitemaps($files);
+        $this->cf_log_result('manual_purge_sitemaps', $result);
+        $message = $result['messages'][0] ?? ($result['success'] ? 'Cloudflare purge successful.' : 'Cloudflare purge failed.');
+        $redirect = add_query_arg([!empty($result['success']) ? 'vpp_msg' : 'vpp_err' => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_cf_purge_last_batch() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        if (!$this->cf_is_ready()) {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Configure Zone ID + API Token first.')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        $batch = $this->get_cf_last_batch();
+        if (empty($batch) || (empty($batch['sitemap_files']) && empty($batch['product_slugs']))) {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('No cached batch information available yet.')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        $sitemap_result = $this->cf_purge_sitemaps($batch['sitemap_files']);
+        $this->cf_log_result('manual_purge_last_batch_sitemaps', $sitemap_result);
+        $product_result = null;
+        if (!empty($batch['product_slugs'])) {
+            $product_result = $this->cf_purge_products($batch['product_slugs']);
+            $this->cf_log_result('manual_purge_last_batch_products', $product_result);
+        }
+        $success = !empty($sitemap_result['success']) && ($product_result === null || !empty($product_result['success']));
+        $sitemap_count = (int)($sitemap_result['count'] ?? 0);
+        $product_count = (int)($product_result['count'] ?? 0);
+        $message = $success
+            ? sprintf('Cloudflare purge successful (%d sitemap URL%s, %d product URL%s).', $sitemap_count, $sitemap_count === 1 ? '' : 's', $product_count, $product_count === 1 ? '' : 's')
+            : ($sitemap_result['messages'][0] ?? ($product_result['messages'][0] ?? 'Cloudflare purge failed.'));
+        $redirect = add_query_arg([$success ? 'vpp_msg' : 'vpp_err' => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
+    public function handle_cf_purge_everything() {
+        if (!current_user_can('manage_options')) wp_die('Forbidden');
+        check_admin_referer(self::NONCE_KEY);
+        $confirm = isset($_POST['vpp_cf_confirm']) ? sanitize_text_field(wp_unslash($_POST['vpp_cf_confirm'])) : '';
+        if (strtoupper($confirm) !== 'PURGE') {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Type PURGE to confirm full Cloudflare purge.')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        if (!$this->cf_is_ready()) {
+            $redirect = add_query_arg(['vpp_err' => rawurlencode('Configure Zone ID + API Token first.')], admin_url('admin.php?page=vpp_settings'));
+            wp_safe_redirect($redirect); exit;
+        }
+        $result = $this->cf_purge_everything();
+        $this->cf_log_result('manual_purge_everything', $result);
+        $success = !empty($result['success']);
+        $message = $result['messages'][0] ?? ($success ? 'Cloudflare cache purged.' : 'Cloudflare purge failed.');
+        $redirect = add_query_arg([$success ? 'vpp_msg' : 'vpp_err' => rawurlencode($message)], admin_url('admin.php?page=vpp_settings'));
+        wp_safe_redirect($redirect); exit;
+    }
+
     private function publish_product($id_or_slug, &$err = null) {
         $s = $this->get_settings();
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
@@ -3376,9 +4256,8 @@ CSS;
                     if ($p && !empty($p['slug'])) $slug = $p['slug'];
                 }
                 if ($slug) {
-                    $site = $this->get_settings()['cloudflare']['site_base'];
-                    $url = $site ? rtrim($site,'/') . '/p/' . $slug : home_url('/p/' . $slug);
-                    $this->purge_cloudflare_url($url);
+                    $result = $this->cf_purge_products([$slug]);
+                    $this->cf_log_result('manual_publish_product', $result);
                 }
                 $ok++;
             } else { $fail++; $msg = $err ?: 'Unknown error'; }
@@ -3408,9 +4287,11 @@ CSS;
     public function handle_purge_cache() {
         if (!current_user_can('manage_options')) wp_die('Forbidden');
         check_admin_referer(self::NONCE_KEY);
-        $err = null;
-        $ok = $this->purge_cloudflare([], $err);
-        $redirect = add_query_arg([$ok ? 'vpp_msg':'vpp_err' => $ok ? 'Cloudflare cache purged.' : ($err ?: 'Cloudflare purge failed.')], admin_url('admin.php?page=vpp_settings'));
+        $result = $this->cf_purge_everything();
+        $this->cf_log_result('manual_purge_everything', $result);
+        $success = !empty($result['success']);
+        $message = $success ? ($result['messages'][0] ?? 'Cloudflare cache purged.') : ($result['messages'][0] ?? 'Cloudflare purge failed.');
+        $redirect = add_query_arg([$success ? 'vpp_msg':'vpp_err' => $message], admin_url('admin.php?page=vpp_settings'));
         wp_safe_redirect($redirect); exit;
     }
 
@@ -3419,7 +4300,11 @@ CSS;
         check_admin_referer(self::NONCE_KEY);
         $summary = '';
         $err = null;
-        $ok = $this->rebuild_sitemaps($summary, $err);
+        $changed_files = [];
+        $ok = $this->rebuild_sitemaps($summary, $err, $changed_files);
+        if ($ok) {
+            do_action('vpp_rebuild_completed', $changed_files, []);
+        }
         $redirect = add_query_arg([$ok ? 'vpp_msg':'vpp_err' => $ok ? ($summary ?: 'Sitemap rebuilt.') : ($err ?: 'Sitemap rebuild failed.')], admin_url('admin.php?page=vpp_settings'));
         wp_safe_redirect($redirect); exit;
     }
@@ -3451,34 +4336,454 @@ CSS;
 
     /* ========= CF / SITEMAPS / ALGOLIA ========= */
 
-    private function purge_cloudflare(array $urls = [], &$err = null) {
-        $s = $this->get_settings();
-        $token = trim($s['cloudflare']['api_token'] ?? '');
-        $zone  = trim($s['cloudflare']['zone_id'] ?? '');
-        if (!$token || !$zone) { $err = 'Cloudflare credentials not configured.'; return false; }
-        $endpoint = "https://api.cloudflare.com/client/v4/zones/{$zone}/purge_cache";
-        $payload = empty($urls) ? ['purge_everything' => true] : ['files' => array_values(array_filter($urls))];
-        $args = [
-            'method' => 'POST',
-            'headers' => ['Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $token],
-            'body' => wp_json_encode($payload),
-            'timeout' => 15,
-        ];
-        $resp = wp_remote_post($endpoint, $args);
-        if (is_wp_error($resp)) { $err = 'Cloudflare request failed: ' . $resp->get_error_message(); return false; }
-        $code = wp_remote_retrieve_response_code($resp);
-        $body = json_decode(wp_remote_retrieve_body($resp), true);
-        if ($code < 200 || $code >= 300 || (is_array($body) && isset($body['success']) && !$body['success'])) {
-            $msg = is_array($body) && !empty($body['errors'][0]['message']) ? $body['errors'][0]['message'] : ('HTTP ' . $code);
-            $err = 'Cloudflare purge failed: ' . $msg;
-            return false;
-        }
-        return true;
+    private function cf_get_zone_id() {
+        $settings = $this->get_settings();
+        return trim($settings['cloudflare']['zone_id'] ?? '');
     }
 
-    private function purge_cloudflare_url($url) {
-        if (!$url) return false;
-        $err = null; return $this->purge_cloudflare([$url], $err);
+    private function cf_get_api_token() {
+        $settings = $this->get_settings();
+        return trim($settings['cloudflare']['api_token'] ?? '');
+    }
+
+    private function cf_is_ready() {
+        return ($this->cf_get_zone_id() !== '' && $this->cf_get_api_token() !== '');
+    }
+
+    private function cf_build_endpoint($path = '') {
+        $zone = $this->cf_get_zone_id();
+        if ($zone === '') {
+            return '';
+        }
+        $base = 'https://api.cloudflare.com/client/v4/zones/' . rawurlencode($zone);
+        if ($path !== '') {
+            $base .= '/' . ltrim($path, '/');
+        }
+        return $base;
+    }
+
+    private function cf_get_site_base_override() {
+        $settings = $this->get_settings();
+        $base = trim($settings['cloudflare']['site_base'] ?? '');
+        return $base !== '' ? rtrim($base, '/') : '';
+    }
+
+    private function cf_normalize_urls(array $urls) {
+        $home = rtrim(home_url(), '/');
+        $override = $this->cf_get_site_base_override();
+        $normalized = [];
+        foreach ($urls as $url) {
+            $url = trim((string)$url);
+            if ($url === '') {
+                continue;
+            }
+            if (stripos($url, 'http://') !== 0 && stripos($url, 'https://') !== 0) {
+                if ($url[0] !== '/') {
+                    $url = '/' . $url;
+                }
+                $url = $home . $url;
+            }
+            $normalized[] = $url;
+            if ($override) {
+                $swapped = $this->cf_swap_base($url, $override);
+                if ($swapped && $swapped !== $url) {
+                    $normalized[] = $swapped;
+                }
+            }
+        }
+        return array_values(array_unique($normalized));
+    }
+
+    private function cf_swap_base($url, $site_base) {
+        $target = wp_parse_url($url);
+        $base = wp_parse_url($site_base);
+        if (!$target || !$base || empty($target['path'])) {
+            return '';
+        }
+        $scheme = $base['scheme'] ?? ($target['scheme'] ?? 'https');
+        $host = $base['host'] ?? ($target['host'] ?? '');
+        if (!$host) {
+            return '';
+        }
+        $port = isset($base['port']) ? ':' . $base['port'] : '';
+        $path = $target['path'];
+        $query = isset($target['query']) ? '?' . $target['query'] : '';
+        return $scheme . '://' . $host . $port . $path . $query;
+    }
+
+    private function cf_collect_sitemap_urls(array $filenames = [], $include_index = true) {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            return [];
+        }
+        $urls = [];
+        if ($include_index) {
+            $urls[] = '/sitemap_index.xml';
+            $urls[] = '/sitemap-index.xml';
+            $urls[] = '/vpp-index.xml';
+            foreach (['index_url', 'alias_index_url', 'root_index_url', 'yoast_index_url'] as $key) {
+                if (!empty($storage[$key])) {
+                    $urls[] = $storage[$key];
+                }
+            }
+            $bases = ['sitemap_index.xml', 'sitemap-index.xml', 'vpp-index.xml'];
+            foreach ($bases as $name) {
+                if (!empty($storage['url'])) {
+                    $urls[] = trailingslashit($storage['url']) . $name;
+                }
+                if (!empty($storage['upload_url'])) {
+                    $urls[] = trailingslashit($storage['upload_url']) . $name;
+                }
+                if (!empty($storage['legacy_url'])) {
+                    $urls[] = trailingslashit($storage['legacy_url']) . $name;
+                }
+            }
+        }
+        $filenames = array_values(array_unique(array_filter(array_map('basename', $filenames))));
+        foreach ($filenames as $file) {
+            if (!empty($storage['url'])) {
+                $urls[] = trailingslashit($storage['url']) . $file;
+            }
+            if (!empty($storage['upload_url'])) {
+                $urls[] = trailingslashit($storage['upload_url']) . $file;
+            }
+            if (!empty($storage['legacy_url'])) {
+                $urls[] = trailingslashit($storage['legacy_url']) . $file;
+            }
+        }
+        return $this->cf_normalize_urls($urls);
+    }
+
+    private function cf_collect_existing_sitemap_files() {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) {
+            return [];
+        }
+        $files = [];
+        $dirs = [];
+        if (!empty($storage['dir'])) {
+            $dirs[] = $storage['dir'];
+        }
+        if (!empty($storage['legacy_dir'])) {
+            $dirs[] = $storage['legacy_dir'];
+        }
+        foreach ($dirs as $dir) {
+            $dir = trailingslashit($dir);
+            if (!is_dir($dir)) {
+                continue;
+            }
+            foreach (glob($dir . '*.xml') ?: [] as $path) {
+                $files[] = basename($path);
+            }
+        }
+        return array_values(array_unique($files));
+    }
+
+    private function cf_collect_product_urls(array $slugs) {
+        $urls = [];
+        $base = rtrim(home_url(), '/');
+        foreach ($slugs as $slug) {
+            $slug = sanitize_title($slug);
+            if ($slug === '') {
+                continue;
+            }
+            $urls[] = $base . '/p/' . $slug;
+        }
+        return $this->cf_normalize_urls($urls);
+    }
+
+    private function cf_request($method, $endpoint, ?array $payload = null) {
+        $args = [
+            'method' => $method,
+            'headers' => [
+                'Authorization' => 'Bearer ' . $this->cf_get_api_token(),
+                'Content-Type' => 'application/json',
+            ],
+            'timeout' => 25,
+        ];
+        if ($payload !== null) {
+            $args['body'] = wp_json_encode($payload);
+        }
+        $response = wp_remote_request($endpoint, $args);
+        if (is_wp_error($response)) {
+            return [
+                'success' => false,
+                'code' => 0,
+                'body' => null,
+                'message' => 'Cloudflare request failed: ' . $response->get_error_message(),
+                'ray' => '',
+                'should_retry' => true,
+            ];
+        }
+        $code = wp_remote_retrieve_response_code($response);
+        $body_raw = wp_remote_retrieve_body($response);
+        $body = json_decode($body_raw, true);
+        $success = ($code >= 200 && $code < 300 && (!is_array($body) || !isset($body['success']) || $body['success']));
+        $message = '';
+        if (!$success) {
+            if (is_array($body) && !empty($body['errors'][0]['message'])) {
+                $message = $body['errors'][0]['message'];
+            } elseif ($code) {
+                $message = 'HTTP ' . $code;
+            } else {
+                $message = 'Unknown error';
+            }
+        }
+        $ray = function_exists('wp_remote_retrieve_header') ? wp_remote_retrieve_header($response, 'cf-ray') : '';
+        $should_retry = !$success && ($code >= 500 || $code === 429);
+        return [
+            'success' => $success,
+            'code' => $code,
+            'body' => $body,
+            'message' => $message,
+            'ray' => $ray,
+            'should_retry' => $should_retry,
+        ];
+    }
+
+    private function cf_purge_files(array $urls) {
+        $urls = $this->cf_normalize_urls($urls);
+        $result = [
+            'success' => false,
+            'count' => 0,
+            'duration' => 0,
+            'messages' => [],
+            'ray_ids' => [],
+        ];
+        if (empty($urls)) {
+            $result['success'] = true;
+            $result['messages'][] = 'No URLs to purge.';
+            return $result;
+        }
+        if (!$this->cf_is_ready()) {
+            $result['messages'][] = 'Cloudflare credentials not configured.';
+            return $result;
+        }
+        $endpoint = $this->cf_build_endpoint('purge_cache');
+        if ($endpoint === '') {
+            $result['messages'][] = 'Cloudflare zone ID not configured.';
+            return $result;
+        }
+        $start = microtime(true);
+        foreach (array_chunk($urls, 2000) as $chunk) {
+            $attempts = 0;
+            $response = null;
+            do {
+                $attempts++;
+                $response = $this->cf_request('POST', $endpoint, ['files' => $chunk]);
+                if (!empty($response['success'])) {
+                    $result['count'] += count($chunk);
+                    if (!empty($response['ray'])) {
+                        $result['ray_ids'][] = $response['ray'];
+                    }
+                    break;
+                }
+            } while ($attempts < 2 && !empty($response['should_retry']));
+            if (empty($response['success'])) {
+                $result['messages'][] = $response['message'] ?: 'Cloudflare purge failed.';
+                $result['duration'] = microtime(true) - $start;
+                return $result;
+            }
+        }
+        $result['success'] = true;
+        $result['duration'] = microtime(true) - $start;
+        return $result;
+    }
+
+    private function cf_purge_sitemaps(array $filenames = []) {
+        $urls = $this->cf_collect_sitemap_urls($filenames, true);
+        $result = $this->cf_purge_files($urls);
+        if (empty($result['messages'])) {
+            $result['messages'][] = $result['success']
+                ? sprintf('Cloudflare purge successful (%d URL%s).', $result['count'], $result['count'] === 1 ? '' : 's')
+                : 'Cloudflare purge failed.';
+        }
+        $result['urls'] = $urls;
+        return $result;
+    }
+
+    private function cf_purge_products(array $slugs) {
+        $urls = $this->cf_collect_product_urls($slugs);
+        $result = $this->cf_purge_files($urls);
+        if (empty($result['messages'])) {
+            $result['messages'][] = $result['success']
+                ? sprintf('Cloudflare purge successful (%d URL%s).', $result['count'], $result['count'] === 1 ? '' : 's')
+                : 'Cloudflare purge failed.';
+        }
+        $result['urls'] = $urls;
+        return $result;
+    }
+
+    private function cf_purge_everything() {
+        $result = [
+            'success' => false,
+            'count' => 0,
+            'duration' => 0,
+            'messages' => [],
+            'ray_ids' => [],
+        ];
+        if (!$this->cf_is_ready()) {
+            $result['messages'][] = 'Cloudflare credentials not configured.';
+            return $result;
+        }
+        $endpoint = $this->cf_build_endpoint('purge_cache');
+        if ($endpoint === '') {
+            $result['messages'][] = 'Cloudflare zone ID not configured.';
+            return $result;
+        }
+        $start = microtime(true);
+        $response = $this->cf_request('POST', $endpoint, ['purge_everything' => true]);
+        $result['duration'] = microtime(true) - $start;
+        if (!empty($response['success'])) {
+            $result['success'] = true;
+            $result['messages'][] = 'Cloudflare purge everything executed.';
+            if (!empty($response['ray'])) {
+                $result['ray_ids'][] = $response['ray'];
+            }
+        } else {
+            $result['messages'][] = $response['message'] ?: 'Cloudflare purge failed.';
+            if (!empty($response['ray'])) {
+                $result['ray_ids'][] = $response['ray'];
+            }
+        }
+        return $result;
+    }
+
+    private function cf_log_result($context, array $result) {
+        $success = !empty($result['success']);
+        $status = $success ? 'SUCCESS' : 'FAIL';
+        $count = isset($result['count']) ? (int)$result['count'] : 0;
+        $duration = isset($result['duration']) ? sprintf('%.2fs', $result['duration']) : 'n/a';
+        $messages = !empty($result['messages']) ? implode(' | ', array_map('strval', $result['messages'])) : '';
+        $rays = !empty($result['ray_ids']) ? 'ray=' . implode(',', array_map('strval', $result['ray_ids'])) : '';
+        $parts = array_filter([$status, "context={$context}", "urls={$count}", "duration={$duration}", $rays, $messages]);
+        $this->log_error('cloudflare', implode(' ', $parts));
+    }
+
+    private function get_cf_last_batch() {
+        $stored = get_option(self::CF_LAST_BATCH_OPTION);
+        if (!is_array($stored)) {
+            return null;
+        }
+        $files = [];
+        foreach ((array)($stored['sitemap_files'] ?? []) as $file) {
+            $file = basename((string)$file);
+            if ($file !== '') {
+                $files[] = $file;
+            }
+        }
+        $files = array_values(array_unique($files));
+        $slugs = [];
+        foreach ((array)($stored['product_slugs'] ?? []) as $slug) {
+            $slug = sanitize_title($slug);
+            if ($slug !== '') {
+                $slugs[] = $slug;
+            }
+        }
+        $slugs = array_values(array_unique($slugs));
+        $timestamp = isset($stored['timestamp']) ? (int)$stored['timestamp'] : 0;
+        return [
+            'timestamp' => $timestamp,
+            'sitemap_files' => $files,
+            'product_slugs' => $slugs,
+        ];
+    }
+
+    private function save_cf_last_batch(array $data) {
+        $files = [];
+        foreach ((array)($data['sitemap_files'] ?? []) as $file) {
+            $file = basename((string)$file);
+            if ($file !== '') {
+                $files[] = $file;
+            }
+        }
+        $files = array_values(array_unique($files));
+        $slugs = [];
+        foreach ((array)($data['product_slugs'] ?? []) as $slug) {
+            $slug = sanitize_title($slug);
+            if ($slug !== '') {
+                $slugs[] = $slug;
+            }
+        }
+        $slugs = array_values(array_unique($slugs));
+        $payload = [
+            'timestamp' => isset($data['timestamp']) ? (int)$data['timestamp'] : time(),
+            'sitemap_files' => $files,
+            'product_slugs' => $slugs,
+        ];
+        update_option(self::CF_LAST_BATCH_OPTION, $payload, false);
+    }
+
+    private function cf_reset_recent() {
+        $this->cf_recent_sitemaps = [];
+        $this->cf_recent_sitemap_files = [];
+        $this->cf_recent_product_slugs = [];
+    }
+
+    private function cf_record_recent_sitemaps(array $urls, array $filenames = []) {
+        foreach ($urls as $url) {
+            $url = trim((string)$url);
+            if ($url !== '') {
+                $this->cf_recent_sitemaps[$url] = true;
+            }
+        }
+        foreach ($filenames as $file) {
+            $file = basename((string)$file);
+            if ($file !== '') {
+                $this->cf_recent_sitemap_files[$file] = true;
+            }
+        }
+    }
+
+    private function cf_record_recent_products(array $slugs) {
+        foreach ($slugs as $slug) {
+            $slug = sanitize_title($slug);
+            if ($slug !== '') {
+                $this->cf_recent_product_slugs[$slug] = true;
+            }
+        }
+    }
+
+    private function cf_get_recent_context() {
+        return [
+            'sitemap_files' => array_keys($this->cf_recent_sitemap_files),
+            'sitemap_urls' => array_keys($this->cf_recent_sitemaps),
+            'product_slugs' => array_keys($this->cf_recent_product_slugs),
+        ];
+    }
+
+    public function cf_on_publish_completed($changed_sitemaps, $published_slugs) {
+        $files = [];
+        foreach ((array)$changed_sitemaps as $file) {
+            $file = basename((string)$file);
+            if ($file !== '') {
+                $files[] = $file;
+            }
+        }
+        $files = array_values(array_unique($files));
+        $slugs = [];
+        foreach ((array)$published_slugs as $slug) {
+            $slug = sanitize_title($slug);
+            if ($slug !== '') {
+                $slugs[] = $slug;
+            }
+        }
+        $slugs = array_values(array_unique($slugs));
+        $this->save_cf_last_batch([
+            'timestamp' => time(),
+            'sitemap_files' => $files,
+            'product_slugs' => $slugs,
+        ]);
+        $settings = $this->get_settings();
+        if (empty($settings['cloudflare']['enable_purge_on_publish']) || !$this->cf_is_ready()) {
+            return;
+        }
+        $sitemap_result = $this->cf_purge_sitemaps($files);
+        $this->cf_log_result('auto_publish_sitemaps', $sitemap_result);
+        if (!empty($settings['cloudflare']['include_product_urls']) && !empty($slugs)) {
+            $product_result = $this->cf_purge_products($slugs);
+            $this->cf_log_result('auto_publish_products', $product_result);
+        }
     }
 
     private function purge_sitemap_cache(array $storage, array $filenames = []) {
@@ -3567,6 +4872,8 @@ CSS;
     private function rebuild_sitemaps(&$summary = '', &$err = null) {
         $mysqli = $this->db_connect($err);
         if (!$mysqli) { return false; }
+        $this->cf_reset_recent();
+        if (!is_array($changed_files)) { $changed_files = []; }
 
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $this->get_settings()['tidb']['table']);
         $batch_size = 2000;
@@ -3643,7 +4950,12 @@ CSS;
                 $total++;
                 if (count($chunk_entries) >= $chunk_size) {
                     $chunk_index++;
-                    if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) { $res->free(); @$mysqli->close(); return false; }
+                    if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) {
+                        $res->free();
+                        @$mysqli->close();
+                        $changed_files = array_values(array_unique($purge_files));
+                        return false;
+                    }
                     $chunk_entries = []; $chunk_lastmod = 0;
                 }
             }
@@ -3654,10 +4966,22 @@ CSS;
 
         if (!empty($chunk_entries)) {
             $chunk_index++;
-            if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) { @$mysqli->close(); return false; }
+            if (!$write_chunk($chunk_entries, $chunk_lastmod, $chunk_index)) {
+                @$mysqli->close();
+                $changed_files = array_values(array_unique($purge_files));
+                return false;
+            }
         }
 
         @$mysqli->close();
+
+        $cat_err = null;
+        $category_entry = $this->write_category_sitemap($cat_err);
+        if (is_array($category_entry)) {
+            $files[] = ['loc' => $category_entry['url'], 'lastmod' => $category_entry['lastmod']];
+        } elseif (!empty($cat_err)) {
+            $this->log_error('sitemap', $cat_err);
+        }
 
         $index_path = $dir . 'sitemap-index.xml';
         $index_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
@@ -3692,7 +5016,12 @@ CSS;
             $this->purge_sitemap_cache($storage, $purge_files);
         }
 
+        $meta = $this->get_sitemap_meta();
+        $meta['base_url'] = $base_url;
+        $this->save_sitemap_meta($meta);
+
         $summary = sprintf('Generated %d sitemap file(s) covering %d product(s).', count($files), $total);
+        $changed_files = array_values(array_unique($purge_files));
         return true;
     }
 
@@ -3760,6 +5089,49 @@ CSS;
         return null;
     }
 
+    private function current_category_slug() {
+        $slug = get_query_var(self::CATEGORY_SLUG_QUERY_VAR);
+        if (!$slug) {
+            return null;
+        }
+        $slug = sanitize_title($slug);
+        return $slug === '' ? null : $slug;
+    }
+
+    private function current_category_page() {
+        $page = get_query_var(self::CATEGORY_PAGE_QUERY_VAR);
+        if (!$page) {
+            return 1;
+        }
+        $page = (int)$page;
+        return $page > 0 ? $page : 1;
+    }
+
+    private function is_category_request() {
+        $index = get_query_var(self::CATEGORY_INDEX_QUERY_VAR);
+        $slug = get_query_var(self::CATEGORY_SLUG_QUERY_VAR);
+        return !empty($index) || !empty($slug);
+    }
+
+    private function ensure_category_context(&$err = null) {
+        if (is_array($this->current_category_context)) {
+            return $this->current_category_context;
+        }
+        if (!$this->is_category_request()) {
+            return null;
+        }
+        $per_page = $this->get_category_per_page();
+        $page = $this->current_category_page();
+        $slug = $this->current_category_slug();
+        $context = $slug
+            ? $this->get_category_archive_data($slug, $page, $per_page, $err)
+            : $this->get_category_index_data($page, $per_page, false, $err);
+        if ($context) {
+            $this->current_category_context = $context;
+        }
+        return $this->current_category_context;
+    }
+
     private function get_current_product(&$err = null) {
         $slug = $this->current_vpp_slug();
         if (!$slug) {
@@ -3781,33 +5153,62 @@ CSS;
 
     public function filter_canonical($url) {
         $slug = $this->current_vpp_slug();
-        if (!$slug) return $url;
-        return home_url('/p/' . $slug);
+        if ($slug) {
+            return home_url('/p/' . $slug);
+        }
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context && !empty($context['canonical'])) {
+                return $context['canonical'];
+            }
+        }
+        return $url;
     }
 
     public function filter_document_title($title) {
-        if (!$this->current_vpp_slug()) return $title;
-        $err = null;
-        $p = $this->get_current_product($err);
-        if (!$p) return $title;
-        $base = $p['title_h1'] ?: $p['slug'];
-        $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
-        return $base . ' | ' . $site;
+        if ($this->current_vpp_slug()) {
+            $err = null;
+            $p = $this->get_current_product($err);
+            if (!$p) return $title;
+            $base = $p['title_h1'] ?: $p['slug'];
+            $site = wp_specialchars_decode(get_bloginfo('name'), ENT_QUOTES);
+            return $base . ' | ' . $site;
+        }
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context && !empty($context['title'])) {
+                return $context['title'];
+            }
+        }
+        return $title;
     }
 
     public function filter_yoast_metadesc($value) {
-        if (!$this->current_vpp_slug()) return $value;
-        $err = null;
-        $p = $this->get_current_product($err);
-        if (!$p) return $value;
-        $meta = $this->build_meta_description($p);
-        $this->last_meta_source = 'Yoast filter';
-        $this->last_meta_value = $meta;
-        return $meta;
+        if ($this->current_vpp_slug()) {
+            $err = null;
+            $p = $this->get_current_product($err);
+            if (!$p) return $value;
+            $meta = $this->build_meta_description($p);
+            $this->last_meta_source = 'Yoast filter';
+            $this->last_meta_value = $meta;
+            return $meta;
+        }
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if ($context && !empty($context['meta_description'])) {
+                $this->last_meta_source = 'Category';
+                $this->last_meta_value = $context['meta_description'];
+                return $context['meta_description'];
+            }
+        }
+        return $value;
     }
 
     public function filter_yoast_presenters($presenters) {
-        if (!$this->current_vpp_slug()) {
+        if (!$this->current_vpp_slug() && !$this->is_category_request()) {
             return $presenters;
         }
         if (!is_array($presenters)) {
@@ -3907,12 +5308,337 @@ CSS;
         $product = $this->get_current_product($err);
         if (!$product || empty($product['is_published'])) {
             status_header(404);
-            nocache_headers();
-            echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
             exit;
         }
-        $this->render_product($product);
+        header('Content-Type: application/xml; charset=UTF-8');
+        header('X-Robots-Tag: noindex, follow', true);
+        header('Cache-Control: no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
+        readfile($path);
         exit;
+    }
+
+    public function maybe_render_vpp() {
+        $slug = $this->current_vpp_slug();
+        if ($slug) {
+            $err = null;
+            $product = $this->get_current_product($err);
+            if (!$product || empty($product['is_published'])) {
+                status_header(404);
+                nocache_headers();
+                echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>Product not found.</p></body></html>';
+                exit;
+            }
+            $this->render_product($product);
+            exit;
+        }
+
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if (!$context) {
+                $this->render_category_not_found();
+                exit;
+            }
+
+            if (($context['type'] ?? '') === 'archive') {
+                $this->render_category_archive($context);
+            } else {
+                $this->render_category_index($context);
+            }
+            exit;
+        }
+    }
+
+    private function build_category_page_url($base, $page) {
+        $base = trailingslashit($base);
+        if ($page <= 1) {
+            return $base;
+        }
+        return trailingslashit($base . 'page/' . (int)$page);
+    }
+
+    private function render_category_pagination($current, $total, $base_url) {
+        $current = (int)$current;
+        $total = (int)$total;
+        if ($total <= 1) {
+            return;
+        }
+        $base_url = trailingslashit($base_url);
+        $start = max(1, $current - 2);
+        $end = min($total, $current + 2);
+        echo '<nav class="vpp-pagination" aria-label="Pagination"><ul class="vpp-pagination-list">';
+        if ($current > 1) {
+            $prev = $this->build_category_page_url($base_url, $current - 1);
+            echo '<li class="vpp-page-item"><a class="vpp-page-link" href="' . esc_url($prev) . '">' . esc_html__('Prev', 'virtual-product-pages') . '</a></li>';
+        } else {
+            echo '<li class="vpp-page-item disabled"><span class="vpp-page-link">' . esc_html__('Prev', 'virtual-product-pages') . '</span></li>';
+        }
+        for ($i = $start; $i <= $end; $i++) {
+            $url = $this->build_category_page_url($base_url, $i);
+            if ($i === $current) {
+                echo '<li class="vpp-page-item active"><span class="vpp-page-link" aria-current="page">' . esc_html($i) . '</span></li>';
+            } else {
+                echo '<li class="vpp-page-item"><a class="vpp-page-link" href="' . esc_url($url) . '">' . esc_html($i) . '</a></li>';
+            }
+        }
+        if ($current < $total) {
+            $next = $this->build_category_page_url($base_url, $current + 1);
+            echo '<li class="vpp-page-item"><a class="vpp-page-link" href="' . esc_url($next) . '">' . esc_html__('Next', 'virtual-product-pages') . '</a></li>';
+        } else {
+            echo '<li class="vpp-page-item disabled"><span class="vpp-page-link">' . esc_html__('Next', 'virtual-product-pages') . '</span></li>';
+        }
+        echo '</ul></nav>';
+    }
+
+    private function render_category_index($context) {
+        $items = isset($context['items']) ? $context['items'] : [];
+        $total = isset($context['total']) ? (int)$context['total'] : 0;
+        $page = isset($context['page']) ? (int)$context['page'] : 1;
+        $total_pages = isset($context['total_pages']) ? (int)$context['total_pages'] : 1;
+        $count_label = $this->format_items_label($total);
+        $inline_css = $this->current_inline_css;
+        if ($inline_css === '') {
+            $inline_css = $this->load_css_contents();
+            $this->current_inline_css = $inline_css;
+        }
+
+        @header('Content-Type: text/html; charset=utf-8');
+        @header('Cache-Control: public, max-age=300');
+
+        get_header();
+
+        if ($inline_css !== '') {
+            echo '<style id="vpp-inline-css-fallback">' . $inline_css . '</style>';
+        }
+
+        $base_url = home_url('/p-cat/');
+
+        echo '<main class="vpp-container vpp-categories">';
+        echo '<div class="vpp">';
+        echo '<section class="vpp card-elevated vpp-cat-hero">';
+        echo '<h1 class="vpp-cat-title">' . esc_html__('Categories', 'virtual-product-pages') . '</h1>';
+        echo '<p class="vpp-cat-subtitle">' . esc_html($count_label) . '</p>';
+        echo '</section>';
+
+        if (empty($items)) {
+            echo '<section class="vpp card vpp-cat-empty"><p>' . esc_html__('No categories yet.', 'virtual-product-pages') . '</p></section>';
+        } else {
+            echo '<section class="vpp card vpp-cat-grid-wrap">';
+            echo '<div class="vpp-cat-grid">';
+            foreach ($items as $item) {
+                $slug = $item['slug'];
+                $name = $item['name'];
+                $count = isset($item['count']) ? (int)$item['count'] : 0;
+                $href = $this->build_category_page_url(home_url('/p-cat/' . $slug . '/'), 1);
+                echo '<a class="vpp-cat-card" href="' . esc_url($href) . '" aria-label="' . esc_attr(sprintf(__('View category: %s', 'virtual-product-pages'), $name)) . '">';
+                echo '<span class="vpp-cat-name">' . esc_html($name) . '</span>';
+                echo '<span class="vpp-cat-count">' . esc_html($this->format_items_label($count)) . '</span>';
+                echo '</a>';
+            }
+            echo '</div>';
+            echo '</section>';
+            $this->render_category_pagination($page, $total_pages, $base_url);
+        }
+
+        $this->output_category_json_ld($context);
+
+        echo '</div>';
+        echo '</main>';
+
+        get_footer();
+    }
+
+    private function render_category_archive($context) {
+        $items = isset($context['items']) ? $context['items'] : [];
+        $count = isset($context['count']) ? (int)$context['count'] : 0;
+        $page = isset($context['page']) ? (int)$context['page'] : 1;
+        $total_pages = isset($context['total_pages']) ? (int)$context['total_pages'] : 1;
+        $name = isset($context['name']) ? $context['name'] : '';
+        $slug = isset($context['slug']) ? $context['slug'] : '';
+        $count_label = $this->format_items_label($count);
+        $inline_css = $this->current_inline_css;
+        if ($inline_css === '') {
+            $inline_css = $this->load_css_contents();
+            $this->current_inline_css = $inline_css;
+        }
+
+        @header('Content-Type: text/html; charset=utf-8');
+        @header('Cache-Control: public, max-age=300');
+
+        get_header();
+
+        if ($inline_css !== '') {
+            echo '<style id="vpp-inline-css-fallback">' . $inline_css . '</style>';
+        }
+
+        $base_url = home_url('/p-cat/' . $slug . '/');
+
+        echo '<main class="vpp-container vpp-category-archive">';
+        echo '<div class="vpp">';
+        echo '<section class="vpp card-elevated vpp-archive-hero">';
+        echo '<h1 class="vpp-archive-title">' . esc_html($name) . '</h1>';
+        $subtitle = $count_label;
+        if ($total_pages > 1) {
+            $subtitle .= ' • ' . sprintf(__('Page %d of %d', 'virtual-product-pages'), $page, $total_pages);
+        }
+        echo '<p class="vpp-archive-subtitle">' . esc_html($subtitle) . '</p>';
+        echo '</section>';
+
+        if (empty($items)) {
+            echo '<section class="vpp card vpp-archive-empty"><p>' . esc_html__('No products in this category yet.', 'virtual-product-pages') . '</p></section>';
+        } else {
+            echo '<section class="vpp card vpp-archive-grid">';
+            foreach ($items as $item) {
+                $product_slug = $item['slug'];
+                if (!$product_slug) { continue; }
+                $title = $item['title_h1'] ?: $product_slug;
+                $brand = $item['brand'] ?? '';
+                $model = $item['model'] ?? '';
+                $summary = isset($item['short_summary']) ? trim((string)$item['short_summary']) : '';
+                if ($summary !== '' && function_exists('mb_substr')) {
+                    $summary = mb_substr($summary, 0, 160);
+                } elseif ($summary !== '') {
+                    $summary = substr($summary, 0, 160);
+                }
+                $parts = array_filter([$brand, $model]);
+                $meta = implode(' • ', $parts);
+                $images = [];
+                if (!empty($item['images_json'])) {
+                    $decoded = json_decode($item['images_json'], true);
+                    if (is_array($decoded)) {
+                        $images = $decoded;
+                    }
+                }
+                $href = home_url('/p/' . $product_slug . '/');
+                echo '<a class="vpp-archive-card" href="' . esc_url($href) . '">';
+                if (!empty($images) && !empty($images[0])) {
+                    echo '<div class="vpp-archive-thumb"><img src="' . esc_url($images[0]) . '" alt="' . esc_attr($title) . '" loading="lazy" decoding="async"></div>';
+                } else {
+                    echo '<div class="vpp-archive-thumb placeholder" aria-hidden="true"></div>';
+                }
+                echo '<div class="vpp-archive-body">';
+                echo '<h2 class="vpp-archive-card-title">' . esc_html($title) . '</h2>';
+                if ($meta !== '') {
+                    echo '<p class="vpp-archive-card-meta">' . esc_html($meta) . '</p>';
+                }
+                if ($summary !== '') {
+                    echo '<p class="vpp-archive-card-summary">' . esc_html($summary) . '</p>';
+                }
+                echo '</div>';
+                echo '</a>';
+            }
+            echo '</section>';
+            $this->render_category_pagination($page, $total_pages, $base_url);
+        }
+
+        $this->output_category_json_ld($context);
+
+        echo '</div>';
+        echo '</main>';
+
+        get_footer();
+    }
+
+    private function render_category_not_found() {
+        status_header(404);
+        nocache_headers();
+        echo '<!doctype html><html><head><meta charset="utf-8"><title>Not found</title></head><body><h1>404</h1><p>' . esc_html__('Category not found.', 'virtual-product-pages') . '</p></body></html>';
+    }
+
+    private function output_category_json_ld($context) {
+        if (!is_array($context) || empty($context['canonical'])) {
+            return;
+        }
+        $canonical = $context['canonical'];
+        $offset = isset($context['offset']) ? (int)$context['offset'] : 0;
+        $items = isset($context['items']) && is_array($context['items']) ? $context['items'] : [];
+        $breadcrumb = [
+            '@context' => 'https://schema.org',
+            '@type' => 'BreadcrumbList',
+            'itemListElement' => [
+                [
+                    '@type' => 'ListItem',
+                    'position' => 1,
+                    'name' => get_bloginfo('name'),
+                    'item' => home_url('/'),
+                ],
+                [
+                    '@type' => 'ListItem',
+                    'position' => 2,
+                    'name' => __('Categories', 'virtual-product-pages'),
+                    'item' => trailingslashit(home_url('/p-cat/')),
+                ],
+            ],
+        ];
+
+        if ($context['type'] === 'archive') {
+            $breadcrumb['itemListElement'][] = [
+                '@type' => 'ListItem',
+                'position' => 3,
+                'name' => $context['name'],
+                'item' => $context['canonical'],
+            ];
+            if ($context['page'] > 1) {
+                $breadcrumb['itemListElement'][] = [
+                    '@type' => 'ListItem',
+                    'position' => 4,
+                    'name' => sprintf(__('Page %d', 'virtual-product-pages'), $context['page']),
+                    'item' => $context['canonical'],
+                ];
+            }
+            $item_list = [];
+            $position = $offset + 1;
+            foreach ($items as $item) {
+                if (empty($item['slug'])) {
+                    continue;
+                }
+                $item_list[] = [
+                    '@type' => 'ListItem',
+                    'position' => $position++,
+                    'name' => $item['title_h1'] ?: $item['slug'],
+                    'url' => home_url('/p/' . $item['slug'] . '/'),
+                ];
+            }
+            $collection = [
+                '@context' => 'https://schema.org',
+                '@type' => 'CollectionPage',
+                'name' => $context['name'],
+                'url' => $canonical,
+                'mainEntity' => [
+                    '@type' => 'ItemList',
+                    'itemListOrder' => 'http://schema.org/ItemListOrderDescending',
+                    'itemListElement' => $item_list,
+                ],
+            ];
+        } else {
+            $breadcrumb['itemListElement'][1]['item'] = $canonical;
+            $item_list = [];
+            $position = $offset + 1;
+            foreach ($items as $item) {
+                $item_list[] = [
+                    '@type' => 'ListItem',
+                    'position' => $position++,
+                    'name' => $item['name'],
+                    'url' => $this->build_category_page_url(home_url('/p-cat/' . $item['slug'] . '/'), 1),
+                ];
+            }
+            $collection = [
+                '@context' => 'https://schema.org',
+                '@type' => 'CollectionPage',
+                'name' => __('Categories', 'virtual-product-pages'),
+                'url' => $canonical,
+                'mainEntity' => [
+                    '@type' => 'ItemList',
+                    'itemListOrder' => 'http://schema.org/ItemListOrderAscending',
+                    'itemListElement' => $item_list,
+                ],
+            ];
+        }
+
+        $payload = [$collection, $breadcrumb];
+        echo '<script type="application/ld+json">' . wp_json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . '</script>';
     }
 
     private function allowed_html() {
@@ -4071,43 +5797,66 @@ CSS;
     }
 
     public function output_meta_tags() {
-        if (!$this->current_vpp_slug()) {
-            return;
-        }
-
-        $err = null;
-        $product = $this->get_current_product($err);
-        if (!$product || empty($product['is_published'])) {
-            return;
-        }
-
-        $meta_description = $this->current_meta_description !== ''
-            ? $this->current_meta_description
-            : $this->build_meta_description($product);
-        $canonical = $this->current_canonical !== ''
-            ? $this->current_canonical
-            : home_url('/p/' . $product['slug']);
-
         $css_href = add_query_arg('ver', self::VERSION, plugins_url('assets/vpp.css', __FILE__));
+        if ($this->current_vpp_slug()) {
+            $err = null;
+            $product = $this->get_current_product($err);
+            if (!$product || empty($product['is_published'])) {
+                return;
+            }
 
-        if (!defined('WPSEO_VERSION')) {
-            echo '<link rel="canonical" href="' . esc_url($canonical) . '" />' . "\n";
+            $meta_description = $this->current_meta_description !== ''
+                ? $this->current_meta_description
+                : $this->build_meta_description($product);
+            $canonical = $this->current_canonical !== ''
+                ? $this->current_canonical
+                : home_url('/p/' . $product['slug']);
+
+            if (!defined('WPSEO_VERSION')) {
+                echo '<link rel="canonical" href="' . esc_url($canonical) . '" />' . "\n";
+            }
+
+            echo '<link rel="preload" href="' . esc_url($css_href) . '" as="style" />' . "\n";
+            echo '<meta name="description" content="' . esc_attr($meta_description) . '" data-vpp-meta="description" />' . "\n";
+            echo '<meta property="og:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="og-description" />' . "\n";
+            echo '<meta name="twitter:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="twitter-description" />' . "\n";
+
+            if ($this->last_meta_source === '') {
+                $this->last_meta_source = 'Manual tag';
+            }
+            $this->last_meta_value = $meta_description;
+            return;
         }
 
-        echo '<link rel="preload" href="' . esc_url($css_href) . '" as="style" />' . "\n";
+        if ($this->is_category_request()) {
+            $err = null;
+            $context = $this->ensure_category_context($err);
+            if (!$context) {
+                return;
+            }
+            $meta_description = $context['meta_description'] ?? '';
+            $canonical = $context['canonical'] ?? trailingslashit(home_url('/p-cat/'));
 
-        echo '<meta name="description" content="' . esc_attr($meta_description) . '" data-vpp-meta="description" />' . "\n";
-        echo '<meta property="og:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="og-description" />' . "\n";
-        echo '<meta name="twitter:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="twitter-description" />' . "\n";
+            if (!defined('WPSEO_VERSION')) {
+                echo '<link rel="canonical" href="' . esc_url($canonical) . '" />' . "\n";
+            }
 
-        if ($this->last_meta_source === '') {
-            $this->last_meta_source = 'Manual tag';
+            echo '<link rel="preload" href="' . esc_url($css_href) . '" as="style" />' . "\n";
+
+            if ($meta_description !== '') {
+                echo '<meta name="description" content="' . esc_attr($meta_description) . '" data-vpp-meta="description" />' . "\n";
+                echo '<meta property="og:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="og-description" />' . "\n";
+                echo '<meta name="twitter:description" content="' . esc_attr($meta_description) . '" data-vpp-meta="twitter-description" />' . "\n";
+                if ($this->last_meta_source === '') {
+                    $this->last_meta_source = 'Category page';
+                }
+                $this->last_meta_value = $meta_description;
+            }
         }
-        $this->last_meta_value = $meta_description;
     }
 
     public function inject_inline_css_head() {
-        if (!$this->current_vpp_slug()) {
+        if (!$this->current_vpp_slug() && !$this->is_category_request()) {
             return;
         }
         $inline = $this->current_inline_css;
