@@ -4083,11 +4083,19 @@ CSS;
             exit;
         }
 
-        $files = glob($dir . 'products-*.xml') ?: [];
+        $files = glob($dir . '*.xml') ?: [];
+        $skip_names = [
+            'sitemap_index.xml',
+            'sitemap-index.xml',
+            'vpp-index.xml',
+        ];
         $rows = [];
         $total_urls = 0;
         foreach ($files as $file) {
             $name = basename($file);
+            if (in_array($name, $skip_names, true)) {
+                continue;
+            }
             $size = @filesize($file) ?: 0;
             $mtime = @filemtime($file) ?: time();
             $entries = $this->read_sitemap_entries($file);
