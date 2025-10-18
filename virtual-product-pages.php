@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.5.4
+ * Version: 1.5.5
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -16,14 +16,8 @@ class VPP_Plugin {
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const CATEGORY_INDEX_QUERY_VAR = 'vpp_cat_index';
-    const CATEGORY_SLUG_QUERY_VAR = 'vpp_cat_slug';
-    const CATEGORY_PAGE_QUERY_VAR = 'vpp_cat_page';
-    const CATEGORY_PER_PAGE_DEFAULT = 12;
-    const CATEGORY_PER_PAGE_MAX = 48;
-    const CATEGORY_CACHE_TTL = 1800; // 30 minutes
-    const CATEGORY_RESERVED_SLUGS = ['page', 'feed', 'tag', 'category', 'amp', 'index'];
-    const VERSION = '1.5.4';
+    const VERSION = '1.5.5';
+    const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -178,7 +172,7 @@ CSS;
 
     private function __construct() {
         add_action('init', [$this, 'register_rewrite']);
-        add_action('init', [$this, 'maybe_flush_rewrite_on_update'], 20);
+        add_action('init', [$this, 'maybe_flush_rewrite_on_upgrade'], 20);
         add_filter('query_vars', [$this, 'add_query_var']);
         add_action('template_redirect', [$this, 'maybe_output_sitemap'], 0);
         add_action('template_redirect', [$this, 'maybe_render_vpp']);
@@ -235,10 +229,20 @@ CSS;
         }
     }
 
+    public function maybe_flush_rewrite_on_upgrade() {
+        $stored = get_option(self::VERSION_OPTION);
+        if (!is_string($stored) || version_compare($stored, self::VERSION, '<')) {
+            $this->register_rewrite();
+            flush_rewrite_rules(false);
+            update_option(self::VERSION_OPTION, self::VERSION, false);
+        }
+    }
+
     public static function on_activate() {
-        self::instance()->register_rewrite();
+        $instance = self::instance();
+        $instance->register_rewrite();
         flush_rewrite_rules();
-        update_option(self::VERSION_OPTION, self::VERSION);
+        update_option(self::VERSION_OPTION, self::VERSION, false);
     }
     public static function on_deactivate() { flush_rewrite_rules(); }
 
@@ -246,22 +250,12 @@ CSS;
         $vars[] = self::QUERY_VAR;
         $vars[] = self::SITEMAP_QUERY_VAR;
         $vars[] = self::SITEMAP_FILE_QUERY_VAR;
-        $vars[] = self::CATEGORY_INDEX_QUERY_VAR;
-        $vars[] = self::CATEGORY_SLUG_QUERY_VAR;
-        $vars[] = self::CATEGORY_PAGE_QUERY_VAR;
         return $vars;
     }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
-        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([^&]+)');
-        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
-        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
-        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
-        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
-        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
-        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
         if (!$this->uses_wpseo_sitemaps()) {
             add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
             add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
@@ -269,77 +263,6 @@ CSS;
         add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
         add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
-    }
-
-    public function maybe_flush_rewrite_on_update() {
-        $stored_version = get_option(self::VERSION_OPTION);
-        $current_version = self::VERSION;
-
-        if ($stored_version === $current_version) {
-            return;
-        }
-
-        if (version_compare($current_version, '1.4.9', '>=')) {
-            $this->register_rewrite();
-            flush_rewrite_rules();
-            $this->refresh_sitemaps_after_upgrade();
-        }
-
-        update_option(self::VERSION_OPTION, $current_version);
-    }
-
-    private function refresh_sitemaps_after_upgrade() {
-        $storage = $this->get_sitemap_storage_paths();
-        if (!$storage) {
-            return;
-        }
-
-        $meta = $this->get_sitemap_meta();
-        $stored_base = isset($meta['base_url']) ? (string)$meta['base_url'] : '';
-        $target_base = isset($storage['url']) ? (string)$storage['url'] : '';
-        if ($target_base === '') {
-            return;
-        }
-
-        if ($stored_base !== '' && $stored_base === $target_base) {
-            return;
-        }
-
-        $directories = [];
-        if (wp_mkdir_p($storage['dir'])) {
-            $directories[] = trailingslashit($storage['dir']);
-        }
-        if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
-            $directories[] = trailingslashit($storage['legacy_dir']);
-        }
-
-        $skip_names = ['sitemap_index.xml', 'sitemap-index.xml', 'vpp-index.xml', 'sitemap-categories.xml'];
-        foreach ($directories as $dir) {
-            foreach (glob($dir . '*.xml') ?: [] as $file) {
-                $name = basename($file);
-                if (in_array($name, $skip_names, true)) {
-                    continue;
-                }
-                $entries = $this->read_sitemap_entries($file);
-                if (!$this->write_sitemap_file($file, $entries)) {
-                    error_log('VPP sitemap rewrite after upgrade failed for ' . $name);
-                }
-            }
-        }
-
-        $cat_err = null;
-        $category_entry = $this->write_category_sitemap($cat_err);
-        if ($category_entry === false && !empty($cat_err)) {
-            error_log('VPP category sitemap rewrite after upgrade failed: ' . $cat_err);
-        }
-
-        $meta['base_url'] = $target_base;
-        $this->save_sitemap_meta($meta);
-
-        $index_err = null;
-        if ($this->refresh_sitemap_index($storage, $index_err) === false && !empty($index_err)) {
-            error_log('VPP sitemap index refresh after upgrade failed: ' . $index_err);
-        }
     }
 
     private function uses_wpseo_sitemaps() {
@@ -378,7 +301,8 @@ CSS;
         $path = $storage['dir'] . 'sitemap_index.xml';
         if (!@is_readable($path)) {
             $err = null;
-            $this->refresh_sitemap_index($storage, $err);
+            $index_files = [];
+            $this->refresh_sitemap_index($storage, $err, $index_files);
         }
         $lastmod_ts = @filemtime($path) ?: time();
         $entry  = "  <sitemap>\n";
@@ -2043,64 +1967,15 @@ CSS;
         return @file_put_contents($path, $xml) !== false;
     }
 
-    private function write_category_sitemap(&$err = null) {
-        $storage = $this->get_sitemap_storage_paths();
-        if (!$storage) {
-            $err = 'Sitemap storage unavailable.';
-            return false;
-        }
-        if (!wp_mkdir_p($storage['dir'])) {
-            $err = 'Failed to create sitemap directory.';
-            return false;
-        }
-        $tmp_err = null;
-        $cache = $this->get_category_cache(true, $tmp_err);
-        if ($cache === null && $tmp_err) {
-            $err = $tmp_err;
-            return false;
-        }
-        $categories = isset($cache['categories']) && is_array($cache['categories']) ? $cache['categories'] : [];
-        $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-        $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
-        $lastmod_max = 0;
-        foreach ($categories as $category) {
-            if (empty($category['slug'])) {
-                continue;
-            }
-            $loc = home_url('/p-cat/' . $category['slug'] . '/');
-            $lastmod = !empty($category['last_updated']) ? strtotime($category['last_updated']) : 0;
-            if ($lastmod <= 0) {
-                $lastmod = time();
-            }
-            $lastmod_max = max($lastmod_max, $lastmod);
-            $xml .= "  <url>\n";
-            $xml .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
-            $xml .= '    <lastmod>' . gmdate('c', $lastmod) . '</lastmod>' . "\n";
-            $xml .= "  </url>\n";
-        }
-        $xml .= '</urlset>';
-        $path = $storage['dir'] . 'sitemap-categories.xml';
-        if (@file_put_contents($path, $xml) === false) {
-            $err = 'Failed to write sitemap-categories.xml';
-            return false;
-        }
-        if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
-            @file_put_contents($storage['legacy_dir'] . 'sitemap-categories.xml', $xml);
-        }
-        $lastmod = $lastmod_max > 0 ? gmdate('c', $lastmod_max) : gmdate('c');
-        return [
-            'path' => $path,
-            'url' => $storage['url'] . 'sitemap-categories.xml',
-            'lastmod' => $lastmod,
-        ];
-    }
-
-    private function refresh_sitemap_index(array $storage, &$err = null) {
+    private function refresh_sitemap_index(array $storage, &$err = null, ?array &$touched_files = null) {
         $dir = $storage['dir'];
         $base_url = $storage['url'];
         $files = glob($dir . '*.xml') ?: [];
         $meta = $this->get_sitemap_meta();
         $needs_rewrite = isset($meta['base_url']) ? ($meta['base_url'] !== $base_url) : true;
+        if ($touched_files === null) {
+            $touched_files = [];
+        }
         if ($needs_rewrite) {
             foreach ($files as $file) {
                 $name = basename($file);
@@ -2112,6 +1987,7 @@ CSS;
                     $err = 'Failed to rewrite ' . basename($file);
                     return false;
                 }
+                $touched_files[] = $name;
             }
             $meta['base_url'] = $base_url;
             $this->save_sitemap_meta($meta);
@@ -2147,11 +2023,17 @@ CSS;
         }
         @file_put_contents($dir . 'sitemap-index.xml', $xml);
         @file_put_contents($dir . 'vpp-index.xml', $xml);
+        $touched_files[] = 'sitemap_index.xml';
+        $touched_files[] = 'sitemap-index.xml';
+        $touched_files[] = 'vpp-index.xml';
         if (!empty($storage['legacy_dir'])) {
             if (wp_mkdir_p($storage['legacy_dir'])) {
                 @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $xml);
                 @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $xml);
                 @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $xml);
+                $touched_files[] = 'sitemap_index.xml';
+                $touched_files[] = 'sitemap-index.xml';
+                $touched_files[] = 'vpp-index.xml';
             }
         }
         if (!$needs_rewrite && $meta['base_url'] !== $base_url) {
@@ -2195,6 +2077,7 @@ CSS;
             return true;
         }
         $files_touched = 0;
+        $purge_files = [];
         $filtered_files = [];
         foreach ($existing_files as $file) {
             $name = basename($file);
@@ -2221,6 +2104,7 @@ CSS;
                     return false;
                 }
                 $files_touched++;
+                $purge_files[] = basename($file);
             }
         }
         $remaining = array_values($items_map);
@@ -2259,6 +2143,7 @@ CSS;
                     return false;
                 }
                 $files_touched++;
+                $purge_files[] = basename($file);
             }
         }
         if (!empty($remaining)) {
@@ -2281,18 +2166,17 @@ CSS;
                 }
                 $files_touched++;
                 $filtered_files[] = $path;
+                $purge_files[] = $filename;
             }
         }
-        $cat_err = null;
-        $category_entry = $this->write_category_sitemap($cat_err);
-        if ($category_entry === false && !empty($cat_err)) {
-            $this->log_error('sitemap', $cat_err);
-        } elseif (is_array($category_entry)) {
-            $files_touched++;
-        }
-        $index_url = $this->refresh_sitemap_index($storage, $err);
+        $index_files = [];
+        $index_url = $this->refresh_sitemap_index($storage, $err, $index_files);
         if ($index_url === false) {
             return false;
+        }
+        $purge_targets = array_merge($purge_files, $index_files);
+        if (!empty($purge_targets)) {
+            $this->purge_sitemap_cache($storage, $purge_targets);
         }
         $notes = $files_touched ? sprintf('Updated %d sitemap file(s).', $files_touched) : 'Sitemap unchanged.';
         if ($ping_google && $index_url) {
@@ -3802,13 +3686,18 @@ CSS;
         $this->save_sitemap_meta($meta);
 
         $refresh_err = null;
-        $this->refresh_sitemap_index($storage, $refresh_err);
+        $index_files = [];
+        $this->refresh_sitemap_index($storage, $refresh_err, $index_files);
         if ($refresh_err) {
             $state['message'] = $refresh_err;
             $state['message_type'] = 'error';
         } else {
             $state['message'] = sprintf('Rotation complete. Next sitemap file: %s', $filename);
             $state['message_type'] = 'success';
+        }
+        $purge_targets = array_merge([$filename], $index_files);
+        if (!empty($purge_targets)) {
+            $this->purge_sitemap_cache($storage, $purge_targets);
         }
         $this->save_publish_state($state);
         wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
@@ -3846,18 +3735,20 @@ CSS;
             exit;
         }
 
+        $purge_files = [];
         if ((int)$published_count === 0) {
-            foreach (glob($dir . 'products-*.xml') ?: [] as $old) { @unlink($old); }
-            foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+            foreach (glob($dir . 'products-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+            foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
             if (!empty($storage['legacy_dir']) && is_dir($storage['legacy_dir'])) {
-                foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { @unlink($old); }
-                foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
+                foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+                foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
             }
         }
 
         $files = glob($dir . 'products-*.xml') ?: [];
         $err = null;
-        $this->refresh_sitemap_index($storage, $err);
+        $index_files = [];
+        $this->refresh_sitemap_index($storage, $err, $index_files);
         if ($err) {
             $state['message'] = $err;
             $state['message_type'] = 'error';
@@ -3868,6 +3759,10 @@ CSS;
                 (int)$published_count
             );
             $state['message_type'] = 'success';
+        }
+        $purge_targets = array_merge($purge_files, $index_files);
+        if (!empty($purge_targets)) {
+            $this->purge_sitemap_cache($storage, $purge_targets);
         }
         $this->save_publish_state($state);
         wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
@@ -4158,6 +4053,89 @@ CSS;
         $err = null; return $this->purge_cloudflare([$url], $err);
     }
 
+    private function purge_sitemap_cache(array $storage, array $filenames = []) {
+        $settings = $this->get_settings();
+        $token = trim($settings['cloudflare']['api_token'] ?? '');
+        $zone  = trim($settings['cloudflare']['zone_id'] ?? '');
+        if (!$token || !$zone) {
+            return;
+        }
+
+        $site_base = trim($settings['cloudflare']['site_base'] ?? '');
+        $urls = [];
+
+        $candidates = [
+            $storage['index_url'] ?? '',
+            $storage['alias_index_url'] ?? '',
+            $storage['root_index_url'] ?? '',
+            $storage['yoast_index_url'] ?? '',
+        ];
+        foreach ($candidates as $candidate) {
+            if ($candidate) {
+                $urls[] = $candidate;
+            }
+        }
+
+        $index_variants = ['sitemap_index.xml', 'sitemap-index.xml', 'vpp-index.xml'];
+        foreach ($index_variants as $index) {
+            if (!empty($storage['upload_url'])) {
+                $urls[] = $storage['upload_url'] . $index;
+            }
+            if (!empty($storage['legacy_url'])) {
+                $urls[] = $storage['legacy_url'] . $index;
+            }
+        }
+
+        $filenames = array_unique(array_filter(array_map('basename', $filenames)));
+        foreach ($filenames as $name) {
+            if (!empty($storage['url'])) {
+                $urls[] = rtrim($storage['url'], '/') . '/' . $name;
+            }
+            if (!empty($storage['upload_url'])) {
+                $urls[] = $storage['upload_url'] . $name;
+            }
+            if (!empty($storage['legacy_url'])) {
+                $urls[] = $storage['legacy_url'] . $name;
+            }
+        }
+
+        $urls = $this->expand_site_base_urls(array_values(array_unique(array_filter($urls))), $site_base);
+        foreach ($urls as $url) {
+            $this->purge_cloudflare_url($url);
+        }
+    }
+
+    private function expand_site_base_urls(array $urls, $site_base) {
+        if (!$site_base) {
+            return $urls;
+        }
+        $expanded = $urls;
+        foreach ($urls as $url) {
+            $rewritten = $this->swap_url_base($url, $site_base);
+            if ($rewritten) {
+                $expanded[] = $rewritten;
+            }
+        }
+        return array_values(array_unique(array_filter($expanded)));
+    }
+
+    private function swap_url_base($url, $site_base) {
+        $target = wp_parse_url($url);
+        $base = wp_parse_url($site_base);
+        if (!$target || !$base || empty($target['path'])) {
+            return $url;
+        }
+        $scheme = $base['scheme'] ?? ($target['scheme'] ?? 'https');
+        $host = $base['host'] ?? ($target['host'] ?? '');
+        if (!$host) {
+            return $url;
+        }
+        $port = isset($base['port']) ? ':' . $base['port'] : '';
+        $path = $target['path'];
+        $query = isset($target['query']) ? '?' . $target['query'] : '';
+        return $scheme . '://' . $host . $port . $path . $query;
+    }
+
     private function rebuild_sitemaps(&$summary = '', &$err = null) {
         $mysqli = $this->db_connect($err);
         if (!$mysqli) { return false; }
@@ -4180,20 +4158,28 @@ CSS;
         if (!wp_mkdir_p($dir)) { @$mysqli->close(); $err = 'Failed to create sitemap directory.'; return false; }
         $dir = trailingslashit($dir);
         $base_url = $storage['url'];
+        $purge_files = [];
 
-        foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
-        foreach (glob($dir . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+        foreach (glob($dir . 'sitemap-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+        foreach (glob($dir . 'products-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
         @unlink($dir . 'sitemap-index.xml');
+        @unlink($dir . 'sitemap_index.xml');
         @unlink($dir . 'vpp-index.xml');
+        $purge_files[] = 'sitemap-index.xml';
+        $purge_files[] = 'sitemap_index.xml';
+        $purge_files[] = 'vpp-index.xml';
         if (!empty($storage['legacy_dir']) && is_dir($storage['legacy_dir'])) {
-            foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { @unlink($old); }
-            foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { @unlink($old); }
+            foreach (glob($storage['legacy_dir'] . 'sitemap-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+            foreach (glob($storage['legacy_dir'] . 'products-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
             @unlink($storage['legacy_dir'] . 'sitemap-index.xml');
             @unlink($storage['legacy_dir'] . 'sitemap_index.xml');
             @unlink($storage['legacy_dir'] . 'vpp-index.xml');
+            $purge_files[] = 'sitemap-index.xml';
+            $purge_files[] = 'sitemap_index.xml';
+            $purge_files[] = 'vpp-index.xml';
         }
 
-        $write_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err) {
+        $write_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err, &$purge_files) {
             if (empty($entries)) { return true; }
             $filename = sprintf('sitemap-products-%d.xml', $index);
             $path = $dir . $filename;
@@ -4209,6 +4195,7 @@ CSS;
             $xml .= '</urlset>';
             if (@file_put_contents($path, $xml) === false) { $err = 'Failed to write ' . $filename; return false; }
             $files[] = ['loc' => $base_url . $filename, 'lastmod' => gmdate('c', $lastmod_ts ?: time())];
+            $purge_files[] = $filename;
             return true;
         };
 
@@ -4265,10 +4252,24 @@ CSS;
         if (@file_put_contents($index_path, $index_xml) === false) { $err = 'Failed to write sitemap-index.xml'; return false; }
         @file_put_contents($dir . 'sitemap_index.xml', $index_xml);
         @file_put_contents($dir . 'vpp-index.xml', $index_xml);
+        $purge_files[] = 'sitemap-index.xml';
+        $purge_files[] = 'sitemap_index.xml';
+        $purge_files[] = 'vpp-index.xml';
         if (!empty($storage['legacy_dir']) && wp_mkdir_p($storage['legacy_dir'])) {
             @file_put_contents($storage['legacy_dir'] . 'sitemap-index.xml', $index_xml);
             @file_put_contents($storage['legacy_dir'] . 'sitemap_index.xml', $index_xml);
             @file_put_contents($storage['legacy_dir'] . 'vpp-index.xml', $index_xml);
+            $purge_files[] = 'sitemap-index.xml';
+            $purge_files[] = 'sitemap_index.xml';
+            $purge_files[] = 'vpp-index.xml';
+        }
+
+        $meta = $this->get_sitemap_meta();
+        $meta['base_url'] = $base_url;
+        $this->save_sitemap_meta($meta);
+
+        if (!empty($purge_files)) {
+            $this->purge_sitemap_cache($storage, $purge_files);
         }
 
         $meta = $this->get_sitemap_meta();
@@ -4497,6 +4498,70 @@ CSS;
         }
         $storage = $this->get_sitemap_storage_paths();
         if (!$storage) {
+            status_header(404);
+            exit;
+        }
+        $path = '';
+        if ($mode === 'index') {
+            $refresh_err = null;
+            $index_files = [];
+            if ($this->refresh_sitemap_index($storage, $refresh_err, $index_files) === false && $refresh_err) {
+                error_log('VPP sitemap refresh failed: ' . $refresh_err);
+            }
+            $candidates = [
+                $storage['dir'] . 'sitemap_index.xml',
+                $storage['dir'] . 'sitemap-index.xml',
+            ];
+            foreach ($candidates as $candidate) {
+                if (@is_readable($candidate)) {
+                    $path = $candidate;
+                    break;
+                }
+            }
+        } elseif ($mode === 'file') {
+            $requested = get_query_var(self::SITEMAP_FILE_QUERY_VAR);
+            if (!is_string($requested) || $requested === '') {
+                status_header(404);
+                exit;
+            }
+            if (!preg_match('/^[a-z0-9\-]+\.xml$/i', $requested)) {
+                status_header(404);
+                exit;
+            }
+            if (strcasecmp($requested, 'vpp-index.xml') === 0) {
+                $refresh_err = null;
+                $index_files = [];
+                if ($this->refresh_sitemap_index($storage, $refresh_err, $index_files) === false && $refresh_err) {
+                    error_log('VPP sitemap refresh failed: ' . $refresh_err);
+                }
+            }
+            $path = $storage['dir'] . $requested;
+            if (!@is_readable($path)) {
+                status_header(404);
+                exit;
+            }
+        } else {
+            return;
+        }
+        if ($path === '') {
+            status_header(404);
+            exit;
+        }
+        header('Content-Type: application/xml; charset=UTF-8');
+        header('X-Robots-Tag: noindex, follow', true);
+        header('Cache-Control: no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
+        readfile($path);
+        exit;
+    }
+
+    public function maybe_render_vpp() {
+        $slug = $this->current_vpp_slug();
+        if (!$slug) return;
+        $err = null;
+        $product = $this->get_current_product($err);
+        if (!$product || empty($product['is_published'])) {
             status_header(404);
             exit;
         }
