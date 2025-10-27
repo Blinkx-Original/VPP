@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.6.1
+ * Version: 1.6.2
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -16,8 +16,15 @@ class VPP_Plugin {
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const VERSION = '1.6.1';
-    const VERSION_OPTION = 'vpp_plugin_version';
+    const CATEGORY_INDEX_QUERY_VAR = 'vpp_cat_index';
+    const CATEGORY_SLUG_QUERY_VAR = 'vpp_cat_slug';
+    const CATEGORY_PAGE_QUERY_VAR = 'vpp_cat_page';
+    const CATEGORY_RESERVED_SLUGS = ['p', 'p-cat', 'category', 'categories', 'tag', 'tags', 'product', 'products', 'page', 'search'];
+    const CATEGORY_PER_PAGE_DEFAULT = 24;
+    const CATEGORY_PER_PAGE_MAX = 120;
+    const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
+    const SITEMAP_MAX_URLS = 50000;
+    const VERSION = '1.6.2';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -262,12 +269,22 @@ CSS;
         $vars[] = self::QUERY_VAR;
         $vars[] = self::SITEMAP_QUERY_VAR;
         $vars[] = self::SITEMAP_FILE_QUERY_VAR;
+        $vars[] = self::CATEGORY_INDEX_QUERY_VAR;
+        $vars[] = self::CATEGORY_SLUG_QUERY_VAR;
+        $vars[] = self::CATEGORY_PAGE_QUERY_VAR;
         return $vars;
     }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
+        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
+        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([0-9]+)');
+        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
         if (!$this->uses_wpseo_sitemaps()) {
             add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
             add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
@@ -2098,25 +2115,83 @@ CSS;
         if (!@file_exists($path)) {
             return $entries;
         }
-        $xml = @simplexml_load_file($path);
-        if (!$xml) {
-            return $entries;
-        }
-        foreach ($xml->url as $url) {
-            $loc = (string)$url->loc;
-            $slug = $this->extract_slug_from_loc($loc);
-            if ($slug === '') {
-                continue;
+        $flags = 0;
+        if (defined('LIBXML_NOERROR')) { $flags |= LIBXML_NOERROR; }
+        if (defined('LIBXML_NOWARNING')) { $flags |= LIBXML_NOWARNING; }
+        if (defined('LIBXML_PARSEHUGE')) { $flags |= LIBXML_PARSEHUGE; }
+
+        if (class_exists('XMLReader')) {
+            $reader = new XMLReader();
+            if (@$reader->open($path, null, $flags)) {
+                while ($reader->read()) {
+                    if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'url') {
+                        $depth = $reader->depth;
+                        $loc = '';
+                        $lastmod = '';
+                        while ($reader->read()) {
+                            if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->depth === $depth && $reader->localName === 'url') {
+                                break;
+                            }
+                            if ($reader->nodeType === XMLReader::ELEMENT) {
+                                $name = $reader->localName;
+                                if ($reader->isEmptyElement) {
+                                    continue;
+                                }
+                                $reader->read();
+                                if ($reader->nodeType === XMLReader::TEXT || $reader->nodeType === XMLReader::CDATA) {
+                                    if ($name === 'loc') {
+                                        $loc = $reader->value;
+                                    } elseif ($name === 'lastmod') {
+                                        $lastmod = $reader->value;
+                                    }
+                                }
+                            }
+                        }
+                        $slug = $this->extract_slug_from_loc($loc);
+                        if ($slug === '') {
+                            continue;
+                        }
+                        if ($lastmod === '') {
+                            $lastmod = gmdate('c');
+                        }
+                        $entries[] = [
+                            'slug' => $slug,
+                            'lastmod' => $lastmod,
+                        ];
+                    }
+                }
+                $reader->close();
+                if (!empty($entries)) {
+                    return $entries;
+                }
+            } else {
+                $this->log_error('sitemap', 'Failed opening sitemap XML: ' . basename($path));
             }
-            $lastmod = (string)$url->lastmod;
-            if ($lastmod === '') {
-                $lastmod = gmdate('c');
-            }
-            $entries[] = [
-                'slug' => $slug,
-                'lastmod' => $lastmod,
-            ];
         }
+
+        libxml_use_internal_errors(true);
+        $xml = @simplexml_load_file($path, 'SimpleXMLElement', $flags);
+        if ($xml) {
+            foreach ($xml->url as $url) {
+                $loc = (string)$url->loc;
+                $slug = $this->extract_slug_from_loc($loc);
+                if ($slug === '') {
+                    continue;
+                }
+                $lastmod = (string)$url->lastmod;
+                if ($lastmod === '') {
+                    $lastmod = gmdate('c');
+                }
+                $entries[] = [
+                    'slug' => $slug,
+                    'lastmod' => $lastmod,
+                ];
+            }
+        } else {
+            $this->log_error('sitemap', 'Failed parsing sitemap XML: ' . basename($path));
+        }
+        libxml_clear_errors();
+        libxml_use_internal_errors(false);
         return $entries;
     }
 
@@ -2284,7 +2359,7 @@ CSS;
         }
         $remaining = array_values($items_map);
         $date_prefix = gmdate('Ymd');
-        $max_entries = 50000;
+        $max_entries = self::SITEMAP_MAX_URLS;
         if (!empty($remaining)) {
             foreach ($filtered_files as $file) {
                 if (empty($remaining)) {
@@ -2350,8 +2425,9 @@ CSS;
             return false;
         }
         $purge_targets = array_merge($purge_files, $index_files);
-        if (!empty($purge_targets)) {
-            $this->purge_sitemap_cache($storage, $purge_targets);
+        $recent_urls = $this->cf_collect_sitemap_urls($purge_targets, true);
+        if (!empty($recent_urls)) {
+            $this->cf_record_recent_sitemaps($recent_urls, $purge_targets);
         }
         $notes = $files_touched ? sprintf('Updated %d sitemap file(s).', $files_touched) : 'Sitemap unchanged.';
         if ($ping_google && $index_url) {
@@ -3882,7 +3958,22 @@ CSS;
         }
         $purge_targets = array_merge([$filename], $index_files);
         if (!empty($purge_targets)) {
-            $this->purge_sitemap_cache($storage, $purge_targets);
+            $recent_urls = $this->cf_collect_sitemap_urls($purge_targets, true);
+            if (!empty($recent_urls)) {
+                $this->cf_record_recent_sitemaps($recent_urls, $purge_targets);
+            }
+            if ($this->cf_is_ready()) {
+                $purge_result = $this->cf_purge_sitemaps($purge_targets);
+                $this->cf_log_result('manual_rotate_sitemaps', $purge_result);
+                $purge_message = $purge_result['messages'][0] ?? '';
+                if ($purge_message !== '') {
+                    if ($state['message_type'] === 'success') {
+                        $state['message'] .= ' ' . $purge_message;
+                    } else {
+                        $state['message'] .= ' Cloudflare: ' . $purge_message;
+                    }
+                }
+            }
         }
         $this->save_publish_state($state);
         wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
@@ -3947,7 +4038,22 @@ CSS;
         }
         $purge_targets = array_merge($purge_files, $index_files);
         if (!empty($purge_targets)) {
-            $this->purge_sitemap_cache($storage, $purge_targets);
+            $recent_urls = $this->cf_collect_sitemap_urls($purge_targets, true);
+            if (!empty($recent_urls)) {
+                $this->cf_record_recent_sitemaps($recent_urls, $purge_targets);
+            }
+            if ($this->cf_is_ready()) {
+                $purge_result = $this->cf_purge_sitemaps($purge_targets);
+                $this->cf_log_result('manual_rebuild_sitemaps', $purge_result);
+                $purge_message = $purge_result['messages'][0] ?? '';
+                if ($purge_message !== '') {
+                    if ($state['message_type'] === 'success') {
+                        $state['message'] .= ' ' . $purge_message;
+                    } else {
+                        $state['message'] .= ' Cloudflare: ' . $purge_message;
+                    }
+                }
+            }
         }
         $this->save_publish_state($state);
         wp_safe_redirect(admin_url('admin.php?page=vpp_publishing'));
@@ -4786,90 +4892,7 @@ CSS;
         }
     }
 
-    private function purge_sitemap_cache(array $storage, array $filenames = []) {
-        $settings = $this->get_settings();
-        $token = trim($settings['cloudflare']['api_token'] ?? '');
-        $zone  = trim($settings['cloudflare']['zone_id'] ?? '');
-        if (!$token || !$zone) {
-            return;
-        }
-
-        $site_base = trim($settings['cloudflare']['site_base'] ?? '');
-        $urls = [];
-
-        $candidates = [
-            $storage['index_url'] ?? '',
-            $storage['alias_index_url'] ?? '',
-            $storage['root_index_url'] ?? '',
-            $storage['yoast_index_url'] ?? '',
-        ];
-        foreach ($candidates as $candidate) {
-            if ($candidate) {
-                $urls[] = $candidate;
-            }
-        }
-
-        $index_variants = ['sitemap_index.xml', 'sitemap-index.xml', 'vpp-index.xml'];
-        foreach ($index_variants as $index) {
-            if (!empty($storage['upload_url'])) {
-                $urls[] = $storage['upload_url'] . $index;
-            }
-            if (!empty($storage['legacy_url'])) {
-                $urls[] = $storage['legacy_url'] . $index;
-            }
-        }
-
-        $filenames = array_unique(array_filter(array_map('basename', $filenames)));
-        foreach ($filenames as $name) {
-            if (!empty($storage['url'])) {
-                $urls[] = rtrim($storage['url'], '/') . '/' . $name;
-            }
-            if (!empty($storage['upload_url'])) {
-                $urls[] = $storage['upload_url'] . $name;
-            }
-            if (!empty($storage['legacy_url'])) {
-                $urls[] = $storage['legacy_url'] . $name;
-            }
-        }
-
-        $urls = $this->expand_site_base_urls(array_values(array_unique(array_filter($urls))), $site_base);
-        foreach ($urls as $url) {
-            $this->purge_cloudflare_url($url);
-        }
-    }
-
-    private function expand_site_base_urls(array $urls, $site_base) {
-        if (!$site_base) {
-            return $urls;
-        }
-        $expanded = $urls;
-        foreach ($urls as $url) {
-            $rewritten = $this->swap_url_base($url, $site_base);
-            if ($rewritten) {
-                $expanded[] = $rewritten;
-            }
-        }
-        return array_values(array_unique(array_filter($expanded)));
-    }
-
-    private function swap_url_base($url, $site_base) {
-        $target = wp_parse_url($url);
-        $base = wp_parse_url($site_base);
-        if (!$target || !$base || empty($target['path'])) {
-            return $url;
-        }
-        $scheme = $base['scheme'] ?? ($target['scheme'] ?? 'https');
-        $host = $base['host'] ?? ($target['host'] ?? '');
-        if (!$host) {
-            return $url;
-        }
-        $port = isset($base['port']) ? ':' . $base['port'] : '';
-        $path = $target['path'];
-        $query = isset($target['query']) ? '?' . $target['query'] : '';
-        return $scheme . '://' . $host . $port . $path . $query;
-    }
-
-    private function rebuild_sitemaps(&$summary = '', &$err = null) {
+    private function rebuild_sitemaps(&$summary = '', &$err = null, &$changed_files = []) {
         $mysqli = $this->db_connect($err);
         if (!$mysqli) { return false; }
         $this->cf_reset_recent();
@@ -4877,7 +4900,7 @@ CSS;
 
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $this->get_settings()['tidb']['table']);
         $batch_size = 2000;
-        $chunk_size = 50000;
+        $chunk_size = self::SITEMAP_MAX_URLS;
         $offset = 0;
         $total = 0;
         $chunk_index = 0;
@@ -5013,7 +5036,10 @@ CSS;
         $this->save_sitemap_meta($meta);
 
         if (!empty($purge_files)) {
-            $this->purge_sitemap_cache($storage, $purge_files);
+            $recent_urls = $this->cf_collect_sitemap_urls($purge_files, true);
+            if (!empty($recent_urls)) {
+                $this->cf_record_recent_sitemaps($recent_urls, $purge_files);
+            }
         }
 
         $meta = $this->get_sitemap_meta();
@@ -5289,24 +5315,6 @@ CSS;
             return;
         }
         if ($path === '') {
-            status_header(404);
-            exit;
-        }
-        header('Content-Type: application/xml; charset=UTF-8');
-        header('X-Robots-Tag: noindex, follow', true);
-        header('Cache-Control: no-cache, must-revalidate, max-age=0');
-        header('Pragma: no-cache');
-        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
-        readfile($path);
-        exit;
-    }
-
-    public function maybe_render_vpp() {
-        $slug = $this->current_vpp_slug();
-        if (!$slug) return;
-        $err = null;
-        $product = $this->get_current_product($err);
-        if (!$product || empty($product['is_published'])) {
             status_header(404);
             exit;
         }
