@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.6.1
+ * Version: 2.0.4
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -16,130 +16,144 @@ class VPP_Plugin {
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const VERSION = '1.6.1';
-    const VERSION_OPTION = 'vpp_plugin_version';
+    const CATEGORY_INDEX_QUERY_VAR = 'vpp_cat_index';
+    const CATEGORY_SLUG_QUERY_VAR = 'vpp_cat_slug';
+    const CATEGORY_PAGE_QUERY_VAR = 'vpp_cat_page';
+    const CATEGORY_RESERVED_SLUGS = ['p', 'p-cat', 'category', 'categories', 'tag', 'tags', 'product', 'products', 'page', 'search'];
+    const CATEGORY_PER_PAGE_DEFAULT = 9;
+    const CATEGORY_PER_PAGE_MAX = 9;
+    const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
+    const SITEMAP_MAX_URLS = 50000;
+    const VERSION = '2.0.4';
     const CSS_FALLBACK = <<<CSS
-/* Minimal Vercel-like look */
-body.vpp-body {
-  background: #f9fafb;
-  color: #0f172a;
-  color-scheme: light;
-  margin: 0;
-  min-height: 100vh;
-  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  line-height: 1.5;
-}
-.vpp-container { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }
-.vpp .card,
-.vpp .card-elevated {
-  background: linear-gradient(180deg, rgba(248,250,252,0.85), #ffffff 45%);
-  border-radius: 20px;
-  padding: 1.35rem;
-  box-shadow: 0 20px 60px rgba(15,23,42,0.08);
-  border: 1px solid rgba(148,163,184,0.15);
-}
-.vpp .card-elevated {
-  box-shadow: 0 28px 80px rgba(15,23,42,0.12), 0 1px 0 rgba(148,163,184,0.25);
-}
-.vpp-hero {
-  margin-bottom: 1.25rem;
-  background: linear-gradient(160deg, rgba(226,232,240,0.35), rgba(255,255,255,0.95));
-}
-.vpp-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 2rem; }
-@media (max-width: 900px) { .vpp-grid { grid-template-columns: 1fr; } }
+/* Strictly-scoped VPP CSS to avoid theme/header collisions */
+body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-scheme:light;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.55}
 
-.vpp-media { display:flex; flex-direction:column; gap: .75rem; }
-.vpp-main-image {
-  width: 100%;
-  height: auto;
-  border-radius: 16px;
-  background: #f1f5f9;
-  box-shadow: 0 18px 40px rgba(15,23,42,0.12);
-}
-.vpp-thumbs { display:flex; gap: .5rem; flex-wrap: wrap; }
-.vpp-thumb {
-  width: 88px;
-  height: 64px;
-  object-fit: cover;
-  border-radius: 12px;
-  background: #f1f5f9;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.9), 0 10px 24px rgba(15,23,42,0.08);
-}
+.vpp{--ink:#0f172a;--muted:#6b7280;--ink-2:#1e293b;--card:#ffffff;--glow:rgba(37,99,235,0.55);
+     --ring:rgba(148,163,184,0.25);--stroke:rgba(148,163,184,0.15);--brand-1:#2563eb;--brand-2:#3b82f6}
 
-.vpp-placeholder {
-  display:flex;
-  align-items:center;
-  justify-content:center;
-  height: 360px;
-  background: linear-gradient(180deg,#f8fafc,#e2e8f0);
-  border-radius: 16px;
-  box-shadow: inset 0 1px 0 rgba(255,255,255,0.6), 0 20px 40px rgba(15,23,42,0.08);
-}
-.vpp-ph-img {
-  width: 60%;
-  height: 70%;
-  border-radius: 16px;
-  background: repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 12px,#f8fafc 12px,#f8fafc 24px);
-}
+.vpp-container{max-width:1120px;margin:0 auto;padding:28px 16px}
+.vpp a{color:var(--brand-1);text-decoration:none}
+.vpp a:hover{text-decoration:underline}
 
-.vpp-summary {
-  display:flex;
-  flex-direction:column;
-  gap: .65rem;
+.vpp .card,.vpp .card-elevated{
+  background:linear-gradient(180deg,rgba(248,250,252,.9),var(--card) 55%);
+  border-radius:20px;padding:20px;border:1px solid var(--stroke);
+  box-shadow:0 18px 50px rgba(15,23,42,.08)
 }
-.vpp-title { font-size: clamp(1.6rem, 2vw, 2.2rem); font-weight: 800; margin: 0; color: #111827; }
-.vpp-meta { color: #6b7280; margin: 0; }
-.vpp-short { color: #374151; font-size: .95rem; margin: .25rem 0 0; max-width: 50ch; }
+.vpp .card-elevated{box-shadow:0 28px 80px rgba(15,23,42,.12),0 1px 0 var(--ring)}
 
-        .vpp-cta-block { margin-top: .75rem; display:flex; flex-direction:column; gap: .75rem; }
-        .vpp-cta-button {
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          text-decoration:none;
-          padding: .95rem 1.4rem;
-          font-weight: 700;
-          border-radius: 999px;
-          background: linear-gradient(135deg,#2563eb,#3b82f6);
-          color: #fff !important;
-          position: relative;
-          box-shadow: 0 16px 32px rgba(37,99,235,0.4);
-          transition: transform .2s ease, box-shadow .2s ease;
-          min-height: 56px;
-          text-align: center;
-        }
-        .vpp-cta-button.glow::before {
-          content:"";
-          position:absolute;
-          inset:-3px;
-          border-radius: 999px;
-          background: radial-gradient( 120% 120% at 50% 0%, rgba(59,130,246,0.65), rgba(59,130,246,0.15) 60%, transparent 70% );
-          filter: blur(8px);
-          z-index:-1;
-        }
-        .vpp-cta-button:hover {
-          transform: translateY(-2px);
-          box-shadow: 0 24px 48px rgba(37,99,235,0.55);
-        }
-        .vpp-cta-button:focus-visible {
-          outline: 3px solid rgba(59,130,246,0.45);
-          outline-offset: 2px;
-        }
+.vpp-hero{margin-bottom:18px;background:linear-gradient(160deg,rgba(226,232,240,.35),rgba(255,255,255,.95))}
+.vpp-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:28px}
+@media (max-width:960px){.vpp-grid{grid-template-columns:1fr}}
 
-.vpp-content {
-  margin-top: 1.5rem;
-  background: linear-gradient(180deg, rgba(248,250,252,0.9), #ffffff 55%);
+.vpp-media{display:flex;flex-direction:column;gap:10px}
+.vpp-main-image{width:100%;height:auto;border-radius:16px;background:#eef2f7;box-shadow:0 18px 40px rgba(15,23,42,.12)}
+.vpp-thumbs{display:flex;gap:8px;flex-wrap:wrap}
+.vpp-thumb{width:96px;height:70px;object-fit:cover;border-radius:12px;background:#eef2f7;
+  box-shadow:inset 0 1px 0 #fff,0 10px 24px rgba(15,23,42,.08)}
+
+.vpp-placeholder{display:flex;align-items:center;justify-content:center;height:360px;border-radius:16px;
+  background:linear-gradient(180deg,#f8fafc,#e2e8f0);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 20px 40px rgba(15,23,42,.08)}
+.vpp-ph-img{width:60%;height:70%;border-radius:16px;
+  background:repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 12px,#f8fafc 12px,#f8fafc 24px)}
+
+.vpp-summary{display:flex;flex-direction:column;gap:8px}
+.vpp-title{margin:0;font-weight:800;color:#111827;font-size:clamp(1.6rem,2.4vw,2.25rem)}
+.vpp-meta{margin:0;color:var(--muted)}
+.vpp-short{margin:.2rem 0 0;color:#374151;font-size:.98rem;max-width:60ch}
+
+.vpp-cta-block{margin-top:.75rem;display:flex;flex-direction:column;gap:.75rem}
+.vpp-cta-button{display:flex;align-items:center;justify-content:center;text-decoration:none;color:#fff!important;
+  background:linear-gradient(135deg,var(--brand-1),var(--brand-2));border-radius:999px;font-weight:700;padding:.95rem 1.4rem;
+  position:relative;box-shadow:0 16px 32px rgba(37,99,235,.4);transition:transform .2s, box-shadow .2s;min-height:56px;text-align:center}
+.vpp-cta-button.glow::before{content:"";position:absolute;inset:-3px;border-radius:999px;
+  background:radial-gradient(120% 120% at 50% 0%, rgba(59,130,246,.65), rgba(59,130,246,.18) 60%, transparent 72%);
+  filter:blur(8px);z-index:-1}
+.vpp-cta-button:hover{transform:translateY(-2px);box-shadow:0 24px 48px rgba(37,99,235,.55)}
+.vpp-cta-button:focus-visible{outline:3px solid rgba(59,130,246,.45);outline-offset:2px}
+
+.vpp-content{margin-top:18px}
+.vpp-content.card{background:linear-gradient(180deg,rgba(248,250,252,.9),var(--card) 55%)}
+.vpp-content h2{font-size:1.25rem;margin:1rem 0 .5rem}
+.vpp-content h3{font-size:1.05rem;margin:.75rem 0 .35rem}
+.vpp-content p{margin:.5rem 0}
+.vpp-content table{width:100%;border-collapse:collapse;margin:.75rem 0}
+.vpp-content th,.vpp-content td{border:1px solid #e5e7eb;padding:.55rem .65rem;text-align:left}
+.vpp-content a{color:#2563eb}
+
+.vpp-inline{padding:.25rem .5rem;border-radius:8px;font-size:12px}
+.vpp-inline.ok{background:#e6ffed;color:#065f46}
+.vpp-inline.err{background:#fee2e2;color:#991b1b}
+
+.vpp-cat-hero{display:flex;flex-direction:column;gap:8px;margin-bottom:18px;background:linear-gradient(150deg,rgba(226,232,240,.38),rgba(255,255,255,.95))}
+.vpp-cat-title{margin:0;font-weight:800;color:var(--ink);font-size:clamp(1.85rem,3vw,2.45rem)}
+.vpp-cat-subtitle{margin:0;color:var(--muted);font-size:1rem}
+.vpp-cat-grid-wrap{margin-top:18px}
+.vpp-cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:18px}
+.vpp-cat-card{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;
+  border-radius:22px;padding:26px;background:linear-gradient(160deg,rgba(255,255,255,.95),rgba(226,232,240,.6));
+  border:1px solid rgba(148,163,184,.18);box-shadow:0 16px 48px rgba(15,23,42,.1);text-decoration:none;color:var(--ink);
+  transition:transform .2s ease, box-shadow .2s ease;background-blend-mode:overlay;min-height:0;aspect-ratio:1/1}
+.vpp-cat-card::after{content:"";position:absolute;inset:14px;border-radius:18px;border:1px solid rgba(148,163,184,.18);
+  pointer-events:none;opacity:.75}
+.vpp-cat-card:hover{transform:translateY(-4px);box-shadow:0 22px 56px rgba(37,99,235,.22)}
+.vpp-cat-card:focus-visible{outline:3px solid rgba(59,130,246,.55);outline-offset:4px}
+.vpp-cat-name{font-weight:700;font-size:1.05rem;text-align:center;color:var(--ink-2)}
+.vpp-cat-count{font-size:.9rem;color:var(--muted)}
+.vpp-cat-empty{text-align:center;font-size:1rem;color:var(--muted)}
+
+.vpp-archive-hero{display:flex;flex-direction:column;gap:6px;margin-bottom:18px;background:linear-gradient(150deg,rgba(226,232,240,.38),rgba(255,255,255,.95))}
+.vpp-archive-title{margin:0;font-weight:800;color:var(--ink);font-size:clamp(1.9rem,3vw,2.5rem)}
+.vpp-archive-subtitle{margin:0;color:var(--muted)}
+.vpp-archive-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:24px;margin-top:20px}
+@media (max-width:1024px){.vpp-archive-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:640px){.vpp-archive-grid{grid-template-columns:1fr}}
+.vpp-archive-card{position:relative;display:flex;flex-direction:column;justify-content:space-between;gap:16px;padding:24px;
+  border-radius:24px;background:linear-gradient(175deg,rgba(248,250,252,.95),#fff 65%);
+  border:1px solid rgba(148,163,184,.18);box-shadow:0 24px 64px rgba(15,23,42,.1);min-height:0;aspect-ratio:1/1;
+  transition:transform .2s ease, box-shadow .2s ease}
+.vpp-archive-card::after{content:"";position:absolute;inset:18px;border-radius:20px;border:1px solid rgba(148,163,184,.12);
+  pointer-events:none;opacity:.6}
+.vpp-archive-card:hover{transform:translateY(-6px);box-shadow:0 32px 84px rgba(37,99,235,.22)}
+.vpp-archive-card-header{display:flex;flex-direction:column;gap:8px}
+.vpp-archive-card-title{margin:0;font-size:clamp(1.05rem,1.8vw,1.3rem);font-weight:800;color:var(--ink-2)}
+.vpp-archive-card-meta{margin:0;color:var(--muted);font-size:.9rem}
+.vpp-archive-card-thumb{width:100%;aspect-ratio:4/3;border-radius:18px;overflow:hidden;background:linear-gradient(150deg,#e2e8f0,#f1f5f9);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 18px 40px rgba(15,23,42,.12);display:flex;align-items:center;justify-content:center}
+.vpp-archive-card-thumb img{width:100%;height:100%;object-fit:cover}
+.vpp-archive-card-thumb.placeholder{background:linear-gradient(150deg,#e2e8f0,#f8fafc)}
+.vpp-archive-card-body{display:flex;flex-direction:column;gap:10px;flex:1 1 auto}
+.vpp-archive-card-summary{margin:0;color:var(--ink);font-size:.95rem;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;
+  -webkit-box-orient:vertical;overflow:hidden}
+.vpp-archive-card-footer{margin-top:auto;padding-top:12px}
+.vpp-archive-card-button{display:inline-flex;align-items:center;justify-content:center;padding:.8rem 1.4rem;border-radius:999px;
+  background:linear-gradient(135deg,var(--brand-1),var(--brand-2));color:#fff!important;font-weight:700;text-decoration:none;
+  box-shadow:0 18px 36px rgba(37,99,235,.35);transition:transform .2s ease, box-shadow .2s ease}
+.vpp-archive-card-button:hover{transform:translateY(-2px);box-shadow:0 26px 52px rgba(37,99,235,.45);text-decoration:none}
+.vpp-archive-card-button:focus-visible{outline:3px solid rgba(59,130,246,.5);outline-offset:3px}
+.vpp-archive-empty{text-align:center;color:var(--muted);font-size:1rem}
+
+.vpp-pagination{margin:26px 0;display:flex;justify-content:center}
+.vpp-pagination-list{display:inline-flex;gap:6px;padding:0;margin:0;list-style:none}
+.vpp-page-item{display:inline-flex}
+.vpp-page-link{display:inline-flex;align-items:center;justify-content:center;padding:10px 16px;border-radius:999px;font-weight:600;
+  background:rgba(148,163,184,.18);color:var(--ink);text-decoration:none;transition:background .2s ease, color .2s ease}
+.vpp-page-item.active .vpp-page-link{background:linear-gradient(135deg,var(--brand-1),var(--brand-2));color:#fff}
+.vpp-page-item.disabled .vpp-page-link{opacity:.5;pointer-events:none}
+.vpp-page-link:hover{background:rgba(59,130,246,.18);text-decoration:none}
+.vpp-page-link:focus-visible{outline:3px solid rgba(59,130,246,.5);outline-offset:2px}
+
+@media (max-width:420px){
+  .vpp-container{padding:18px 12px}
+  .vpp-cta-button{padding:.85rem 1.1rem}
+  .vpp-thumb{width:86px;height:62px}
+  .vpp-cat-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+  .vpp-archive-grid{grid-template-columns:1fr}
 }
-.vpp-content h2 { font-size: 1.25rem; margin: 1rem 0 .5rem; }
-.vpp-content h3 { font-size: 1.05rem; margin: .75rem 0 .25rem; }
-.vpp-content table { width:100%; border-collapse: collapse; margin: .75rem 0; }
-.vpp-content th, .vpp-content td { border: 1px solid #e5e7eb; padding: .5rem .6rem; text-align:left; }
-.vpp-content a { color: #2563eb; }
-
-/* inline admin messages */
-.vpp-inline { padding:.25rem .5rem; border-radius:8px; font-size:12px; }
-.vpp-inline.ok { background:#e6ffed; color:#065f46; }
-.vpp-inline.err { background:#fee2e2; color:#991b1b; }
 CSS;
     const SITEMAP_META_OPTION = 'vpp_sitemap_meta';
     const LOG_SUBDIR = 'vpp-logs';
@@ -262,12 +276,22 @@ CSS;
         $vars[] = self::QUERY_VAR;
         $vars[] = self::SITEMAP_QUERY_VAR;
         $vars[] = self::SITEMAP_FILE_QUERY_VAR;
+        $vars[] = self::CATEGORY_INDEX_QUERY_VAR;
+        $vars[] = self::CATEGORY_SLUG_QUERY_VAR;
+        $vars[] = self::CATEGORY_PAGE_QUERY_VAR;
         return $vars;
     }
 
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
+        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
+        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([0-9]+)');
+        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
         if (!$this->uses_wpseo_sitemaps()) {
             add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
             add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
@@ -5303,24 +5327,6 @@ CSS;
 
     public function maybe_render_vpp() {
         $slug = $this->current_vpp_slug();
-        if (!$slug) return;
-        $err = null;
-        $product = $this->get_current_product($err);
-        if (!$product || empty($product['is_published'])) {
-            status_header(404);
-            exit;
-        }
-        header('Content-Type: application/xml; charset=UTF-8');
-        header('X-Robots-Tag: noindex, follow', true);
-        header('Cache-Control: no-cache, must-revalidate, max-age=0');
-        header('Pragma: no-cache');
-        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
-        readfile($path);
-        exit;
-    }
-
-    public function maybe_render_vpp() {
-        $slug = $this->current_vpp_slug();
         if ($slug) {
             $err = null;
             $product = $this->get_current_product($err);
@@ -5504,30 +5510,35 @@ CSS;
                 }
                 $parts = array_filter([$brand, $model]);
                 $meta = implode(' • ', $parts);
-                $images = [];
+                $image_url = '';
                 if (!empty($item['images_json'])) {
                     $decoded = json_decode($item['images_json'], true);
-                    if (is_array($decoded)) {
-                        $images = $decoded;
+                    if (is_array($decoded) && !empty($decoded[0])) {
+                        $image_url = trim((string)$decoded[0]);
                     }
                 }
                 $href = home_url('/p/' . $product_slug . '/');
-                echo '<a class="vpp-archive-card" href="' . esc_url($href) . '">';
-                if (!empty($images) && !empty($images[0])) {
-                    echo '<div class="vpp-archive-thumb"><img src="' . esc_url($images[0]) . '" alt="' . esc_attr($title) . '" loading="lazy" decoding="async"></div>';
+                echo '<article class="vpp-archive-card">';
+                if ($image_url !== '') {
+                    echo '<div class="vpp-archive-card-thumb"><img src="' . esc_url($image_url) . '" alt="' . esc_attr($title) . '" loading="lazy" decoding="async"></div>';
                 } else {
-                    echo '<div class="vpp-archive-thumb placeholder" aria-hidden="true"></div>';
+                    echo '<div class="vpp-archive-card-thumb placeholder" aria-hidden="true"></div>';
                 }
-                echo '<div class="vpp-archive-body">';
+                echo '<div class="vpp-archive-card-body">';
+                echo '<div class="vpp-archive-card-header">';
                 echo '<h2 class="vpp-archive-card-title">' . esc_html($title) . '</h2>';
                 if ($meta !== '') {
                     echo '<p class="vpp-archive-card-meta">' . esc_html($meta) . '</p>';
                 }
+                echo '</div>';
                 if ($summary !== '') {
                     echo '<p class="vpp-archive-card-summary">' . esc_html($summary) . '</p>';
                 }
                 echo '</div>';
-                echo '</a>';
+                echo '<div class="vpp-archive-card-footer">';
+                echo '<a class="vpp-archive-card-button" href="' . esc_url($href) . '">' . esc_html__('GoToProduct', 'virtual-product-pages') . '</a>';
+                echo '</div>';
+                echo '</article>';
             }
             echo '</section>';
             $this->render_category_pagination($page, $total_pages, $base_url);
@@ -5661,8 +5672,17 @@ CSS;
         $images = [];
         if (!empty($p['images_json'])) {
             $arr = json_decode($p['images_json'], true);
-            if (is_array($arr)) $images = $arr;
+            if (is_array($arr)) {
+                $images = $arr;
+            }
         }
+        if (!empty($images)) {
+            $images = array_values(array_filter(array_map(static function ($value) {
+                $value = is_string($value) ? trim($value) : '';
+                return $value !== '' ? $value : null;
+            }, $images)));
+        }
+        $primary_image = $images[0] ?? '';
         $allowed = $this->allowed_html();
         $meta_line = trim(implode(' • ', array_filter([$brand, $model, $sku])));
 
@@ -5741,8 +5761,8 @@ CSS;
             <section class="vpp-hero card-elevated">
               <div class="vpp-grid">
                 <div class="vpp-media">
-                  <?php if (!empty($images)): ?>
-                      <img src="<?php echo esc_url($images[0]); ?>" alt="<?php echo esc_attr($title); ?>" loading="eager" decoding="async" class="vpp-main-image"/>
+                  <?php if ($primary_image !== ''): ?>
+                      <img src="<?php echo esc_url($primary_image); ?>" alt="<?php echo esc_attr($title); ?>" loading="eager" decoding="async" class="vpp-main-image"/>
                       <?php if (count($images) > 1): ?>
                         <div class="vpp-thumbs">
                           <?php foreach (array_slice($images, 1, 6) as $thumb): ?>
