@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.0.5
+ * Version: 2.0.6
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.0.5';
+    const VERSION = '2.0.6';
     const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
@@ -49,17 +49,32 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
 .vpp-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:28px}
 @media (max-width:960px){.vpp-grid{grid-template-columns:1fr}}
 
-.vpp-media{display:flex;flex-direction:column;gap:10px}
-.vpp-main-image{width:100%;height:auto;border-radius:16px;background:#eef2f7;box-shadow:0 18px 40px rgba(15,23,42,.12)}
-.vpp-thumbs{display:flex;gap:8px;flex-wrap:wrap}
-.vpp-thumb{width:96px;height:70px;object-fit:cover;border-radius:12px;background:#eef2f7;
-  box-shadow:inset 0 1px 0 #fff,0 10px 24px rgba(15,23,42,.08)}
-
+.vpp-media{display:flex;flex-direction:column;gap:12px}
+.vpp-carousel{position:relative;border-radius:16px;overflow:hidden;background:#eef2f7;
+  box-shadow:0 18px 40px rgba(15,23,42,.12)}
+.vpp-carousel-frame{position:relative}
+.vpp-carousel-image{display:none;width:100%;height:auto;border-radius:16px;object-fit:contain;
+  background:#eef2f7;transition:opacity .25s ease}
+.vpp-carousel-image.is-active{display:block;opacity:1}
+.vpp-carousel-nav{position:absolute;top:50%;transform:translateY(-50%);border:0;background:rgba(15,23,42,.55);
+  color:#fff;width:42px;height:42px;border-radius:999px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;transition:background .2s ease, transform .2s ease;box-shadow:0 10px 28px rgba(15,23,42,.25)}
+.vpp-carousel-nav:hover{background:rgba(15,23,42,.68);transform:translateY(-50%) scale(1.05)}
+.vpp-carousel-nav:focus-visible{outline:3px solid rgba(59,130,246,.55);outline-offset:2px}
+.vpp-carousel-nav[data-dir="prev"]{left:12px}
+.vpp-carousel-nav[data-dir="next"]{right:12px}
+.vpp-carousel-nav svg{width:18px;height:18px}
+.vpp-carousel-nav[disabled]{opacity:.45;pointer-events:none}
 .vpp-placeholder{display:flex;align-items:center;justify-content:center;height:360px;border-radius:16px;
   background:linear-gradient(180deg,#f8fafc,#e2e8f0);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 20px 40px rgba(15,23,42,.08)}
 .vpp-ph-img{width:60%;height:70%;border-radius:16px;
   background:repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 12px,#f8fafc 12px,#f8fafc 24px)}
+
+.vpp-price-callout{margin-top:1rem;padding:1.15rem 1.35rem;border-radius:18px;background:rgba(37,99,235,.08);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.65),0 12px 30px rgba(37,99,235,.18);color:#0f172a;font-weight:800;
+  font-size:clamp(1.45rem,2.75vw,2.3rem);line-height:1.2}
+.vpp-price-callout span{display:block}
 
 .vpp-summary{display:flex;flex-direction:column;gap:8px}
 .vpp-title{margin:0;font-weight:800;color:#111827;font-size:clamp(1.6rem,2.4vw,2.25rem)}
@@ -150,7 +165,7 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
 @media (max-width:420px){
   .vpp-container{padding:18px 12px}
   .vpp-cta-button{padding:.85rem 1.1rem}
-  .vpp-thumb{width:86px;height:62px}
+  .vpp-carousel-nav{width:38px;height:38px}
   .vpp-cat-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
   .vpp-archive-grid{grid-template-columns:1fr}
 }
@@ -360,11 +375,16 @@ CSS;
 
     public function enqueue_assets() {
         wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
-        if ($this->current_vpp_slug() || $this->is_category_request()) {
+        wp_register_script('vpp-scripts', plugins_url('assets/vpp.js', __FILE__), [], self::VERSION, true);
+        $is_product_page = $this->current_vpp_slug();
+        if ($is_product_page || $this->is_category_request()) {
             wp_enqueue_style('vpp-styles');
             $inline = $this->load_css_contents();
             if ($inline !== '') {
                 wp_add_inline_style('vpp-styles', $inline);
+            }
+            if ($is_product_page) {
+                wp_enqueue_script('vpp-scripts');
             }
         }
     }
@@ -5739,6 +5759,15 @@ CSS;
             }, $images)));
         }
         $primary_image = $images[0] ?? '';
+        $price_display = '';
+        if (isset($p['price']) && $p['price'] !== '') {
+            if (is_string($p['price'])) {
+                $price_display = trim($p['price']);
+            } elseif (is_numeric($p['price'])) {
+                $price_display = trim((string)(0 + $p['price']));
+            }
+        }
+        $price_display_html = $price_display !== '' ? nl2br(esc_html($price_display)) : '';
         $allowed = $this->allowed_html();
         $meta_line = trim(implode(' • ', array_filter([$brand, $model, $sku])));
 
@@ -5818,14 +5847,21 @@ CSS;
               <div class="vpp-grid">
                 <div class="vpp-media">
                   <?php if ($primary_image !== ''): ?>
-                      <img src="<?php echo esc_url($primary_image); ?>" alt="<?php echo esc_attr($title); ?>" loading="eager" decoding="async" class="vpp-main-image"/>
-                      <?php if (count($images) > 1): ?>
-                        <div class="vpp-thumbs">
-                          <?php foreach (array_slice($images, 1, 6) as $thumb): ?>
-                            <img src="<?php echo esc_url($thumb); ?>" alt="<?php echo esc_attr($title); ?>" loading="lazy" decoding="async" class="vpp-thumb"/>
+                      <div class="vpp-carousel" data-vpp-carousel>
+                        <div class="vpp-carousel-frame" data-vpp-carousel-frame aria-live="polite">
+                          <?php foreach ($images as $index => $image_url): ?>
+                            <img src="<?php echo esc_url($image_url); ?>" alt="<?php echo esc_attr($title); ?>" loading="<?php echo $index === 0 ? 'eager' : 'lazy'; ?>" decoding="async" class="vpp-carousel-image vpp-main-image<?php echo $index === 0 ? ' is-active' : ''; ?>" data-vpp-carousel-item data-index="<?php echo (int)$index; ?>"<?php echo $index === 0 ? ' aria-current="true"' : ' aria-hidden="true"'; ?> />
                           <?php endforeach; ?>
                         </div>
-                      <?php endif; ?>
+                        <?php if (count($images) > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
                   <?php else: ?>
                       <div class="vpp-placeholder">
                         <div class="vpp-ph-img"></div>
@@ -5836,6 +5872,9 @@ CSS;
                   <h1 class="vpp-title"><?php echo esc_html($title); ?></h1>
                   <?php if ($meta_line): ?><p class="vpp-meta"><?php echo esc_html($meta_line); ?></p><?php endif; ?>
                   <?php if ($short_summary): ?><p class="vpp-short"><?php echo esc_html($short_summary); ?></p><?php endif; ?>
+                  <?php if ($price_display_html !== ''): ?>
+                    <div class="vpp-price-callout"><span><?php echo $price_display_html; ?></span></div>
+                  <?php endif; ?>
                   <?php if (!empty($cta_buttons)): ?>
                   <div class="vpp-cta-block">
                     <?php foreach ($cta_buttons as $btn): ?>
