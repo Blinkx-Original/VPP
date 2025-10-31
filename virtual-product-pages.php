@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 1.6.1
+ * Version: 2.0.1
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -12,11 +12,10 @@ if (!defined('ABSPATH')) { exit; }
 class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
-    const VERSION_OPTION = 'vpp_version';
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
-    const VERSION = '1.6.1';
+    const VERSION = '2.0.1';
     const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
@@ -5289,24 +5288,6 @@ CSS;
             return;
         }
         if ($path === '') {
-            status_header(404);
-            exit;
-        }
-        header('Content-Type: application/xml; charset=UTF-8');
-        header('X-Robots-Tag: noindex, follow', true);
-        header('Cache-Control: no-cache, must-revalidate, max-age=0');
-        header('Pragma: no-cache');
-        header('Expires: Wed, 11 Jan 1984 05:00:00 GMT');
-        readfile($path);
-        exit;
-    }
-
-    public function maybe_render_vpp() {
-        $slug = $this->current_vpp_slug();
-        if (!$slug) return;
-        $err = null;
-        $product = $this->get_current_product($err);
-        if (!$product || empty($product['is_published'])) {
             status_header(404);
             exit;
         }
