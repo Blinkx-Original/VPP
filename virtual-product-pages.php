@@ -12,7 +12,6 @@ if (!defined('ABSPATH')) { exit; }
 class VPP_Plugin {
     const OPT_KEY = 'vpp_settings';
     const NONCE_KEY = 'vpp_nonce';
-    const VERSION_OPTION = 'vpp_version';
     const QUERY_VAR = 'vpp_slug';
     const SITEMAP_QUERY_VAR = 'vpp_sitemap';
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
@@ -299,6 +298,13 @@ CSS;
         add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
         add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
+        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([0-9]+)');
+        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
     }
 
     private function uses_wpseo_sitemaps() {
@@ -2714,7 +2720,7 @@ CSS;
             if ($trans instanceof Transliterator) {
                 $value = $trans->transliterate($value);
             }
-        } else {
+        } elseif (function_exists('iconv')) {
             $converted = @iconv('UTF-8', 'ASCII//TRANSLIT', $value);
             if ($converted !== false) {
                 $value = $converted;
