@@ -17,6 +17,13 @@ class VPP_Plugin {
     const SITEMAP_FILE_QUERY_VAR = 'vpp_sitemap_file';
     const VERSION = '2.0.1';
     const VERSION_OPTION = 'vpp_plugin_version';
+    const CATEGORY_INDEX_QUERY_VAR = 'vpp_cat_index';
+    const CATEGORY_SLUG_QUERY_VAR = 'vpp_cat_slug';
+    const CATEGORY_PAGE_QUERY_VAR = 'vpp_cat_page';
+    const CATEGORY_PER_PAGE_DEFAULT = 12;
+    const CATEGORY_PER_PAGE_MAX = 60;
+    const CATEGORY_CACHE_TTL = 900; // 15 minutes
+    const CATEGORY_RESERVED_SLUGS = ['page', 'index', 'feed', 'sitemap'];
     const CSS_FALLBACK = <<<CSS
 /* Minimal Vercel-like look */
 body.vpp-body {
@@ -261,6 +268,9 @@ CSS;
         $vars[] = self::QUERY_VAR;
         $vars[] = self::SITEMAP_QUERY_VAR;
         $vars[] = self::SITEMAP_FILE_QUERY_VAR;
+        $vars[] = self::CATEGORY_INDEX_QUERY_VAR;
+        $vars[] = self::CATEGORY_SLUG_QUERY_VAR;
+        $vars[] = self::CATEGORY_PAGE_QUERY_VAR;
         return $vars;
     }
 
@@ -274,6 +284,13 @@ CSS;
         add_rewrite_rule('^sitemaps/([^/]+\\.xml)$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=file&' . self::SITEMAP_FILE_QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::SITEMAP_QUERY_VAR . '%', '([^&]+)');
         add_rewrite_tag('%' . self::SITEMAP_FILE_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
+        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([0-9]+)');
+        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
     }
 
     private function uses_wpseo_sitemaps() {
