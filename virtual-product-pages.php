@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.0.3
+ * Version: 2.0.4
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.0.3';
+    const VERSION = '2.0.4';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
 body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-scheme:light;
@@ -284,6 +284,13 @@ CSS;
     public function register_rewrite() {
         add_rewrite_rule('^p/([^/]+)/?$', 'index.php?' . self::QUERY_VAR . '=$matches[1]', 'top');
         add_rewrite_tag('%' . self::QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_rule('^p-cat/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1', 'top');
+        add_rewrite_rule('^p-cat/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_INDEX_QUERY_VAR . '=1&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]', 'top');
+        add_rewrite_rule('^p-cat/([^/]+)/page/([0-9]+)/?$', 'index.php?' . self::CATEGORY_SLUG_QUERY_VAR . '=$matches[1]&' . self::CATEGORY_PAGE_QUERY_VAR . '=$matches[2]', 'top');
+        add_rewrite_tag('%' . self::CATEGORY_INDEX_QUERY_VAR . '%', '([0-9]+)');
+        add_rewrite_tag('%' . self::CATEGORY_SLUG_QUERY_VAR . '%', '([^&]+)');
+        add_rewrite_tag('%' . self::CATEGORY_PAGE_QUERY_VAR . '%', '([0-9]+)');
         if (!$this->uses_wpseo_sitemaps()) {
             add_rewrite_rule('^sitemap_index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
             add_rewrite_rule('^sitemap-index\\.xml$', 'index.php?' . self::SITEMAP_QUERY_VAR . '=index', 'top');
