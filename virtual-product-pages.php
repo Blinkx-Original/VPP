@@ -24,6 +24,7 @@ class VPP_Plugin {
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
     const VERSION = '2.0.5';
+    const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
 body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-scheme:light;
