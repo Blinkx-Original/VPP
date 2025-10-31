@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.0.4
+ * Version: 2.0.5
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.0.4';
+    const VERSION = '2.0.5';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
 body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-scheme:light;
@@ -3217,11 +3217,36 @@ CSS;
         $raw = trim((string)$raw);
         if ($raw === '') return '';
         $t = ltrim($raw);
-        if ($t && $t[0] === '[') return $raw;
+        if ($t && $t[0] === '[') {
+            $decoded = json_decode($raw, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $urls = [];
+                foreach ($decoded as $item) {
+                    if (is_string($item) && trim($item) !== '') {
+                        $urls[] = trim($item);
+                    }
+                }
+                if (empty($urls)) {
+                    return '';
+                }
+                $urls = array_values(array_unique($urls));
+                return wp_json_encode($urls, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            }
+            return $raw;
+        }
         $lines = preg_split('/\r?\n/', $raw);
         $urls = [];
-        foreach ($lines as $ln) { $u = trim($ln); if ($u !== '') $urls[] = $u; }
-        return wp_json_encode(array_values(array_unique($urls)));
+        foreach ($lines as $ln) {
+            $u = trim($ln);
+            if ($u !== '') {
+                $urls[] = $u;
+            }
+        }
+        if (empty($urls)) {
+            return '';
+        }
+        $urls = array_values(array_unique($urls));
+        return wp_json_encode($urls, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
     /* ========= ADMIN: EDIT PRODUCT ========= */
@@ -3288,10 +3313,25 @@ CSS;
                         <tr><th scope="row">Short summary (max 150 chars)</th><td><input type="text" maxlength="150" name="short_summary" value="<?php echo esc_attr($row['short_summary'] ?? ''); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Meta description (max 160)</th><td><input type="text" maxlength="160" name="meta_description" value="<?php echo esc_attr($row['meta_description'] ?? ''); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Images</th><td>
-                            <textarea name="images_json" rows="3" style="width:100%;" placeholder='Either JSON array ["https://...","https://..."] or one URL per line'><?php
-                                $images_val = $row['images_json'];
+                            <textarea name="images_json" rows="4" style="width:100%;" placeholder="One image URL per line or paste a JSON array."><?php
+                                $images_val = (string)($row['images_json'] ?? '');
+                                if ($images_val !== '') {
+                                    $decoded_images = json_decode($images_val, true);
+                                    if (is_array($decoded_images)) {
+                                        $normalized_images = [];
+                                        foreach ($decoded_images as $img_url) {
+                                            if (is_string($img_url) && trim($img_url) !== '') {
+                                                $normalized_images[] = trim($img_url);
+                                            }
+                                        }
+                                        if (!empty($normalized_images)) {
+                                            $images_val = implode("\n", $normalized_images);
+                                        }
+                                    }
+                                }
                                 echo esc_textarea($images_val);
                             ?></textarea>
+                            <p class="description">Enter each image URL on its own line. The plugin will save them as JSON automatically.</p>
                         </td></tr>
                         <tr><th scope="row">CTAs</th><td style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;">
                             <input type="text" placeholder="Lead button label" name="cta_lead_label" value="<?php echo esc_attr($row['cta_lead_label'] ?? ''); ?>" aria-label="Lead button label"/>
@@ -3513,16 +3553,19 @@ CSS;
             }
         }
 
+        $schema_invalid = false;
         if ($clear_schema) {
             $schema_json = null;
         } elseif ($schema_json_raw === '') {
             $schema_json = $current_schema;
         } else {
-            $decoded = json_decode($schema_json_raw, true);
-            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                $schema_json = wp_json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $schema_clean = wp_check_invalid_utf8($schema_json_raw, true);
+            $decoded = json_decode($schema_clean, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $schema_json = wp_json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
             } else {
-                $schema_json = $current_schema;
+                $schema_json = $schema_clean;
+                $schema_invalid = true;
             }
         }
 
@@ -3617,6 +3660,12 @@ CSS;
             } else {
                 $inline = 'err'; $inline_msg = 'Algolia: ' . ($tmp2 ?: 'error'); $top_msg = 'Saved, but Algolia push failed.';
             }
+        }
+
+        if ($ok && $schema_invalid) {
+            $schema_note = 'Schema kept as raw text (invalid JSON).';
+            $inline_msg = trim($inline_msg . ' ' . $schema_note);
+            $top_msg = trim($top_msg . ' ' . $schema_note);
         }
 
         $args = ['lookup_type'=>'id','lookup_val'=>$id,'vpp_msg'=>$top_msg,'inline'=>$inline,'inline_msg'=>$inline_msg];
