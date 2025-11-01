@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.2
+ * Version: 2.3
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.2';
+    const VERSION = '2.3';
     const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
@@ -70,11 +70,6 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
   box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 20px 40px rgba(15,23,42,.08)}
 .vpp-ph-img{width:60%;height:70%;border-radius:16px;
   background:#fff;border:1px solid rgba(148,163,184,.16)}
-
-.vpp-price-callout{margin-top:1rem;padding:1.15rem 1.35rem;border-radius:18px;background:rgba(37,99,235,.08);
-  box-shadow:inset 0 1px 0 rgba(255,255,255,.65),0 12px 30px rgba(37,99,235,.18);color:#0f172a;font-weight:800;
-  font-size:clamp(1.45rem,2.75vw,2.3rem);line-height:1.2}
-.vpp-price-callout span{display:block}
 
 .vpp-price-callout{margin-top:1rem;padding:1.15rem 1.35rem;border-radius:18px;background:rgba(37,99,235,.08);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.65),0 12px 30px rgba(37,99,235,.18);color:#0f172a;font-weight:800;
@@ -5951,6 +5946,24 @@ CSS;
                             </button>
                           <?php endforeach; ?>
                         </div>
+                        <?php if ($image_count > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
+                      <?php if ($image_count > 1): ?>
+                        <div class="vpp-carousel-thumbs" data-vpp-carousel-thumbs role="group" aria-label="<?php echo esc_attr__('Carousel thumbnails', 'virtual-product-pages'); ?>">
+                          <?php foreach ($images as $index => $image_url): ?>
+                            <?php $thumb_label = sprintf(__('Show image %1$d of %2$d', 'virtual-product-pages'), $index + 1, $image_count); ?>
+                            <button type="button" class="vpp-carousel-thumb<?php echo $index === 0 ? ' is-active' : ''; ?>" data-vpp-carousel-thumb data-index="<?php echo (int)$index; ?>" aria-pressed="<?php echo $index === 0 ? 'true' : 'false'; ?>" aria-label="<?php echo esc_attr($thumb_label); ?>">
+                              <img src="<?php echo esc_url($image_url); ?>" alt="" loading="lazy" decoding="async" />
+                            </button>
+                          <?php endforeach; ?>
+                        </div>
                         <?php if (count($images) > 1): ?>
                           <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
                             <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -5989,9 +6002,13 @@ CSS;
 
             <section class="vpp-content card">
               <?php
-                $html = $p['desc_html'] ?? '';
-                if ($html) { echo wp_kses($html, $allowed); }
-                else { echo '<p>No description available yet.</p>'; }
+                $html = isset($p['desc_html']) ? trim((string)$p['desc_html']) : '';
+                if ($html !== '') {
+                    $rendered_html = wpautop($html);
+                    echo wp_kses($rendered_html, $allowed);
+                } else {
+                    echo '<p>No description available yet.</p>';
+                }
               ?>
             </section>
             <?php
