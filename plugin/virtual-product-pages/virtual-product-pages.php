@@ -2212,7 +2212,11 @@ CSS;
             $lastmod = $entry['lastmod'] ?? gmdate('c');
             switch ($type) {
                 case 'blog':
-                    $loc = home_url('/b/' . $slug);
+                    if (!empty($entry['loc'])) {
+                        $loc = esc_url($entry['loc']);
+                    } else {
+                        $loc = home_url('/b/' . $slug);
+                    }
                     break;
                 case 'category':
                     $loc = home_url('/p-cat/' . $slug . '/');
@@ -5810,31 +5814,39 @@ CSS;
         }
 
         $blog_table = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$this->get_blog_table());
-        if ($blog_table !== '' && $this->table_exists($mysqli, $blog_table)) {
-            $blog_chunk_index = 0;
+        $blog_chunk_index = 0;
+        $blog_chunk_entries = [];
+        $blog_chunk_lastmod = 0;
+        $blog_chunk_total = 0;
+        $write_blog_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err, &$purge_files) {
+            if (empty($entries)) { return true; }
+            $filename = sprintf('blog-%d.xml', $index);
+            $path = $dir . $filename;
+            $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+            $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
+            foreach ($entries as $entry) {
+                $slug = sanitize_title($entry['slug'] ?? '');
+                if ($slug === '') { continue; }
+                $loc = isset($entry['loc']) && $entry['loc'] !== '' ? (string)$entry['loc'] : home_url('/b/' . $slug);
+                $loc = esc_url($loc);
+                if ($loc === '') { continue; }
+                $xml .= "  <url>\n";
+                $xml .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
+                $xml .= '    <lastmod>' . gmdate('c', (int)$entry['lastmod']) . '</lastmod>' . "\n";
+                $xml .= "  </url>\n";
+            }
+            $xml .= '</urlset>';
+            if (@file_put_contents($path, $xml) === false) { $err = 'Failed to write ' . $filename; return false; }
+            $files[] = ['loc' => $base_url . $filename, 'lastmod' => gmdate('c', $lastmod_ts ?: time())];
+            $purge_files[] = $filename;
+            return true;
+        };
+        $table_exists = $blog_table !== '' && $this->table_exists($mysqli, $blog_table);
+        if ($table_exists) {
             $blog_chunk_entries = [];
             $blog_chunk_lastmod = 0;
             $blog_batch_size = 2000;
             $blog_offset = 0;
-            $write_blog_chunk = function(array $entries, $lastmod_ts, $index) use (&$files, $dir, $base_url, &$err, &$purge_files) {
-                if (empty($entries)) { return true; }
-                $filename = sprintf('blog-%d.xml', $index);
-                $path = $dir . $filename;
-                $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-                $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
-                foreach ($entries as $entry) {
-                    $loc = home_url('/b/' . $entry['slug']);
-                    $xml .= "  <url>\n";
-                    $xml .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
-                    $xml .= '    <lastmod>' . gmdate('c', $entry['lastmod']) . '</lastmod>' . "\n";
-                    $xml .= "  </url>\n";
-                }
-                $xml .= '</urlset>';
-                if (@file_put_contents($path, $xml) === false) { $err = 'Failed to write ' . $filename; return false; }
-                $files[] = ['loc' => $base_url . $filename, 'lastmod' => gmdate('c', $lastmod_ts ?: time())];
-                $purge_files[] = $filename;
-                return true;
-            };
             while (true) {
                 $sql = sprintf("SELECT slug, published_at, last_tidb_update_at, is_published FROM `%s` WHERE is_published = 1 ORDER BY id LIMIT %d OFFSET %d", $blog_table, $blog_batch_size, $blog_offset);
                 $res = $mysqli->query($sql);
@@ -5856,6 +5868,7 @@ CSS;
                     if (!$lastmod) { $lastmod = time(); }
                     $blog_chunk_entries[] = ['slug' => $row_slug, 'lastmod' => $lastmod];
                     $blog_chunk_lastmod = max($blog_chunk_lastmod, $lastmod);
+                    $blog_chunk_total++;
                     if (count($blog_chunk_entries) >= $chunk_size) {
                         $blog_chunk_index++;
                         if (!$write_blog_chunk($blog_chunk_entries, $blog_chunk_lastmod, $blog_chunk_index)) {
@@ -5878,6 +5891,41 @@ CSS;
                     @$mysqli->close();
                     $changed_files = array_values(array_unique($purge_files));
                     return false;
+                }
+            }
+        }
+
+        if (!$table_exists || $blog_chunk_total === 0) {
+            $blog_entries = $this->collect_wp_blog_posts_for_sitemap();
+            if (!empty($blog_entries)) {
+                $blog_chunk_entries = [];
+                $blog_chunk_lastmod = 0;
+                foreach ($blog_entries as $entry) {
+                    $slug = sanitize_title($entry['slug'] ?? '');
+                    if ($slug === '') { continue; }
+                    $lastmod = isset($entry['lastmod']) ? (int)$entry['lastmod'] : time();
+                    $loc = isset($entry['loc']) ? (string)$entry['loc'] : '';
+                    $blog_chunk_entries[] = ['slug' => $slug, 'lastmod' => $lastmod, 'loc' => $loc];
+                    $blog_chunk_lastmod = max($blog_chunk_lastmod, $lastmod);
+                    $blog_chunk_total++;
+                    if (count($blog_chunk_entries) >= $chunk_size) {
+                        $blog_chunk_index++;
+                        if (!$write_blog_chunk($blog_chunk_entries, $blog_chunk_lastmod, $blog_chunk_index)) {
+                            @$mysqli->close();
+                            $changed_files = array_values(array_unique($purge_files));
+                            return false;
+                        }
+                        $blog_chunk_entries = [];
+                        $blog_chunk_lastmod = 0;
+                    }
+                }
+                if (!empty($blog_chunk_entries)) {
+                    $blog_chunk_index++;
+                    if (!$write_blog_chunk($blog_chunk_entries, $blog_chunk_lastmod, $blog_chunk_index)) {
+                        @$mysqli->close();
+                        $changed_files = array_values(array_unique($purge_files));
+                        return false;
+                    }
                 }
             }
         }
@@ -5953,13 +6001,14 @@ CSS;
         if (!$mysqli) { return false; }
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$this->get_blog_table());
         $has_table = $table !== '' && $this->table_exists($mysqli, $table);
+        $chunk_size = 50000;
+        $chunk_entries = [];
+        $file_index = 0;
+        $written_total = 0;
 
         if ($has_table) {
             $blog_batch_size = 2000;
             $blog_offset = 0;
-            $chunk_size = 50000;
-            $chunk_entries = [];
-            $file_index = 0;
             while (true) {
                 $sql = sprintf("SELECT slug, published_at, last_tidb_update_at, is_published FROM `%s` WHERE is_published = 1 ORDER BY id LIMIT %d OFFSET %d", $table, $blog_batch_size, $blog_offset);
                 $res = $mysqli->query($sql);
@@ -5983,6 +6032,7 @@ CSS;
                         'slug' => $slug,
                         'lastmod' => gmdate('c', $lastmod),
                     ];
+                    $written_total++;
                     if (count($chunk_entries) >= $chunk_size) {
                         $file_index++;
                         $filename = sprintf('blog-%d.xml', $file_index);
@@ -5997,14 +6047,39 @@ CSS;
                 if ($row_count < $blog_batch_size) { break; }
                 $blog_offset += $blog_batch_size;
             }
-            if (!empty($chunk_entries)) {
-                $file_index++;
-                $filename = sprintf('blog-%d.xml', $file_index);
-                $xml = $this->build_sitemap_xml($chunk_entries, 'blog');
-                if ($xml === false || @file_put_contents($dir . $filename, $xml) === false) { @$mysqli->close(); $err = 'Failed to write ' . $filename; return false; }
-                if ($legacy_dir) { @file_put_contents($legacy_dir . $filename, $xml); }
-                $purge_files[] = $filename;
+        }
+
+        if (!$has_table || $written_total === 0) {
+            $fallback_entries = $this->collect_wp_blog_posts_for_sitemap();
+            foreach ($fallback_entries as $entry) {
+                $slug = sanitize_title($entry['slug'] ?? '');
+                if ($slug === '') { continue; }
+                $lastmod_ts = isset($entry['lastmod']) ? (int)$entry['lastmod'] : time();
+                $chunk_entries[] = [
+                    'slug' => $slug,
+                    'lastmod' => gmdate('c', $lastmod_ts),
+                    'loc' => isset($entry['loc']) ? (string)$entry['loc'] : '',
+                ];
+                $written_total++;
+                if (count($chunk_entries) >= $chunk_size) {
+                    $file_index++;
+                    $filename = sprintf('blog-%d.xml', $file_index);
+                    $xml = $this->build_sitemap_xml($chunk_entries, 'blog');
+                    if ($xml === false || @file_put_contents($dir . $filename, $xml) === false) { @$mysqli->close(); $err = 'Failed to write ' . $filename; return false; }
+                    if ($legacy_dir) { @file_put_contents($legacy_dir . $filename, $xml); }
+                    $purge_files[] = $filename;
+                    $chunk_entries = [];
+                }
             }
+        }
+
+        if (!empty($chunk_entries)) {
+            $file_index++;
+            $filename = sprintf('blog-%d.xml', $file_index);
+            $xml = $this->build_sitemap_xml($chunk_entries, 'blog');
+            if ($xml === false || @file_put_contents($dir . $filename, $xml) === false) { @$mysqli->close(); $err = 'Failed to write ' . $filename; return false; }
+            if ($legacy_dir) { @file_put_contents($legacy_dir . $filename, $xml); }
+            $purge_files[] = $filename;
         }
 
         @$mysqli->close();
@@ -6702,18 +6777,142 @@ CSS;
     }
 
     private function is_blog_post_public($post) {
-        if (!is_array($post) || empty($post['is_published'])) {
+        if (!is_array($post)) {
             return false;
         }
-        $published_at = isset($post['published_at']) ? trim((string)$post['published_at']) : '';
-        if ($published_at === '') {
+
+        $is_published = null;
+        if (array_key_exists('is_published', $post)) {
+            $is_published = (int)$post['is_published'] > 0;
+        }
+        if ($is_published === null && isset($post['post_status'])) {
+            $status = strtolower((string)$post['post_status']);
+            $is_published = ($status === 'publish');
+        }
+        if (!$is_published) {
+            return false;
+        }
+
+        $published_at = '';
+        if (isset($post['published_at'])) {
+            $published_at = trim((string)$post['published_at']);
+        }
+        if ($published_at === '' && isset($post['post_date_gmt'])) {
+            $published_at = trim((string)$post['post_date_gmt']);
+        }
+        if ($published_at === '' && isset($post['post_date'])) {
+            $published_at = trim((string)$post['post_date']);
+            if ($published_at !== '' && function_exists('get_gmt_from_date')) {
+                $converted = get_gmt_from_date($published_at);
+                if (is_string($converted) && $converted !== '') {
+                    $published_at = $converted;
+                }
+            }
+        }
+
+        if ($published_at === '' || $published_at === '0000-00-00 00:00:00') {
             return true;
         }
-        $timestamp = strtotime($published_at);
+        $timestamp = $this->parse_blog_datetime($published_at, true);
+        if ($timestamp === false) {
+            $timestamp = strtotime($published_at);
+        }
         if ($timestamp === false) {
             return true;
         }
         return $timestamp <= time();
+    }
+
+    private function parse_blog_datetime($value, $is_gmt = true)
+    {
+        $value = trim((string)$value);
+        if ($value === '' || $value === '0000-00-00 00:00:00') {
+            return false;
+        }
+        if ($is_gmt) {
+            $ts = strtotime($value . ' UTC');
+            if ($ts === false) {
+                $ts = strtotime($value);
+            }
+            return $ts;
+        }
+        $ts = strtotime($value);
+        if ($ts === false) {
+            return false;
+        }
+        return $ts;
+    }
+
+    private function collect_wp_blog_posts_for_sitemap()
+    {
+        if (!function_exists('get_posts')) {
+            return [];
+        }
+        $args = [
+            'post_type' => 'post',
+            'post_status' => ['publish', 'future'],
+            'orderby' => 'ID',
+            'order' => 'ASC',
+            'posts_per_page' => -1,
+        ];
+        $posts = get_posts($args);
+        if (!is_array($posts) || empty($posts)) {
+            return [];
+        }
+        $entries = [];
+        foreach ($posts as $post) {
+            if (!is_object($post)) {
+                continue;
+            }
+            $slug = '';
+            if (isset($post->post_name)) {
+                $slug = sanitize_title((string)$post->post_name);
+            }
+            if ($slug === '' && isset($post->post_title)) {
+                $slug = sanitize_title((string)$post->post_title);
+            }
+            if ($slug === '') {
+                continue;
+            }
+            $data = [
+                'slug' => $slug,
+                'post_status' => isset($post->post_status) ? (string)$post->post_status : '',
+                'post_date_gmt' => isset($post->post_date_gmt) ? (string)$post->post_date_gmt : '',
+                'post_date' => isset($post->post_date) ? (string)$post->post_date : '',
+            ];
+            if (!empty($post->post_modified_gmt)) {
+                $data['post_modified_gmt'] = (string)$post->post_modified_gmt;
+            }
+            $permalink = '';
+            if (function_exists('get_permalink')) {
+                $permalink = (string)get_permalink($post);
+            }
+            if ($permalink !== '') {
+                $data['permalink'] = $permalink;
+            }
+            if (!$this->is_blog_post_public($data)) {
+                continue;
+            }
+            $lastmod = null;
+            if (!empty($data['post_modified_gmt'])) {
+                $lastmod = $this->parse_blog_datetime($data['post_modified_gmt'], true);
+            }
+            if (!$lastmod && !empty($data['post_date_gmt'])) {
+                $lastmod = $this->parse_blog_datetime($data['post_date_gmt'], true);
+            }
+            if (!$lastmod && !empty($data['post_date'])) {
+                $lastmod = $this->parse_blog_datetime($data['post_date'], false);
+            }
+            if (!$lastmod) {
+                $lastmod = time();
+            }
+            $entries[] = [
+                'slug' => $slug,
+                'lastmod' => $lastmod,
+                'loc' => $permalink,
+            ];
+        }
+        return $entries;
     }
 
     private function build_blog_meta_description($post) {
@@ -6742,6 +6941,12 @@ CSS;
             $sanitized = esc_url($custom);
             if ($sanitized !== '') {
                 return $sanitized;
+            }
+        }
+        if (!empty($post['permalink'])) {
+            $permalink = esc_url($post['permalink']);
+            if ($permalink !== '') {
+                return $permalink;
             }
         }
         $slug = sanitize_title($post['slug'] ?? '');
