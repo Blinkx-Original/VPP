@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.9
+ * Version: 2.10
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -24,7 +24,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.9';
+    const VERSION = '2.10';
     const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
