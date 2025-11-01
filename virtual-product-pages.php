@@ -5904,7 +5904,15 @@ CSS;
                             </button>
                           <?php endforeach; ?>
                         </div>
-                      <?php endif; ?>
+                        <?php if (count($images) > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
                   <?php else: ?>
                       <div class="vpp-placeholder">
                         <div class="vpp-ph-img"></div>
