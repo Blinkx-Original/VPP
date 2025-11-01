@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.0.4
+ * Version: 2.2
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,8 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.0.4';
+    const VERSION = '2.2';
+    const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
 body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-scheme:light;
@@ -48,22 +49,39 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
 .vpp-grid{display:grid;grid-template-columns:1.1fr 1fr;gap:28px}
 @media (max-width:960px){.vpp-grid{grid-template-columns:1fr}}
 
-.vpp-media{display:flex;flex-direction:column;gap:10px}
-.vpp-main-image{width:100%;height:auto;border-radius:16px;background:#eef2f7;box-shadow:0 18px 40px rgba(15,23,42,.12)}
-.vpp-thumbs{display:flex;gap:8px;flex-wrap:wrap}
-.vpp-thumb{width:96px;height:70px;object-fit:cover;border-radius:12px;background:#eef2f7;
-  box-shadow:inset 0 1px 0 #fff,0 10px 24px rgba(15,23,42,.08)}
-
+.vpp-media{display:flex;flex-direction:column;gap:12px}
+.vpp-carousel{position:relative;border-radius:16px;overflow:hidden;background:#eef2f7;
+  box-shadow:0 18px 40px rgba(15,23,42,.12)}
+.vpp-carousel-frame{position:relative}
+.vpp-carousel-image{display:none;width:100%;height:auto;border-radius:16px;object-fit:contain;
+  background:#eef2f7;transition:opacity .25s ease}
+.vpp-carousel-image.is-active{display:block;opacity:1}
+.vpp-carousel-nav{position:absolute;top:50%;transform:translateY(-50%);border:0;background:rgba(15,23,42,.55);
+  color:#fff;width:42px;height:42px;border-radius:999px;display:flex;align-items:center;justify-content:center;
+  cursor:pointer;transition:background .2s ease, transform .2s ease;box-shadow:0 10px 28px rgba(15,23,42,.25)}
+.vpp-carousel-nav:hover{background:rgba(15,23,42,.68);transform:translateY(-50%) scale(1.05)}
+.vpp-carousel-nav:focus-visible{outline:3px solid rgba(59,130,246,.55);outline-offset:2px}
+.vpp-carousel-nav[data-dir="prev"]{left:12px}
+.vpp-carousel-nav[data-dir="next"]{right:12px}
+.vpp-carousel-nav svg{width:18px;height:18px}
+.vpp-carousel-nav[disabled]{opacity:.45;pointer-events:none}
 .vpp-placeholder{display:flex;align-items:center;justify-content:center;height:360px;border-radius:16px;
-  background:linear-gradient(180deg,#f8fafc,#e2e8f0);
+  background:#fff;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 20px 40px rgba(15,23,42,.08)}
 .vpp-ph-img{width:60%;height:70%;border-radius:16px;
-  background:repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 12px,#f8fafc 12px,#f8fafc 24px)}
+  background:#fff;border:1px solid rgba(148,163,184,.16)}
+
+.vpp-price-callout{margin-top:1rem;padding:1.15rem 1.35rem;border-radius:18px;background:rgba(37,99,235,.08);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.65),0 12px 30px rgba(37,99,235,.18);color:#0f172a;font-weight:800;
+  font-size:clamp(1.45rem,2.75vw,2.3rem);line-height:1.2}
+.vpp-price-callout span{display:block}
 
 .vpp-summary{display:flex;flex-direction:column;gap:8px}
 .vpp-title{margin:0;font-weight:800;color:#111827;font-size:clamp(1.6rem,2.4vw,2.25rem)}
 .vpp-meta{margin:0;color:var(--muted)}
 .vpp-short{margin:.2rem 0 0;color:#374151;font-size:.98rem;max-width:60ch}
+
+.vpp-availability{margin:.5rem 0 0;font-weight:600;color:#047857;font-size:1.02rem}
 
 .vpp-cta-block{margin-top:.75rem;display:flex;flex-direction:column;gap:.75rem}
 .vpp-cta-button{display:flex;align-items:center;justify-content:center;text-decoration:none;color:#fff!important;
@@ -149,7 +167,7 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
 @media (max-width:420px){
   .vpp-container{padding:18px 12px}
   .vpp-cta-button{padding:.85rem 1.1rem}
-  .vpp-thumb{width:86px;height:62px}
+  .vpp-carousel-nav{width:38px;height:38px}
   .vpp-cat-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
   .vpp-archive-grid{grid-template-columns:1fr}
 }
@@ -359,11 +377,16 @@ CSS;
 
     public function enqueue_assets() {
         wp_register_style('vpp-styles', plugins_url('assets/vpp.css', __FILE__), [], self::VERSION);
-        if ($this->current_vpp_slug() || $this->is_category_request()) {
+        wp_register_script('vpp-scripts', plugins_url('assets/vpp.js', __FILE__), [], self::VERSION, true);
+        $is_product_page = $this->current_vpp_slug();
+        if ($is_product_page || $this->is_category_request()) {
             wp_enqueue_style('vpp-styles');
             $inline = $this->load_css_contents();
             if ($inline !== '') {
                 wp_add_inline_style('vpp-styles', $inline);
+            }
+            if ($is_product_page) {
+                wp_enqueue_script('vpp-scripts');
             }
         }
     }
@@ -1395,6 +1418,7 @@ CSS;
             $select[] = "'' AS short_description";
         }
         $select[] = isset($cols['price']) ? '`price`' : "'' AS price";
+        $select[] = isset($cols['availability']) ? '`availability`' : "'' AS availability";
         $select[] = isset($cols['categories']) ? '`categories`' : "'' AS categories";
         if (isset($cols['image'])) {
             $select[] = '`image`';
@@ -2454,6 +2478,9 @@ CSS;
         if (isset($row['price']) && $row['price'] !== '') {
             $record['price'] = is_numeric($row['price']) ? 0 + $row['price'] : (string)$row['price'];
         }
+        if (isset($row['availability']) && $row['availability'] !== '') {
+            $record['availability'] = trim((string)$row['availability']);
+        }
         $categories = $this->normalize_publish_categories($row['categories'] ?? null);
         if ($categories !== null) {
             $record['categories'] = $categories;
@@ -3163,6 +3190,14 @@ CSS;
         return $this->column_exists($mysqli, $table, 'schema_json');
     }
 
+    private function select_has_price_column($mysqli, $table) {
+        return $this->column_exists($mysqli, $table, 'price');
+    }
+
+    private function select_has_availability_column($mysqli, $table) {
+        return $this->column_exists($mysqli, $table, 'availability');
+    }
+
     private function fetch_product_by_slug($slug, &$err = null) {
         $s = $this->get_settings();
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
@@ -3172,9 +3207,13 @@ CSS;
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
+        $has_price = $this->select_has_price_column($mysqli, $table);
+        $price_sql = $has_price ? ', price' : ", '' AS price";
+        $has_availability = $this->select_has_availability_column($mysqli, $table);
+        $availability_sql = $has_availability ? ', availability' : ", '' AS availability";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
         $category_sql = $this->build_category_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$availability_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -3197,9 +3236,13 @@ CSS;
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
+        $has_price = $this->select_has_price_column($mysqli, $table);
+        $price_sql = $has_price ? ', price' : ", '' AS price";
+        $has_availability = $this->select_has_availability_column($mysqli, $table);
+        $availability_sql = $has_availability ? ', availability' : ", '' AS availability";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
         $category_sql = $this->build_category_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$availability_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -3213,15 +3256,75 @@ CSS;
         return $row;
     }
 
+    private function normalize_price_input($raw) {
+        if (is_array($raw)) {
+            $raw = implode("\n", $raw);
+        }
+        $value = is_string($raw) ? sanitize_textarea_field(wp_unslash($raw)) : '';
+        if ($value === '') {
+            return '';
+        }
+        $value = str_replace(["\r\n", "\r"], "\n", $value);
+        $value = preg_replace("/\n{3,}/", "\n\n", $value);
+        if (function_exists('mb_substr')) {
+            $value = mb_substr($value, 0, 220);
+        } else {
+            $value = substr($value, 0, 220);
+        }
+        return trim($value);
+    }
+
+    private function normalize_availability_input($raw) {
+        if (is_array($raw)) {
+            $raw = implode(' ', $raw);
+        }
+        $value = is_string($raw) ? sanitize_text_field(wp_unslash($raw)) : '';
+        if ($value === '') {
+            return '';
+        }
+        $value = preg_replace('/\s+/', ' ', $value);
+        if (function_exists('mb_substr')) {
+            $value = mb_substr($value, 0, 80);
+        } else {
+            $value = substr($value, 0, 80);
+        }
+        return trim($value);
+    }
+
     private function normalize_images_input($raw) {
         $raw = trim((string)$raw);
         if ($raw === '') return '';
         $t = ltrim($raw);
-        if ($t && $t[0] === '[') return $raw;
+        if ($t && $t[0] === '[') {
+            $decoded = json_decode($raw, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $urls = [];
+                foreach ($decoded as $item) {
+                    if (is_string($item) && trim($item) !== '') {
+                        $urls[] = trim($item);
+                    }
+                }
+                if (empty($urls)) {
+                    return '';
+                }
+                $urls = array_values(array_unique($urls));
+                return wp_json_encode($urls, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            }
+            return $raw;
+        }
         $lines = preg_split('/\r?\n/', $raw);
         $urls = [];
-        foreach ($lines as $ln) { $u = trim($ln); if ($u !== '') $urls[] = $u; }
-        return wp_json_encode(array_values(array_unique($urls)));
+        foreach ($lines as $ln) {
+            $u = trim($ln);
+            if ($u !== '') {
+                $urls[] = $u;
+            }
+        }
+        if (empty($urls)) {
+            return '';
+        }
+        $urls = array_values(array_unique($urls));
+        return wp_json_encode($urls, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
     /* ========= ADMIN: EDIT PRODUCT ========= */
@@ -3285,13 +3388,36 @@ CSS;
                         </td></tr>
                         <tr><th scope="row">Model</th><td><input type="text" name="model" value="<?php echo esc_attr($row['model']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">SKU</th><td><input type="text" name="sku" value="<?php echo esc_attr($row['sku']); ?>" class="regular-text"></td></tr>
+                        <tr><th scope="row">Availability</th><td>
+                            <input type="text" name="availability" value="<?php echo esc_attr($row['availability'] ?? ''); ?>" class="regular-text" placeholder="e.g. In stock" style="max-width:320px;">
+                            <p class="description">Shown above the price banner. Freeform text saved to TiDB.</p>
+                        </td></tr>
+                        <tr><th scope="row">Price</th><td>
+                            <textarea name="price" rows="3" class="large-text" placeholder="e.g. $650 solo esta semana" style="max-width:520px;"><?php echo esc_textarea($row['price'] ?? ''); ?></textarea>
+                            <p class="description">Shown prominently on the product page. Supports numbers and short text, including line breaks.</p>
+                        </td></tr>
                         <tr><th scope="row">Short summary (max 150 chars)</th><td><input type="text" maxlength="150" name="short_summary" value="<?php echo esc_attr($row['short_summary'] ?? ''); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Meta description (max 160)</th><td><input type="text" maxlength="160" name="meta_description" value="<?php echo esc_attr($row['meta_description'] ?? ''); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Images</th><td>
-                            <textarea name="images_json" rows="3" style="width:100%;" placeholder='Either JSON array ["https://...","https://..."] or one URL per line'><?php
-                                $images_val = $row['images_json'];
+                            <textarea name="images_json" rows="4" style="width:100%;" placeholder="One image URL per line or paste a JSON array."><?php
+                                $images_val = (string)($row['images_json'] ?? '');
+                                if ($images_val !== '') {
+                                    $decoded_images = json_decode($images_val, true);
+                                    if (is_array($decoded_images)) {
+                                        $normalized_images = [];
+                                        foreach ($decoded_images as $img_url) {
+                                            if (is_string($img_url) && trim($img_url) !== '') {
+                                                $normalized_images[] = trim($img_url);
+                                            }
+                                        }
+                                        if (!empty($normalized_images)) {
+                                            $images_val = implode("\n", $normalized_images);
+                                        }
+                                    }
+                                }
                                 echo esc_textarea($images_val);
                             ?></textarea>
+                            <p class="description">Enter each image URL on its own line. The plugin will save them as JSON automatically.</p>
                         </td></tr>
                         <tr><th scope="row">CTAs</th><td style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;">
                             <input type="text" placeholder="Lead button label" name="cta_lead_label" value="<?php echo esc_attr($row['cta_lead_label'] ?? ''); ?>" aria-label="Lead button label"/>
@@ -3456,6 +3582,8 @@ CSS;
         if (strlen($short_summary) > 150) $short_summary = substr($short_summary, 0, 150);
         $meta_description = sanitize_text_field($_POST['meta_description'] ?? '');
         if (strlen($meta_description) > 160) $meta_description = substr($meta_description, 0, 160);
+        $availability = $this->normalize_availability_input($_POST['availability'] ?? '');
+        $price = $this->normalize_price_input($_POST['price'] ?? '');
         $images_json = $this->normalize_images_input($_POST['images_json'] ?? '');
         $cta_lead_label = $this->sanitize_cta_label($_POST['cta_lead_label'] ?? '');
         $cta_lead_url = esc_url_raw($_POST['cta_lead_url'] ?? '');
@@ -3513,16 +3641,19 @@ CSS;
             }
         }
 
+        $schema_invalid = false;
         if ($clear_schema) {
             $schema_json = null;
         } elseif ($schema_json_raw === '') {
             $schema_json = $current_schema;
         } else {
-            $decoded = json_decode($schema_json_raw, true);
-            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                $schema_json = wp_json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            $schema_clean = wp_check_invalid_utf8($schema_json_raw, true);
+            $decoded = json_decode($schema_clean, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $schema_json = wp_json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
             } else {
-                $schema_json = $current_schema;
+                $schema_json = $schema_clean;
+                $schema_invalid = true;
             }
         }
 
@@ -3533,6 +3664,8 @@ CSS;
             'sku' => $sku,
             'short_summary' => $short_summary,
             'meta_description' => $meta_description,
+            'availability' => $availability,
+            'price' => $price,
             'images_json' => $images_json,
             'schema_json' => $schema_json,
             'cta_lead_label' => $cta_lead_label,
@@ -3617,6 +3750,12 @@ CSS;
             } else {
                 $inline = 'err'; $inline_msg = 'Algolia: ' . ($tmp2 ?: 'error'); $top_msg = 'Saved, but Algolia push failed.';
             }
+        }
+
+        if ($ok && $schema_invalid) {
+            $schema_note = 'Schema kept as raw text (invalid JSON).';
+            $inline_msg = trim($inline_msg . ' ' . $schema_note);
+            $top_msg = trim($top_msg . ' ' . $schema_note);
         }
 
         $args = ['lookup_type'=>'id','lookup_val'=>$id,'vpp_msg'=>$top_msg,'inline'=>$inline,'inline_msg'=>$inline_msg];
@@ -5688,7 +5827,22 @@ CSS;
                 return $value !== '' ? $value : null;
             }, $images)));
         }
+        $image_count = count($images);
         $primary_image = $images[0] ?? '';
+        $availability_display = '';
+        if (isset($p['availability']) && $p['availability'] !== '') {
+            $availability_display = trim((string)$p['availability']);
+        }
+        $price_display = '';
+        if (isset($p['price']) && $p['price'] !== '') {
+            if (is_string($p['price'])) {
+                $price_display = trim($p['price']);
+            } elseif (is_numeric($p['price'])) {
+                $price_display = trim((string)(0 + $p['price']));
+            }
+        }
+        $availability_display_html = $availability_display !== '' ? esc_html($availability_display) : '';
+        $price_display_html = $price_display !== '' ? nl2br(esc_html($price_display)) : '';
         $allowed = $this->allowed_html();
         $meta_line = trim(implode(' • ', array_filter([$brand, $model, $sku])));
 
@@ -5768,11 +5922,28 @@ CSS;
               <div class="vpp-grid">
                 <div class="vpp-media">
                   <?php if ($primary_image !== ''): ?>
-                      <img src="<?php echo esc_url($primary_image); ?>" alt="<?php echo esc_attr($title); ?>" loading="eager" decoding="async" class="vpp-main-image"/>
-                      <?php if (count($images) > 1): ?>
-                        <div class="vpp-thumbs">
-                          <?php foreach (array_slice($images, 1, 6) as $thumb): ?>
-                            <img src="<?php echo esc_url($thumb); ?>" alt="<?php echo esc_attr($title); ?>" loading="lazy" decoding="async" class="vpp-thumb"/>
+                      <div class="vpp-carousel" data-vpp-carousel>
+                        <div class="vpp-carousel-frame" data-vpp-carousel-frame aria-live="polite">
+                          <?php foreach ($images as $index => $image_url): ?>
+                            <img src="<?php echo esc_url($image_url); ?>" alt="<?php echo esc_attr($title); ?>" loading="<?php echo $index === 0 ? 'eager' : 'lazy'; ?>" decoding="async" class="vpp-carousel-image vpp-main-image<?php echo $index === 0 ? ' is-active' : ''; ?>" data-vpp-carousel-item data-index="<?php echo (int)$index; ?>"<?php echo $index === 0 ? ' aria-current="true"' : ' aria-hidden="true"'; ?> />
+                          <?php endforeach; ?>
+                        </div>
+                        <?php if ($image_count > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
+                      <?php if ($image_count > 1): ?>
+                        <div class="vpp-carousel-thumbs" data-vpp-carousel-thumbs role="group" aria-label="<?php echo esc_attr__('Carousel thumbnails', 'virtual-product-pages'); ?>">
+                          <?php foreach ($images as $index => $image_url): ?>
+                            <?php $thumb_label = sprintf(__('Show image %1$d of %2$d', 'virtual-product-pages'), $index + 1, $image_count); ?>
+                            <button type="button" class="vpp-carousel-thumb<?php echo $index === 0 ? ' is-active' : ''; ?>" data-vpp-carousel-thumb data-index="<?php echo (int)$index; ?>" aria-pressed="<?php echo $index === 0 ? 'true' : 'false'; ?>" aria-label="<?php echo esc_attr($thumb_label); ?>">
+                              <img src="<?php echo esc_url($image_url); ?>" alt="" loading="lazy" decoding="async" />
+                            </button>
                           <?php endforeach; ?>
                         </div>
                       <?php endif; ?>
@@ -5786,6 +5957,12 @@ CSS;
                   <h1 class="vpp-title"><?php echo esc_html($title); ?></h1>
                   <?php if ($meta_line): ?><p class="vpp-meta"><?php echo esc_html($meta_line); ?></p><?php endif; ?>
                   <?php if ($short_summary): ?><p class="vpp-short"><?php echo esc_html($short_summary); ?></p><?php endif; ?>
+                  <?php if ($availability_display_html !== ''): ?>
+                    <p class="vpp-availability"><?php echo $availability_display_html; ?></p>
+                  <?php endif; ?>
+                  <?php if ($price_display_html !== ''): ?>
+                    <div class="vpp-price-callout"><span><?php echo $price_display_html; ?></span></div>
+                  <?php endif; ?>
                   <?php if (!empty($cta_buttons)): ?>
                   <div class="vpp-cta-block">
                     <?php foreach ($cta_buttons as $btn): ?>
