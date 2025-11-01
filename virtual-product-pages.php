@@ -76,6 +76,11 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
   font-size:clamp(1.45rem,2.75vw,2.3rem);line-height:1.2}
 .vpp-price-callout span{display:block}
 
+.vpp-price-callout{margin-top:1rem;padding:1.15rem 1.35rem;border-radius:18px;background:rgba(37,99,235,.08);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.65),0 12px 30px rgba(37,99,235,.18);color:#0f172a;font-weight:800;
+  font-size:clamp(1.45rem,2.75vw,2.3rem);line-height:1.2}
+.vpp-price-callout span{display:block}
+
 .vpp-summary{display:flex;flex-direction:column;gap:8px}
 .vpp-title{margin:0;font-weight:800;color:#111827;font-size:clamp(1.6rem,2.4vw,2.25rem)}
 .vpp-meta{margin:0;color:var(--muted)}
@@ -5946,7 +5951,15 @@ CSS;
                             </button>
                           <?php endforeach; ?>
                         </div>
-                      <?php endif; ?>
+                        <?php if (count($images) > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
                   <?php else: ?>
                       <div class="vpp-placeholder">
                         <div class="vpp-ph-img"></div>
