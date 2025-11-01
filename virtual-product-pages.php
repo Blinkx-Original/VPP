@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.1
+ * Version: 2.2
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.1';
+    const VERSION = '2.2';
     const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
@@ -66,10 +66,15 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
 .vpp-carousel-nav svg{width:18px;height:18px}
 .vpp-carousel-nav[disabled]{opacity:.45;pointer-events:none}
 .vpp-placeholder{display:flex;align-items:center;justify-content:center;height:360px;border-radius:16px;
-  background:linear-gradient(180deg,#f8fafc,#e2e8f0);
+  background:#fff;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.6),0 20px 40px rgba(15,23,42,.08)}
 .vpp-ph-img{width:60%;height:70%;border-radius:16px;
-  background:repeating-linear-gradient(45deg,#e2e8f0,#e2e8f0 12px,#f8fafc 12px,#f8fafc 24px)}
+  background:#fff;border:1px solid rgba(148,163,184,.16)}
+
+.vpp-price-callout{margin-top:1rem;padding:1.15rem 1.35rem;border-radius:18px;background:rgba(37,99,235,.08);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.65),0 12px 30px rgba(37,99,235,.18);color:#0f172a;font-weight:800;
+  font-size:clamp(1.45rem,2.75vw,2.3rem);line-height:1.2}
+.vpp-price-callout span{display:block}
 
 .vpp-price-callout{margin-top:1rem;padding:1.15rem 1.35rem;border-radius:18px;background:rgba(37,99,235,.08);
   box-shadow:inset 0 1px 0 rgba(255,255,255,.65),0 12px 30px rgba(37,99,235,.18);color:#0f172a;font-weight:800;
@@ -80,6 +85,8 @@ body.vpp-body{margin:0;min-height:100vh;background:#f7f8fb;color:#0f172a;color-s
 .vpp-title{margin:0;font-weight:800;color:#111827;font-size:clamp(1.6rem,2.4vw,2.25rem)}
 .vpp-meta{margin:0;color:var(--muted)}
 .vpp-short{margin:.2rem 0 0;color:#374151;font-size:.98rem;max-width:60ch}
+
+.vpp-availability{margin:.5rem 0 0;font-weight:600;color:#047857;font-size:1.02rem}
 
 .vpp-cta-block{margin-top:.75rem;display:flex;flex-direction:column;gap:.75rem}
 .vpp-cta-button{display:flex;align-items:center;justify-content:center;text-decoration:none;color:#fff!important;
@@ -1416,6 +1423,7 @@ CSS;
             $select[] = "'' AS short_description";
         }
         $select[] = isset($cols['price']) ? '`price`' : "'' AS price";
+        $select[] = isset($cols['availability']) ? '`availability`' : "'' AS availability";
         $select[] = isset($cols['categories']) ? '`categories`' : "'' AS categories";
         if (isset($cols['image'])) {
             $select[] = '`image`';
@@ -2475,6 +2483,9 @@ CSS;
         if (isset($row['price']) && $row['price'] !== '') {
             $record['price'] = is_numeric($row['price']) ? 0 + $row['price'] : (string)$row['price'];
         }
+        if (isset($row['availability']) && $row['availability'] !== '') {
+            $record['availability'] = trim((string)$row['availability']);
+        }
         $categories = $this->normalize_publish_categories($row['categories'] ?? null);
         if ($categories !== null) {
             $record['categories'] = $categories;
@@ -3188,6 +3199,10 @@ CSS;
         return $this->column_exists($mysqli, $table, 'price');
     }
 
+    private function select_has_availability_column($mysqli, $table) {
+        return $this->column_exists($mysqli, $table, 'availability');
+    }
+
     private function fetch_product_by_slug($slug, &$err = null) {
         $s = $this->get_settings();
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
@@ -3199,9 +3214,11 @@ CSS;
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $has_price = $this->select_has_price_column($mysqli, $table);
         $price_sql = $has_price ? ', price' : ", '' AS price";
+        $has_availability = $this->select_has_availability_column($mysqli, $table);
+        $availability_sql = $has_availability ? ', availability' : ", '' AS availability";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
         $category_sql = $this->build_category_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$availability_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -3226,9 +3243,11 @@ CSS;
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
         $has_price = $this->select_has_price_column($mysqli, $table);
         $price_sql = $has_price ? ', price' : ", '' AS price";
+        $has_availability = $this->select_has_availability_column($mysqli, $table);
+        $availability_sql = $has_availability ? ', availability' : ", '' AS availability";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
         $category_sql = $this->build_category_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$availability_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -3256,6 +3275,23 @@ CSS;
             $value = mb_substr($value, 0, 220);
         } else {
             $value = substr($value, 0, 220);
+        }
+        return trim($value);
+    }
+
+    private function normalize_availability_input($raw) {
+        if (is_array($raw)) {
+            $raw = implode(' ', $raw);
+        }
+        $value = is_string($raw) ? sanitize_text_field(wp_unslash($raw)) : '';
+        if ($value === '') {
+            return '';
+        }
+        $value = preg_replace('/\s+/', ' ', $value);
+        if (function_exists('mb_substr')) {
+            $value = mb_substr($value, 0, 80);
+        } else {
+            $value = substr($value, 0, 80);
         }
         return trim($value);
     }
@@ -3357,6 +3393,10 @@ CSS;
                         </td></tr>
                         <tr><th scope="row">Model</th><td><input type="text" name="model" value="<?php echo esc_attr($row['model']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">SKU</th><td><input type="text" name="sku" value="<?php echo esc_attr($row['sku']); ?>" class="regular-text"></td></tr>
+                        <tr><th scope="row">Availability</th><td>
+                            <input type="text" name="availability" value="<?php echo esc_attr($row['availability'] ?? ''); ?>" class="regular-text" placeholder="e.g. In stock" style="max-width:320px;">
+                            <p class="description">Shown above the price banner. Freeform text saved to TiDB.</p>
+                        </td></tr>
                         <tr><th scope="row">Price</th><td>
                             <textarea name="price" rows="3" class="large-text" placeholder="e.g. $650 solo esta semana" style="max-width:520px;"><?php echo esc_textarea($row['price'] ?? ''); ?></textarea>
                             <p class="description">Shown prominently on the product page. Supports numbers and short text, including line breaks.</p>
@@ -3547,6 +3587,7 @@ CSS;
         if (strlen($short_summary) > 150) $short_summary = substr($short_summary, 0, 150);
         $meta_description = sanitize_text_field($_POST['meta_description'] ?? '');
         if (strlen($meta_description) > 160) $meta_description = substr($meta_description, 0, 160);
+        $availability = $this->normalize_availability_input($_POST['availability'] ?? '');
         $price = $this->normalize_price_input($_POST['price'] ?? '');
         $images_json = $this->normalize_images_input($_POST['images_json'] ?? '');
         $cta_lead_label = $this->sanitize_cta_label($_POST['cta_lead_label'] ?? '');
@@ -3628,6 +3669,7 @@ CSS;
             'sku' => $sku,
             'short_summary' => $short_summary,
             'meta_description' => $meta_description,
+            'availability' => $availability,
             'price' => $price,
             'images_json' => $images_json,
             'schema_json' => $schema_json,
@@ -5792,6 +5834,10 @@ CSS;
         }
         $image_count = count($images);
         $primary_image = $images[0] ?? '';
+        $availability_display = '';
+        if (isset($p['availability']) && $p['availability'] !== '') {
+            $availability_display = trim((string)$p['availability']);
+        }
         $price_display = '';
         if (isset($p['price']) && $p['price'] !== '') {
             if (is_string($p['price'])) {
@@ -5800,6 +5846,7 @@ CSS;
                 $price_display = trim((string)(0 + $p['price']));
             }
         }
+        $availability_display_html = $availability_display !== '' ? esc_html($availability_display) : '';
         $price_display_html = $price_display !== '' ? nl2br(esc_html($price_display)) : '';
         $allowed = $this->allowed_html();
         $meta_line = trim(implode(' • ', array_filter([$brand, $model, $sku])));
@@ -5923,6 +5970,9 @@ CSS;
                   <h1 class="vpp-title"><?php echo esc_html($title); ?></h1>
                   <?php if ($meta_line): ?><p class="vpp-meta"><?php echo esc_html($meta_line); ?></p><?php endif; ?>
                   <?php if ($short_summary): ?><p class="vpp-short"><?php echo esc_html($short_summary); ?></p><?php endif; ?>
+                  <?php if ($availability_display_html !== ''): ?>
+                    <p class="vpp-availability"><?php echo $availability_display_html; ?></p>
+                  <?php endif; ?>
                   <?php if ($price_display_html !== ''): ?>
                     <div class="vpp-price-callout"><span><?php echo $price_display_html; ?></span></div>
                   <?php endif; ?>
