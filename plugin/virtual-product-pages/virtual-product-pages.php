@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.6
+ * Version: 2.7
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -24,7 +24,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.6';
+    const VERSION = '2.7';
     const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
@@ -2190,7 +2190,18 @@ CSS;
         return $entries;
     }
 
-    private function write_sitemap_file($path, array $entries) {
+    private function determine_sitemap_type($path) {
+        $name = basename((string)$path);
+        if (preg_match('/(^|-)blog-/', $name)) {
+            return 'blog';
+        }
+        if (preg_match('/(^|-)cat(?:egory)?-/', $name) || strpos($name, 'category') === 0) {
+            return 'category';
+        }
+        return 'product';
+    }
+
+    private function build_sitemap_xml(array $entries, $type) {
         $xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
         $xml .= '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' . "\n";
         foreach ($entries as $entry) {
@@ -2198,8 +2209,18 @@ CSS;
             if ($slug === '') {
                 continue;
             }
-            $loc = home_url('/p/' . $slug . '/');
             $lastmod = $entry['lastmod'] ?? gmdate('c');
+            switch ($type) {
+                case 'blog':
+                    $loc = home_url('/b/' . $slug);
+                    break;
+                case 'category':
+                    $loc = home_url('/p-cat/' . $slug . '/');
+                    break;
+                default:
+                    $loc = home_url('/p/' . $slug . '/');
+                    break;
+            }
             $xml .= "  <url>\n";
             $xml .= '    <loc>' . htmlspecialchars($loc, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</loc>' . "\n";
             $xml .= '    <lastmod>' . htmlspecialchars($lastmod, ENT_XML1 | ENT_COMPAT, 'UTF-8') . '</lastmod>' . "\n";
@@ -2207,6 +2228,15 @@ CSS;
         }
         $xml .= '</urlset>';
         if (strlen($xml) > 50 * 1024 * 1024) {
+            return false;
+        }
+        return $xml;
+    }
+
+    private function write_sitemap_file($path, array $entries) {
+        $type = $this->determine_sitemap_type($path);
+        $xml = $this->build_sitemap_xml($entries, $type);
+        if ($xml === false) {
             return false;
         }
         return @file_put_contents($path, $xml) !== false;
@@ -4353,6 +4383,18 @@ CSS;
                 $inline_msg = !empty($purge_result['messages'][0]) ? $purge_result['messages'][0] : ($purge_result['success'] ? 'Purged' : 'Purge failed');
                 $top_msg = $purge_result['success'] ? 'Saved and purged Cloudflare.' : 'Saved, but purge failed.';
             }
+            $sitemap_err = null;
+            $sitemap_changed = [];
+            if ($this->regenerate_blog_sitemaps($sitemap_err, $sitemap_changed)) {
+                $top_msg = rtrim($top_msg);
+                if ($top_msg !== '') { $top_msg .= ' '; }
+                $top_msg .= 'Blog sitemap updated.';
+            } else {
+                $this->log_error('sitemap', $sitemap_err ?: 'Blog sitemap update failed.');
+                $inline = 'err';
+                $inline_msg = 'Saved, but sitemap update failed.';
+                $top_msg = 'Saved, but sitemap update failed.';
+            }
         }
 
         $lookup_id = $ok ? $saved_id : $id;
@@ -5891,6 +5933,95 @@ CSS;
 
         $summary = sprintf('Generated %d sitemap file(s) covering %d product(s).', count($files), $total);
         $changed_files = array_values(array_unique($purge_files));
+        return true;
+    }
+
+    private function regenerate_blog_sitemaps(&$err = null, ?array &$changed_files = null) {
+        $storage = $this->get_sitemap_storage_paths();
+        if (!$storage) { $err = 'Uploads directory is not writable.'; return false; }
+        $dir = $storage['dir'];
+        if (!wp_mkdir_p($dir)) { $err = 'Failed to create sitemap directory.'; return false; }
+        $dir = trailingslashit($dir);
+        $legacy_dir = !empty($storage['legacy_dir']) ? trailingslashit($storage['legacy_dir']) : '';
+        $purge_files = [];
+        foreach (glob($dir . 'blog-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+        foreach (glob($dir . 'sitemap-blog-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+        if ($legacy_dir && is_dir($legacy_dir)) {
+            foreach (glob($legacy_dir . 'blog-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+            foreach (glob($legacy_dir . 'sitemap-blog-*.xml') ?: [] as $old) { $purge_files[] = basename($old); @unlink($old); }
+        }
+
+        $mysqli = $this->db_connect($err);
+        if (!$mysqli) { return false; }
+        $table = preg_replace('/[^a-zA-Z0-9_]/', '', (string)$this->get_blog_table());
+        $has_table = $table !== '' && $this->table_exists($mysqli, $table);
+
+        if ($has_table) {
+            $blog_batch_size = 2000;
+            $blog_offset = 0;
+            $chunk_size = 50000;
+            $chunk_entries = [];
+            $file_index = 0;
+            while (true) {
+                $sql = sprintf("SELECT slug, published_at, last_tidb_update_at, is_published FROM `%s` WHERE is_published = 1 ORDER BY id LIMIT %d OFFSET %d", $table, $blog_batch_size, $blog_offset);
+                $res = $mysqli->query($sql);
+                if (!$res) { @$mysqli->close(); $err = 'DB query failed: ' . $mysqli->error; return false; }
+                $row_count = 0;
+                while ($row = $res->fetch_assoc()) {
+                    $row_count++;
+                    $slug = sanitize_title($row['slug'] ?? '');
+                    if ($slug === '') { continue; }
+                    $data = [
+                        'slug' => $slug,
+                        'is_published' => (int)($row['is_published'] ?? 0),
+                        'published_at' => $row['published_at'] ?? '',
+                        'last_tidb_update_at' => $row['last_tidb_update_at'] ?? '',
+                    ];
+                    if (!$this->is_blog_post_public($data)) { continue; }
+                    $lastmod = !empty($data['last_tidb_update_at']) ? strtotime($data['last_tidb_update_at']) : false;
+                    if (!$lastmod && !empty($data['published_at'])) { $lastmod = strtotime($data['published_at']); }
+                    if (!$lastmod) { $lastmod = time(); }
+                    $chunk_entries[] = [
+                        'slug' => $slug,
+                        'lastmod' => gmdate('c', $lastmod),
+                    ];
+                    if (count($chunk_entries) >= $chunk_size) {
+                        $file_index++;
+                        $filename = sprintf('blog-%d.xml', $file_index);
+                        $xml = $this->build_sitemap_xml($chunk_entries, 'blog');
+                        if ($xml === false || @file_put_contents($dir . $filename, $xml) === false) { @$mysqli->close(); $err = 'Failed to write ' . $filename; return false; }
+                        if ($legacy_dir) { @file_put_contents($legacy_dir . $filename, $xml); }
+                        $purge_files[] = $filename;
+                        $chunk_entries = [];
+                    }
+                }
+                $res->free();
+                if ($row_count < $blog_batch_size) { break; }
+                $blog_offset += $blog_batch_size;
+            }
+            if (!empty($chunk_entries)) {
+                $file_index++;
+                $filename = sprintf('blog-%d.xml', $file_index);
+                $xml = $this->build_sitemap_xml($chunk_entries, 'blog');
+                if ($xml === false || @file_put_contents($dir . $filename, $xml) === false) { @$mysqli->close(); $err = 'Failed to write ' . $filename; return false; }
+                if ($legacy_dir) { @file_put_contents($legacy_dir . $filename, $xml); }
+                $purge_files[] = $filename;
+            }
+        }
+
+        @$mysqli->close();
+
+        $refresh_err = null;
+        $index_files = [];
+        if ($this->refresh_sitemap_index($storage, $refresh_err, $index_files) === false) { $err = $refresh_err ?: 'Failed to refresh sitemap index.'; return false; }
+        $purge_targets = array_values(array_unique(array_merge($purge_files, $index_files)));
+        if (!empty($purge_targets)) {
+            $this->purge_sitemap_cache($storage, $purge_targets);
+            $urls = $this->cf_collect_sitemap_urls($purge_targets, false);
+            $this->cf_record_recent_sitemaps($urls, $purge_targets);
+        }
+        if ($changed_files === null) { $changed_files = []; }
+        $changed_files = array_values(array_unique(array_merge($changed_files, $purge_targets)));
         return true;
     }
 
