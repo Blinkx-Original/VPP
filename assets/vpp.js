@@ -16,6 +16,8 @@
       let activeIndex = Math.max(0, items.findIndex((img) => img.classList.contains('is-active')));
       const prev = root.querySelector('[data-vpp-carousel-prev]');
       const next = root.querySelector('[data-vpp-carousel-next]');
+      const thumbCandidates = root.parentElement ? root.parentElement.querySelectorAll('[data-vpp-carousel-thumb]') : [];
+      const thumbs = Array.from(thumbCandidates);
 
       const applyState = (newIndex) => {
         const normalized = ((newIndex % items.length) + items.length) % items.length;
@@ -29,6 +31,11 @@
             img.removeAttribute('aria-current');
             img.setAttribute('aria-hidden', 'true');
           }
+        });
+        thumbs.forEach((thumb, idx) => {
+          const isThumbActive = idx === normalized;
+          thumb.classList.toggle('is-active', isThumbActive);
+          thumb.setAttribute('aria-pressed', isThumbActive ? 'true' : 'false');
         });
         activeIndex = normalized;
         if (prev) {
@@ -49,6 +56,14 @@
       if (next) {
         next.addEventListener('click', () => {
           applyState(activeIndex + 1);
+        });
+      }
+
+      if (thumbs.length) {
+        thumbs.forEach((thumb, idx) => {
+          thumb.addEventListener('click', () => {
+            applyState(idx);
+          });
         });
       }
 

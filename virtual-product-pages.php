@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Virtual Product Pages (TiDB + Algolia)
  * Description: Render virtual product pages at /p/{slug} from TiDB, with external CTAs. Includes Push to VPP, Push to Algolia, Edit Product, sitemap rebuild, and Cloudflare purge.
- * Version: 2.0.6
+ * Version: 2.1
  * Author: ChatGPT (for Martin)
  * Requires PHP: 7.4
  */
@@ -23,7 +23,7 @@ class VPP_Plugin {
     const CATEGORY_PER_PAGE_MAX = 9;
     const CATEGORY_CACHE_TTL = HOUR_IN_SECONDS;
     const SITEMAP_MAX_URLS = 50000;
-    const VERSION = '2.0.6';
+    const VERSION = '2.1';
     const VERSION_OPTION = 'vpp_plugin_version';
     const CSS_FALLBACK = <<<CSS
 /* Strictly-scoped VPP CSS to avoid theme/header collisions */
@@ -3184,6 +3184,10 @@ CSS;
         return $this->column_exists($mysqli, $table, 'schema_json');
     }
 
+    private function select_has_price_column($mysqli, $table) {
+        return $this->column_exists($mysqli, $table, 'price');
+    }
+
     private function fetch_product_by_slug($slug, &$err = null) {
         $s = $this->get_settings();
         $table = preg_replace('/[^a-zA-Z0-9_]/', '', $s['tidb']['table']);
@@ -3193,9 +3197,11 @@ CSS;
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
+        $has_price = $this->select_has_price_column($mysqli, $table);
+        $price_sql = $has_price ? ', price' : ", '' AS price";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
         $category_sql = $this->build_category_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE slug = ? LIMIT 2";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -3218,9 +3224,11 @@ CSS;
         $meta_sql = $has_meta ? ', meta_description' : ", '' AS meta_description";
         $has_schema = $this->select_has_schema_column($mysqli, $table);
         $schema_sql = $has_schema ? ', schema_json' : ", '' AS schema_json";
+        $has_price = $this->select_has_price_column($mysqli, $table);
+        $price_sql = $has_price ? ', price' : ", '' AS price";
         $cta_sql = $this->build_cta_select_clause($mysqli, $table);
         $category_sql = $this->build_category_select_clause($mysqli, $table);
-        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
+        $sql = "SELECT id, slug, title_h1, brand, model, sku, images_json{$schema_sql}{$price_sql}, desc_html, short_summary, is_published, last_tidb_update_at {$meta_sql}{$cta_sql}{$category_sql}
                 FROM `{$table}` WHERE id = ? LIMIT 1";
         $stmt = $mysqli->prepare($sql);
         if (!$stmt) { $err = 'DB prepare failed: ' . $mysqli->error; $this->log_error('db_query', $err); return null; }
@@ -3232,6 +3240,24 @@ CSS;
         @$mysqli->close();
         if (!$row) { $err = 'Product not found.'; return null; }
         return $row;
+    }
+
+    private function normalize_price_input($raw) {
+        if (is_array($raw)) {
+            $raw = implode("\n", $raw);
+        }
+        $value = is_string($raw) ? sanitize_textarea_field(wp_unslash($raw)) : '';
+        if ($value === '') {
+            return '';
+        }
+        $value = str_replace(["\r\n", "\r"], "\n", $value);
+        $value = preg_replace("/\n{3,}/", "\n\n", $value);
+        if (function_exists('mb_substr')) {
+            $value = mb_substr($value, 0, 220);
+        } else {
+            $value = substr($value, 0, 220);
+        }
+        return trim($value);
     }
 
     private function normalize_images_input($raw) {
@@ -3331,6 +3357,10 @@ CSS;
                         </td></tr>
                         <tr><th scope="row">Model</th><td><input type="text" name="model" value="<?php echo esc_attr($row['model']); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">SKU</th><td><input type="text" name="sku" value="<?php echo esc_attr($row['sku']); ?>" class="regular-text"></td></tr>
+                        <tr><th scope="row">Price</th><td>
+                            <textarea name="price" rows="3" class="large-text" placeholder="e.g. $650 solo esta semana" style="max-width:520px;"><?php echo esc_textarea($row['price'] ?? ''); ?></textarea>
+                            <p class="description">Shown prominently on the product page. Supports numbers and short text, including line breaks.</p>
+                        </td></tr>
                         <tr><th scope="row">Short summary (max 150 chars)</th><td><input type="text" maxlength="150" name="short_summary" value="<?php echo esc_attr($row['short_summary'] ?? ''); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Meta description (max 160)</th><td><input type="text" maxlength="160" name="meta_description" value="<?php echo esc_attr($row['meta_description'] ?? ''); ?>" class="regular-text"></td></tr>
                         <tr><th scope="row">Images</th><td>
@@ -3517,6 +3547,7 @@ CSS;
         if (strlen($short_summary) > 150) $short_summary = substr($short_summary, 0, 150);
         $meta_description = sanitize_text_field($_POST['meta_description'] ?? '');
         if (strlen($meta_description) > 160) $meta_description = substr($meta_description, 0, 160);
+        $price = $this->normalize_price_input($_POST['price'] ?? '');
         $images_json = $this->normalize_images_input($_POST['images_json'] ?? '');
         $cta_lead_label = $this->sanitize_cta_label($_POST['cta_lead_label'] ?? '');
         $cta_lead_url = esc_url_raw($_POST['cta_lead_url'] ?? '');
@@ -3597,6 +3628,7 @@ CSS;
             'sku' => $sku,
             'short_summary' => $short_summary,
             'meta_description' => $meta_description,
+            'price' => $price,
             'images_json' => $images_json,
             'schema_json' => $schema_json,
             'cta_lead_label' => $cta_lead_label,
@@ -5758,6 +5790,7 @@ CSS;
                 return $value !== '' ? $value : null;
             }, $images)));
         }
+        $image_count = count($images);
         $primary_image = $images[0] ?? '';
         $price_display = '';
         if (isset($p['price']) && $p['price'] !== '') {
@@ -5851,6 +5884,24 @@ CSS;
                         <div class="vpp-carousel-frame" data-vpp-carousel-frame aria-live="polite">
                           <?php foreach ($images as $index => $image_url): ?>
                             <img src="<?php echo esc_url($image_url); ?>" alt="<?php echo esc_attr($title); ?>" loading="<?php echo $index === 0 ? 'eager' : 'lazy'; ?>" decoding="async" class="vpp-carousel-image vpp-main-image<?php echo $index === 0 ? ' is-active' : ''; ?>" data-vpp-carousel-item data-index="<?php echo (int)$index; ?>"<?php echo $index === 0 ? ' aria-current="true"' : ' aria-hidden="true"'; ?> />
+                          <?php endforeach; ?>
+                        </div>
+                        <?php if ($image_count > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
+                      <?php if ($image_count > 1): ?>
+                        <div class="vpp-carousel-thumbs" data-vpp-carousel-thumbs role="group" aria-label="<?php echo esc_attr__('Carousel thumbnails', 'virtual-product-pages'); ?>">
+                          <?php foreach ($images as $index => $image_url): ?>
+                            <?php $thumb_label = sprintf(__('Show image %1$d of %2$d', 'virtual-product-pages'), $index + 1, $image_count); ?>
+                            <button type="button" class="vpp-carousel-thumb<?php echo $index === 0 ? ' is-active' : ''; ?>" data-vpp-carousel-thumb data-index="<?php echo (int)$index; ?>" aria-pressed="<?php echo $index === 0 ? 'true' : 'false'; ?>" aria-label="<?php echo esc_attr($thumb_label); ?>">
+                              <img src="<?php echo esc_url($image_url); ?>" alt="" loading="lazy" decoding="async" />
+                            </button>
                           <?php endforeach; ?>
                         </div>
                         <?php if (count($images) > 1): ?>
