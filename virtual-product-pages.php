@@ -5946,7 +5946,33 @@ CSS;
                             </button>
                           <?php endforeach; ?>
                         </div>
-                      <?php endif; ?>
+                        <?php if ($image_count > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
+                      <?php if ($image_count > 1): ?>
+                        <div class="vpp-carousel-thumbs" data-vpp-carousel-thumbs role="group" aria-label="<?php echo esc_attr__('Carousel thumbnails', 'virtual-product-pages'); ?>">
+                          <?php foreach ($images as $index => $image_url): ?>
+                            <?php $thumb_label = sprintf(__('Show image %1$d of %2$d', 'virtual-product-pages'), $index + 1, $image_count); ?>
+                            <button type="button" class="vpp-carousel-thumb<?php echo $index === 0 ? ' is-active' : ''; ?>" data-vpp-carousel-thumb data-index="<?php echo (int)$index; ?>" aria-pressed="<?php echo $index === 0 ? 'true' : 'false'; ?>" aria-label="<?php echo esc_attr($thumb_label); ?>">
+                              <img src="<?php echo esc_url($image_url); ?>" alt="" loading="lazy" decoding="async" />
+                            </button>
+                          <?php endforeach; ?>
+                        </div>
+                        <?php if (count($images) > 1): ?>
+                          <button type="button" class="vpp-carousel-nav" data-dir="prev" data-vpp-carousel-prev aria-label="<?php echo esc_attr__('Previous image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12.75 4.75 7.5 10l5.25 5.25" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                          <button type="button" class="vpp-carousel-nav" data-dir="next" data-vpp-carousel-next aria-label="<?php echo esc_attr__('Next image', 'virtual-product-pages'); ?>">
+                            <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="m7.25 15.25 5.25-5.25L7.25 4.75" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                          </button>
+                        <?php endif; ?>
+                      </div>
                   <?php else: ?>
                       <div class="vpp-placeholder">
                         <div class="vpp-ph-img"></div>
